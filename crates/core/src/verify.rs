@@ -156,6 +156,13 @@ pub fn run_standalone_verify(options: &VerifyOptions) -> Result<VerificationSumm
         .map_err(|error| BigcpError::io("read verify source root metadata", error))?;
     let destination_root_metadata = metadata_at(&destination)
         .map_err(|error| BigcpError::io("read verify destination root metadata", error))?;
+    if source_root_metadata.kind != ObjectKind::Directory
+        || destination_root_metadata.kind != ObjectKind::Directory
+    {
+        return Err(BigcpError::Invalid(
+            "verification roots must both resolve to real directories".to_owned(),
+        ));
+    }
     if source_root_metadata.basic.last_access_time
         != destination_root_metadata.basic.last_access_time
     {
@@ -167,7 +174,7 @@ pub fn run_standalone_verify(options: &VerifyOptions) -> Result<VerificationSumm
             == destination_root_metadata.basic.last_write_time
         && source_root_metadata.basic.attributes & COPYABLE_ATTRIBUTES
             == destination_root_metadata.basic.attributes & COPYABLE_ATTRIBUTES;
-    let root_aux_equal = directory_aux_equal(&source, &destination, &mut counters, false)
+    let root_aux_equal = directory_aux_equal(&source, &destination, &mut counters, true)
         .map_err(|error| BigcpError::io("verify root streams or EAs", error))?;
     if root_metadata_equal && root_aux_equal {
         summary.passed = summary.passed.saturating_add(1);
@@ -245,7 +252,7 @@ pub fn run_standalone_verify(options: &VerifyOptions) -> Result<VerificationSumm
                         &source_entry.path,
                         &destination_entry.path,
                         &mut counters,
-                        false,
+                        true,
                     )
                     .unwrap_or(false);
                     if !metadata_equal || !aux_equal {

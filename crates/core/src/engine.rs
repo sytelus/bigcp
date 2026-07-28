@@ -9,13 +9,13 @@ use std::path::{Path, PathBuf};
 
 use bigcp_win::{
     DestinationStream, DestinationTemp, ObjectMetadata, SourceFile, SourceStream, StreamInfo,
-    is_encrypted, is_sparse, list_streams, metadata_at, read_extended_attributes,
+    is_encrypted, is_sparse, list_streams, metadata_at, read_extended_attributes_checked,
     read_protected_dacl,
 };
 use xxhash_rust::xxh3::Xxh3;
 
 use crate::error::{ErrorCategory, OperationError};
-use crate::journal::{Checkpoint, Journal, JournalEvent};
+use crate::journal::{Checkpoint, CheckpointFileIdentity, Journal, JournalEvent};
 use crate::model::{Counters, EntrySnapshot};
 
 /// Successful engine result consumed by the common outcome path.
@@ -83,7 +83,7 @@ pub fn copy_file(
     mut journal: Option<&mut Journal>,
 ) -> Result<EngineResult, OperationError> {
     let mut source = SourceFile::open(request.source_path)
-        .map_err(|error| operation_error("open_src", request.relative_path, &error))?;
+        .map_err(|error| source_open_error("open_src", request.relative_path, &error))?;
     ensure_source_unchanged(
         request.source_snapshot,
         source.opened_metadata(),
@@ -96,7 +96,7 @@ pub fn copy_file(
         streams
     } else {
         discovered_streams = list_streams(request.source_path)
-            .map_err(|error| operation_error("list_streams", request.relative_path, &error))?;
+            .map_err(|error| source_open_error("list_streams", request.relative_path, &error))?;
         &discovered_streams
     };
     let largest_stream = streams
@@ -111,9 +111,14 @@ pub fn copy_file(
     let should_hash =
         request.verify || largest_stream >= request.large_threshold || checkpoint_eligible;
     let extended_attributes = (request.source_snapshot.metadata.ea_size > 0)
-        .then(|| read_extended_attributes(request.source_path))
+        .then(|| {
+            read_extended_attributes_checked(
+                request.source_path,
+                request.source_snapshot.metadata.identity,
+            )
+        })
         .transpose()
-        .map_err(|error| operation_error("read_ea", request.relative_path, &error))?;
+        .map_err(|error| source_open_error("read_ea", request.relative_path, &error))?;
     if request.preserve_sparse
         && is_sparse(request.source_snapshot.metadata.basic.attributes)
         && request.source_snapshot.metadata.size >= request.large_threshold
@@ -639,22 +644,26 @@ fn resume_unnamed(
 ) -> Result<Option<(DestinationTemp, u64, Option<Xxh3>)>, OperationError> {
     let source_matches = checkpoint.source_size == request.source_snapshot.metadata.size
         && checkpoint.source_mtime == request.source_snapshot.metadata.basic.last_write_time
+        && checkpoint
+            .source_identity
+            .as_ref()
+            .is_some_and(|identity| identity.matches(request.source_snapshot.metadata.identity))
         && checkpoint.watermark <= checkpoint.source_size;
-    let mut temp = match DestinationTemp::resume(parent, &checkpoint.temp_name) {
-        Ok(temp) => temp,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(operation_error(
-                "open_resume_temp",
-                request.relative_path,
-                &error,
-            ));
-        }
+    let Ok(mut temp) = DestinationTemp::resume(parent, &checkpoint.temp_name) else {
+        // Checkpoints are optional hints. A missing, inaccessible, or
+        // type-changed candidate must not prevent a clean copy through a new
+        // opaque temporary.
+        return Ok(None);
     };
-    if !source_matches
-        || temp.len().is_err()
-        || temp.len().is_ok_and(|len| len < checkpoint.watermark)
-    {
+    if !checkpoint_matches_temp(checkpoint, &temp) {
+        // The handle is intentionally still persistent. Without identity
+        // proof, this process has no authority to mutate or delete the object.
+        return Ok(None);
+    }
+    let temp_is_long_enough = temp
+        .len()
+        .is_ok_and(|length| length >= checkpoint.watermark);
+    if !source_matches || !temp_is_long_enough {
         temp.discard().map_err(|error| {
             operation_error("discard_resume_temp", request.relative_path, &error)
         })?;
@@ -814,10 +823,17 @@ fn append_checkpoint(
             )
         })?
         .to_owned();
+    let Ok(temp_identity) = temp.identity() else {
+        return Ok(CheckpointStatus::Disabled);
+    };
     let checkpoint = Checkpoint {
         relative_path: crate::journal::path_key(request.relative_path),
         stream: stream.to_owned(),
         temp_name,
+        temp_identity: Some(CheckpointFileIdentity::from_file(temp_identity)),
+        source_identity: Some(CheckpointFileIdentity::from_file(
+            request.source_snapshot.metadata.identity,
+        )),
         source_size,
         source_mtime: request.source_snapshot.metadata.basic.last_write_time,
         watermark,
@@ -829,8 +845,11 @@ fn append_checkpoint(
     {
         return Ok(CheckpointStatus::Disabled);
     }
-    temp.persist_for_resume()
-        .map_err(|error| operation_error("persist_resume_temp", request.relative_path, &error))?;
+    if temp.persist_for_resume().is_err() {
+        // Checkpointing is an optional acceleration. The still-delete-pending
+        // temp remains safe, and the just-written hint will miss on rerun.
+        return Ok(CheckpointStatus::Disabled);
+    }
     Ok(CheckpointStatus::Written)
 }
 
@@ -908,7 +927,18 @@ fn copy_named_streams(
     let mut logical_bytes = 0_u64;
     for stream in named {
         let mut source = SourceStream::open(request.source_path, stream)
-            .map_err(|error| operation_error("open_src_stream", request.relative_path, &error))?;
+            .map_err(|error| source_open_error("open_src_stream", request.relative_path, &error))?;
+        let stream_identity = source.identity().map_err(|error| {
+            source_open_error("identify_src_stream", request.relative_path, &error)
+        })?;
+        if stream_identity != request.source_snapshot.metadata.identity {
+            return Err(OperationError::semantic(
+                ErrorCategory::SourceChanged,
+                "identify_src_stream",
+                request.relative_path.to_path_buf(),
+                "named stream belongs to a different source object",
+            ));
+        }
         let key = crate::journal::stream_key(&stream.name);
         let candidate = journal.as_deref().and_then(|value| {
             value.checkpoint_owned(&crate::journal::path_key(request.relative_path), &key)
@@ -1026,8 +1056,15 @@ fn resume_named(
 ) -> Result<Option<(DestinationStream, u64, Option<Xxh3>)>, OperationError> {
     if checkpoint.source_size != stream.size
         || checkpoint.source_mtime != request.source_snapshot.metadata.basic.last_write_time
+        || !checkpoint
+            .source_identity
+            .as_ref()
+            .is_some_and(|identity| identity.matches(request.source_snapshot.metadata.identity))
         || checkpoint.watermark > stream.size
     {
+        return Ok(None);
+    }
+    if !checkpoint_matches_temp(checkpoint, temp) {
         return Ok(None);
     }
     let mut destination = temp
@@ -1121,22 +1158,50 @@ fn precommit_validate(
     request: &EngineRequest<'_>,
 ) -> Result<Option<bigcp_win::ProtectedDacl>, OperationError> {
     let Some(expected) = request.replacement_snapshot else {
-        if request.destination_path.exists() {
+        match metadata_at(request.destination_path) {
+            Ok(_) => {
+                return Err(OperationError::semantic(
+                    ErrorCategory::DestinationChanged,
+                    "revalidate_dst",
+                    request.relative_path.to_path_buf(),
+                    "a destination object appeared after classification",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(operation_error(
+                    "revalidate_dst",
+                    request.relative_path,
+                    &error,
+                ));
+            }
+        }
+        return Ok(None);
+    };
+    let observed = match metadata_at(request.destination_path) {
+        Ok(observed) => observed,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(OperationError::semantic(
                 ErrorCategory::DestinationChanged,
                 "revalidate_dst",
                 request.relative_path.to_path_buf(),
-                "a destination object appeared after classification",
+                "destination disappeared after classification",
             ));
         }
-        return Ok(None);
+        Err(error) => {
+            return Err(operation_error(
+                "revalidate_dst",
+                request.relative_path,
+                &error,
+            ));
+        }
     };
-    let observed = metadata_at(request.destination_path)
-        .map_err(|error| operation_error("revalidate_dst", request.relative_path, &error))?;
     if expected.metadata.identity != observed.identity
+        || expected.metadata.kind != observed.kind
         || expected.metadata.size != observed.size
         || expected.metadata.basic.last_write_time != observed.basic.last_write_time
         || expected.metadata.basic.attributes != observed.basic.attributes
+        || expected.metadata.reparse_tag != observed.reparse_tag
     {
         return Err(OperationError::semantic(
             ErrorCategory::DestinationChanged,
@@ -1160,6 +1225,16 @@ fn destination_parent<'a>(request: &'a EngineRequest<'_>) -> Result<&'a Path, Op
     })
 }
 
+/// Proves that a resume candidate is still the exact temporary captured by
+/// the journal. An identity query failure is a cache miss, never authority to
+/// mutate the path named by a checkpoint.
+fn checkpoint_matches_temp(checkpoint: &Checkpoint, temp: &DestinationTemp) -> bool {
+    checkpoint
+        .temp_identity
+        .as_ref()
+        .is_some_and(|expected| temp.identity().is_ok_and(|actual| expected.matches(actual)))
+}
+
 fn digest_bytes(bytes: &[u8]) -> String {
     format!("xxh3:{:032x}", xxhash_rust::xxh3::xxh3_128(bytes))
 }
@@ -1170,4 +1245,24 @@ fn operation_error(
     error: &std::io::Error,
 ) -> OperationError {
     OperationError::from_io(operation, PathBuf::from(relative_path), error)
+}
+
+fn source_open_error(
+    operation: &str,
+    relative_path: &Path,
+    error: &std::io::Error,
+) -> OperationError {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidData
+    ) {
+        OperationError::from_io_as(
+            ErrorCategory::SourceChanged,
+            operation,
+            relative_path.to_path_buf(),
+            error,
+        )
+    } else {
+        operation_error(operation, relative_path, error)
+    }
 }

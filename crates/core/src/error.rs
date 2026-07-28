@@ -149,10 +149,12 @@ fn category_for(code: Option<i32>, kind: io::ErrorKind) -> ErrorCategory {
         Some(39 | 112) => ErrorCategory::Space,
         Some(23 | 1117) => ErrorCategory::Media,
         Some(433 | 1167) => ErrorCategory::DeviceGone,
+        Some(80 | 183) => ErrorCategory::DestinationChanged,
         Some(206) => ErrorCategory::Path,
         Some(code) if code == i32::from(0x16A_u16) => ErrorCategory::Cloud,
         _ => match kind {
             io::ErrorKind::NotFound | io::ErrorKind::InvalidInput => ErrorCategory::Path,
+            io::ErrorKind::AlreadyExists => ErrorCategory::DestinationChanged,
             io::ErrorKind::PermissionDenied => ErrorCategory::Permissions,
             _ => ErrorCategory::Internal,
         },
@@ -202,6 +204,7 @@ mod tests {
             (23, ErrorCategory::Media),
             (1167, ErrorCategory::DeviceGone),
             (206, ErrorCategory::Path),
+            (183, ErrorCategory::DestinationChanged),
         ] {
             let error = io::Error::from_raw_os_error(code);
             let classified = OperationError::from_io("test", PathBuf::from("file"), &error);

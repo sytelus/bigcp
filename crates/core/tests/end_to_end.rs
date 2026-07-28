@@ -49,6 +49,16 @@ fn copy_rerun_and_both_verification_forms_converge() -> Result<(), Box<dyn std::
     fs::create_dir(&source)?;
     fs::create_dir(source.join("nested"))?;
 
+    let directory_stream = StreamInfo {
+        name: OsString::from(":directory-test:$DATA"),
+        size: 21,
+    };
+    let mut directory_alternate =
+        DestinationStream::create_reparse(&source.join("nested"), &directory_stream, true)?;
+    directory_alternate.write_all(b"directory stream data")?;
+    directory_alternate.flush()?;
+    drop(directory_alternate);
+
     let small = source.join("small.txt");
     fs::write(&small, b"small, deterministic fixture")?;
     let source_eas = ExtendedAttributes::from_pairs(&[(b"bigcp.test", b"ea-value")])?;
@@ -85,6 +95,11 @@ fn copy_rerun_and_both_verification_forms_converge() -> Result<(), Box<dyn std::
         },
         false,
     )?;
+    let expected_file_logical_bytes = fs::metadata(&small)?
+        .len()
+        .saturating_add(stream.size)
+        .saturating_add(large_bytes.len() as u64)
+        .saturating_add(fs::metadata(&sparse_path)?.len());
 
     let mut options = CopyOptions::new(source.clone(), destination.clone());
     options.verify = true;
@@ -99,6 +114,18 @@ fn copy_rerun_and_both_verification_forms_converge() -> Result<(), Box<dyn std::
             .any(|line| line.contains("\"ev\":\"checkpoint\"")),
         "a checkpoint-eligible file below the large-file threshold bypassed the coordinator"
     );
+    assert!(
+        journal.lines().any(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .is_some_and(|record| {
+                    record.get("ev").and_then(serde_json::Value::as_str) == Some("checkpoint")
+                        && record.get("temp_identity").is_some()
+                        && record.get("source_identity").is_some()
+                })
+        }),
+        "checkpoint did not bind both source and temporary identities"
+    );
     let destination_names = fs::read_dir(&destination)?
         .filter_map(Result::ok)
         .map(|entry| entry.file_name())
@@ -112,6 +139,10 @@ fn copy_rerun_and_both_verification_forms_converge() -> Result<(), Box<dyn std::
     assert_eq!(first.run.exit, 0, "copy errors: {:?}", first.errors);
     assert_eq!(first.counters.failed, 0);
     assert_eq!(first.counters.copied_new, 3);
+    assert_eq!(
+        first.counters.bytes_logical_discovered,
+        expected_file_logical_bytes
+    );
     assert!(
         first.verify.as_ref().is_some_and(|value| value.failed == 0),
         "post-copy verification: {:?}",
@@ -162,7 +193,16 @@ fn dry_run_never_creates_destination_and_replacement_is_atomic()
     let source = sandbox.child(Path::new("source"))?;
     let destination = sandbox.child(Path::new("destination"))?;
     fs::create_dir(&source)?;
-    fs::write(source.join("replace.txt"), b"first version")?;
+    let replace_path = source.join("replace.txt");
+    fs::write(&replace_path, b"first version")?;
+    let stream = StreamInfo {
+        name: OsString::from(":dry-run-count:$DATA"),
+        size: 4,
+    };
+    let mut alternate = DestinationStream::create(&replace_path, &stream, true)?;
+    alternate.write_all(b"ads!")?;
+    alternate.flush()?;
+    drop(alternate);
 
     let mut options = CopyOptions::new(source.clone(), destination.clone());
     options.dry_run = true;
@@ -170,6 +210,10 @@ fn dry_run_never_creates_destination_and_replacement_is_atomic()
     let modeled = run_copy(&options, &SilentObserver)?;
     assert_eq!(modeled.run.exit, 0);
     assert_eq!(modeled.counters.would_copy_new, 1);
+    assert_eq!(
+        modeled.counters.bytes_logical_discovered,
+        fs::metadata(&replace_path)?.len() + stream.size
+    );
     assert!(
         !destination.exists(),
         "dry-run created the destination tree"
@@ -181,7 +225,7 @@ fn dry_run_never_creates_destination_and_replacement_is_atomic()
     assert_eq!(initial.run.exit, 0, "copy errors: {:?}", initial.errors);
     assert_eq!(initial.counters.copied_new, 1);
 
-    fs::write(source.join("replace.txt"), b"second, longer version")?;
+    fs::write(&replace_path, b"second, longer version")?;
     let replacement = run_copy(&options, &SilentObserver)?;
     assert_eq!(
         replacement.run.exit, 0,
@@ -309,6 +353,75 @@ fn existing_file_is_rejected_as_a_destination_root() -> Result<(), Box<dyn std::
     options.state_dir = Some(sandbox.child(Path::new("state"))?);
     assert!(run_copy(&options, &SilentObserver).is_err());
     assert_eq!(fs::read(&destination)?, b"sentinel must remain unchanged");
+    Ok(())
+}
+
+#[test]
+fn standalone_verify_rejects_file_roots_without_modifying_them()
+-> Result<(), Box<dyn std::error::Error>> {
+    let sandbox = SandboxRoot::create_system_temp("verify-file-roots")?;
+    let source = sandbox.child(Path::new("source.txt"))?;
+    let destination = sandbox.child(Path::new("destination.txt"))?;
+    fs::write(&source, b"source sentinel")?;
+    fs::write(&destination, b"destination sentinel")?;
+    let result = bigcp_core::run_standalone_verify(&VerifyOptions {
+        source: source.clone(),
+        destination: destination.clone(),
+        report_path: None,
+    });
+    assert!(result.is_err());
+    assert_eq!(fs::read(source)?, b"source sentinel");
+    assert_eq!(fs::read(destination)?, b"destination sentinel");
+    Ok(())
+}
+
+#[test]
+fn failed_parent_subtree_logs_every_discovered_descendant() -> Result<(), Box<dyn std::error::Error>>
+{
+    let sandbox = SandboxRoot::create_system_temp("failed-subtree-audit")?;
+    let source = sandbox.child(Path::new("source"))?;
+    let destination = sandbox.child(Path::new("destination"))?;
+    fs::create_dir(&source)?;
+    fs::create_dir(&destination)?;
+    fs::create_dir(source.join("conflict"))?;
+    fs::create_dir(source.join("conflict").join("nested"))?;
+    fs::write(
+        source.join("conflict").join("nested").join("file.txt"),
+        b"test-owned descendant",
+    )?;
+    fs::write(destination.join("conflict"), b"type-conflict sentinel")?;
+
+    let mut options = CopyOptions::new(source, destination.clone());
+    options.state_dir = Some(sandbox.child(Path::new("state"))?);
+    let report = run_copy(&options, &SilentObserver)?;
+    assert_eq!(report.run.exit, 2);
+    assert_eq!(report.counters.not_attempted, 1);
+    assert_eq!(report.counters.dirs_failed, 2);
+    assert!(report.counters.reconcile().is_ok());
+    assert_eq!(
+        fs::read(destination.join("conflict"))?,
+        b"type-conflict sentinel"
+    );
+
+    let audit = fs::read_to_string(&report.run.log_path)?;
+    assert!(audit.lines().any(|line| {
+        serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .is_some_and(|event| {
+                event.get("ev").and_then(serde_json::Value::as_str) == Some("directory")
+                    && event.get("action").and_then(serde_json::Value::as_str)
+                        == Some("not_attempted_parent_failed")
+            })
+    }));
+    assert!(audit.lines().any(|line| {
+        serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .is_some_and(|event| {
+                event.get("ev").and_then(serde_json::Value::as_str) == Some("file")
+                    && event.get("action").and_then(serde_json::Value::as_str)
+                        == Some("not_attempted")
+            })
+    }));
     Ok(())
 }
 

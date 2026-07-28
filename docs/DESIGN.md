@@ -21,6 +21,9 @@ unsupported volumes, queries device facts without write probes, selects a
 deterministic static profile, validates audit containment, and acquires the
 destination lock. The coordinator then performs an iterative directory join.
 Directories are created before children and stamped after children.
+Their created or enumerated identities are retained through the post-order
+pass; stream, EA, and metadata handles must match those identities before any
+destination update.
 
 Plain files are classified from the joined snapshots. Stream discovery can
 promote a nominally small file with a large ADS. Small work enters a bounded
@@ -41,7 +44,10 @@ the raw reparse control path. All are built under owned opaque sibling names.
 The CRC32C-framed JSONL journal is a resume hint, never a completion database.
 Loading retains only the valid prefix and discards a torn tail. Job signatures
 bind checkpoints to semantic source, destination, and option identity. A temp
-prefix is reread and hashed before resume.
+prefix is reread and hashed before resume. Each resumable record also binds the
+source and temp to their volume serial plus 128-bit file ID. A stale, legacy,
+type-swapped, or identity-mismatched candidate is ignored without modifying
+the path it names.
 
 The versioned JSONL audit is lossless and rolls back partial line writes. It
 reopens once, then fails over to the state directory. The final JSON report is

@@ -25,12 +25,14 @@ pub mod volume;
 
 pub use device::{DeviceBus, DeviceInfo, profile_device};
 pub use ea::{
-    ExtendedAttributes, clear_extended_attributes, read_extended_attributes,
-    write_extended_attributes,
+    ExtendedAttributes, clear_extended_attributes, clear_extended_attributes_checked,
+    read_extended_attributes, read_extended_attributes_checked, write_extended_attributes,
+    write_extended_attributes_checked,
 };
 pub use file::{
     COPYABLE_ATTRIBUTES, DestinationTemp, SourceFile, create_directory, is_cloud_placeholder,
     is_compressed, is_encrypted, is_sparse, publish_audit_temporary, set_basic_at,
+    set_basic_at_checked,
 };
 pub use lock::DestinationLock;
 pub use metadata::{
@@ -40,7 +42,9 @@ pub use metadata::{
 pub use path::{
     absolute_extended, display_path, final_path, is_same_or_descendant, ordinal_case_key,
 };
-pub use reparse::{ReparseCopyResult, ReparseData, copy_reparse, read_reparse_data};
+pub use reparse::{
+    ReparseCopyError, ReparseCopyResult, ReparseData, copy_reparse, read_reparse_data,
+};
 pub use security::{ProtectedDacl, read_protected_dacl};
 pub use sparse::AllocatedRange;
 pub use streams::{DestinationStream, SourceStream, StreamInfo, list_streams};

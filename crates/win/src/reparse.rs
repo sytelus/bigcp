@@ -25,9 +25,9 @@ use windows_sys::Win32::System::SystemServices::{
     IO_REPARSE_TAG_MOUNT_POINT, IO_REPARSE_TAG_SYMLINK,
 };
 
-use crate::ea::{read_extended_attributes, write_to_file};
+use crate::ea::{read_extended_attributes_checked, write_to_file};
 use crate::file::{close_file, rename_by_handle, set_basic_by_handle, set_delete_on_close};
-use crate::metadata::BasicMetadata;
+use crate::metadata::{BasicMetadata, FileIdentity, ObjectMetadata, metadata_at};
 use crate::security::ProtectedDacl;
 use crate::streams::{DestinationStream, SourceStream, StreamInfo, list_streams};
 use crate::util::bool_result;
@@ -50,6 +50,17 @@ pub struct ReparseCopyResult {
     pub tag: u32,
     /// Named-stream bytes copied on the reparse object.
     pub named_stream_bytes: u64,
+}
+
+/// Typed failure from reparse transfer.
+#[derive(Debug, thiserror::Error)]
+pub enum ReparseCopyError {
+    /// The reparse object changed after it was examined.
+    #[error("source reparse point changed while it was being copied")]
+    SourceChanged,
+    /// A Win32 or filesystem operation failed.
+    #[error(transparent)]
+    Io(#[from] io::Error),
 }
 
 /// Reads a reparse point without following it.
@@ -101,16 +112,22 @@ pub fn copy_reparse(
     source: &Path,
     destination: &Path,
     run_id: &str,
-    replace: bool,
-    metadata: BasicMetadata,
+    expected_source: &ObjectMetadata,
+    expected_destination: Option<&ObjectMetadata>,
     raw: bool,
     flush: bool,
     protected_dacl: Option<&ProtectedDacl>,
-) -> io::Result<ReparseCopyResult> {
-    let source_before = crate::metadata::metadata_at(source)?;
-    let data = read_reparse_data(source)?;
-    let streams = list_streams(source)?;
-    let extended_attributes = read_extended_attributes(source)?;
+) -> Result<ReparseCopyResult, ReparseCopyError> {
+    let source_before = source_result(metadata_at(source))?;
+    if !same_reparse_snapshot(&source_before, expected_source) {
+        return Err(ReparseCopyError::SourceChanged);
+    }
+    let data = source_result(read_reparse_data(source))?;
+    let streams = source_result(list_streams(source))?;
+    let extended_attributes = source_identity_result(read_extended_attributes_checked(
+        source,
+        expected_source.identity,
+    ))?;
     if data.tag != IO_REPARSE_TAG_SYMLINK && data.tag != IO_REPARSE_TAG_MOUNT_POINT && !raw {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -118,7 +135,8 @@ pub fn copy_reparse(
                 "unsupported reparse tag 0x{:08x}; raw copying was not enabled",
                 data.tag
             ),
-        ));
+        )
+        .into());
     }
     let parent = destination.parent().ok_or_else(|| {
         io::Error::new(
@@ -149,32 +167,91 @@ pub fn copy_reparse(
         }
         temp
     };
-    let named_stream_bytes = copy_named_streams(source, &temp, &streams)?;
+    let named_stream_bytes = copy_named_streams(source, &temp, &streams, source_before.identity)?;
     write_to_file(temp.file_ref()?, &extended_attributes)?;
-    let source_after = crate::metadata::metadata_at(source)?;
-    if source_before.identity != source_after.identity
-        || source_before.size != source_after.size
-        || source_before.basic.last_write_time != source_after.basic.last_write_time
-        || source_before.basic.attributes != source_after.basic.attributes
-        || source_before.reparse_tag != source_after.reparse_tag
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "source reparse point changed while it was being copied",
-        ));
+    let source_after = source_result(metadata_at(source))?;
+    if !same_reparse_snapshot(&source_after, expected_source) {
+        return Err(ReparseCopyError::SourceChanged);
     }
-    temp.commit(destination, replace, metadata, flush, protected_dacl)?;
+    revalidate_destination(destination, expected_destination)?;
+    temp.commit(
+        destination,
+        expected_destination.is_some(),
+        expected_source.basic,
+        flush,
+        protected_dacl,
+    )?;
     Ok(ReparseCopyResult {
         tag: data.tag,
         named_stream_bytes,
     })
 }
 
+fn same_reparse_snapshot(observed: &ObjectMetadata, expected: &ObjectMetadata) -> bool {
+    observed.identity == expected.identity
+        && observed.kind == expected.kind
+        && observed.size == expected.size
+        && observed.basic.last_write_time == expected.basic.last_write_time
+        && observed.basic.attributes == expected.basic.attributes
+        && observed.reparse_tag == expected.reparse_tag
+}
+
+fn source_result<T>(result: io::Result<T>) -> Result<T, ReparseCopyError> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::UnexpectedEof
+            ) =>
+        {
+            Err(ReparseCopyError::SourceChanged)
+        }
+        Err(error) => Err(ReparseCopyError::Io(error)),
+    }
+}
+
+fn source_identity_result<T>(result: io::Result<T>) -> Result<T, ReparseCopyError> {
+    match result {
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+            Err(ReparseCopyError::SourceChanged)
+        }
+        other => source_result(other),
+    }
+}
+
+fn revalidate_destination(destination: &Path, expected: Option<&ObjectMetadata>) -> io::Result<()> {
+    match (expected, metadata_at(destination)) {
+        (None, Err(error)) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        (None, Ok(_)) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "a destination object appeared after classification",
+        )),
+        (Some(expected), Ok(observed))
+            if observed.identity == expected.identity
+                && observed.kind == expected.kind
+                && observed.size == expected.size
+                && observed.basic.last_write_time == expected.basic.last_write_time
+                && observed.basic.attributes == expected.basic.attributes
+                && observed.reparse_tag == expected.reparse_tag =>
+        {
+            Ok(())
+        }
+        (Some(_), Ok(_)) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "destination changed after classification",
+        )),
+        (Some(_), Err(error)) if error.kind() == io::ErrorKind::NotFound => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "destination disappeared after classification",
+        )),
+        (None | Some(_), Err(error)) => Err(error),
+    }
+}
+
 struct ReparseTemp {
     file: Option<File>,
     path: PathBuf,
-    directory: bool,
-    owned: bool,
 }
 
 impl ReparseTemp {
@@ -182,47 +259,13 @@ impl ReparseTemp {
         for _ in 0..128 {
             let nonce = Uuid::new_v4().simple().to_string();
             let path = parent.join(format!(".bigcp-{run_id}-{}.part", &nonce[..12]));
-            let creation = if directory {
-                fs::create_dir(&path)
+            let created = if directory {
+                fs::create_dir(&path).and_then(|()| Self::open_created(path.clone()))
             } else {
-                OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&path)
-                    .map(drop)
+                Self::create_file(path)
             };
-            match creation {
-                Ok(()) => {
-                    let mut options = OpenOptions::new();
-                    options
-                        .access_mode(
-                            GENERIC_READ
-                                | GENERIC_WRITE
-                                | DELETE
-                                | FILE_READ_ATTRIBUTES
-                                | FILE_WRITE_ATTRIBUTES,
-                        )
-                        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-                        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);
-                    let file = match options.open(&path) {
-                        Ok(file) => file,
-                        Err(error) => {
-                            remove_owned(&path, directory);
-                            return Err(error);
-                        }
-                    };
-                    if let Err(error) = set_delete_on_close(&file, true) {
-                        drop(file);
-                        remove_owned(&path, directory);
-                        return Err(error);
-                    }
-                    return Ok(Self {
-                        file: Some(file),
-                        path,
-                        directory,
-                        owned: true,
-                    });
-                }
+            match created {
+                Ok(temp) => return Ok(temp),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(error),
             }
@@ -231,6 +274,25 @@ impl ReparseTemp {
             io::ErrorKind::AlreadyExists,
             "could not allocate a unique reparse temporary name",
         ))
+    }
+
+    fn create_file(path: PathBuf) -> io::Result<Self> {
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .access_mode(
+                GENERIC_READ
+                    | GENERIC_WRITE
+                    | DELETE
+                    | FILE_READ_ATTRIBUTES
+                    | FILE_WRITE_ATTRIBUTES,
+            )
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .create_new(true);
+        let file = options.open(&path)?;
+        Self::arm_created(file, path)
     }
 
     fn create_symbolic_link(
@@ -262,7 +324,7 @@ impl ReparseTemp {
             let created =
                 unsafe { CreateSymbolicLinkW(path_wide.as_ptr(), target_wide.as_ptr(), flags) };
             if created {
-                return Self::open_created(path, directory);
+                return Self::open_created(path);
             }
             let error = io::Error::last_os_error();
             if error.kind() != io::ErrorKind::AlreadyExists {
@@ -275,7 +337,7 @@ impl ReparseTemp {
         ))
     }
 
-    fn open_created(path: PathBuf, directory: bool) -> io::Result<Self> {
+    fn open_created(path: PathBuf) -> io::Result<Self> {
         let mut options = OpenOptions::new();
         options
             .access_mode(
@@ -285,25 +347,22 @@ impl ReparseTemp {
                     | FILE_READ_ATTRIBUTES
                     | FILE_WRITE_ATTRIBUTES,
             )
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);
-        let file = match options.open(&path) {
-            Ok(file) => file,
-            Err(error) => {
-                remove_owned(&path, directory);
-                return Err(error);
-            }
-        };
+        // See `create`: never delete by path after losing the handle that
+        // proves which object occupies this opaque name.
+        let file = options.open(&path)?;
+        Self::arm_created(file, path)
+    }
+
+    fn arm_created(file: File, path: PathBuf) -> io::Result<Self> {
         if let Err(error) = set_delete_on_close(&file, true) {
             drop(file);
-            remove_owned(&path, directory);
             return Err(error);
         }
         Ok(Self {
             file: Some(file),
             path,
-            directory,
-            owned: true,
         })
     }
 
@@ -344,7 +403,6 @@ impl ReparseTemp {
             self.file = Some(file);
             return Err(error);
         }
-        self.owned = false;
         self.path = destination.to_path_buf();
         set_basic_by_handle(&file, metadata)?;
         if flush {
@@ -358,15 +416,19 @@ fn copy_named_streams(
     source: &Path,
     temp: &ReparseTemp,
     streams: &[StreamInfo],
-) -> io::Result<u64> {
+    expected_source_identity: FileIdentity,
+) -> Result<u64, ReparseCopyError> {
     let mut buffer = vec![0_u8; 1024 * 1024];
     let mut total = 0_u64;
     for stream in streams.iter().filter(|stream| !stream.is_unnamed()) {
-        let mut input = SourceStream::open_reparse(source, stream)?;
+        let mut input = source_result(SourceStream::open_reparse(source, stream))?;
+        if source_result(input.identity())? != expected_source_identity {
+            return Err(ReparseCopyError::SourceChanged);
+        }
         let mut output = temp.create_stream(stream)?;
         let mut copied = 0_u64;
         loop {
-            let count = input.read(&mut buffer)?;
+            let count = source_result(input.read(&mut buffer))?;
             if count == 0 {
                 break;
             }
@@ -374,10 +436,7 @@ fn copy_named_streams(
             copied = copied.saturating_add(count as u64);
         }
         if copied != stream.size {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "reparse-point named stream changed size while it was copied",
-            ));
+            return Err(ReparseCopyError::SourceChanged);
         }
         output.flush()?;
         total = total.saturating_add(copied);
@@ -469,17 +528,8 @@ impl Drop for ReparseTemp {
         if let Some(file) = self.file.take() {
             drop(file);
         }
-        if self.owned {
-            remove_owned(&self.path, self.directory);
-        }
-    }
-}
-
-fn remove_owned(path: &Path, directory: bool) {
-    if directory {
-        let _ = fs::remove_dir(path);
-    } else {
-        let _ = fs::remove_file(path);
+        // The delete disposition is bound to the exact created object. A
+        // path-based fallback after close could remove a replacement name.
     }
 }
 

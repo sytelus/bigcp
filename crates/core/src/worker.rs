@@ -38,6 +38,8 @@ pub(crate) struct FileCopyJob {
     pub chunk_bytes: usize,
     pub checkpoint_threshold: u64,
     pub streams: Vec<StreamInfo>,
+    /// Unnamed data plus every discovered named `$DATA` stream.
+    pub logical_bytes: u64,
 }
 
 impl FileCopyJob {
@@ -69,6 +71,7 @@ impl FileCopyJob {
             replacement: self.replacement,
             counters,
             result,
+            logical_bytes: self.logical_bytes,
         }
     }
 }
@@ -81,6 +84,8 @@ pub(crate) struct CompletedCopy {
     pub replacement: Option<ReplacementWork>,
     pub counters: Counters,
     pub result: Result<EngineResult, OperationError>,
+    /// Logical bytes represented even when transfer fails partway.
+    pub logical_bytes: u64,
 }
 
 /// Fixed-size worker set with bounded work and result channels.

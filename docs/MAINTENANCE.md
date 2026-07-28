@@ -18,7 +18,7 @@
 | ID | Rule | Mechanical enforcement/evidence |
 |---|---|---|
 | I1 | Source handles are read-only. | `SourceFile`/`SourceStream` choke points; unsafe denied outside `win`. |
-| I2 | Never delete an unowned destination. | Only owned `DestinationTemp`/`ReparseTemp` siblings can self-delete; no mirror/purge command. |
+| I2 | Never delete an unowned destination. | Delete-on-close is bound to the created handle; resumed temps require journaled file identity; no path-delete fallback or mirror/purge command. |
 | I3 | Never truncate a replacement in place. | Replacement always constructs a sibling temp. |
 | I4 | `copied` only follows commit. | `EngineResult` is returned after rename, metadata, optional flush, and close. |
 | I5 | Final names never contain partial file data. | Uniform temp/rename; end-to-end atomic replacement test. |
@@ -27,9 +27,9 @@
 | I8 | Journal never creates a skip. | Journal API exposes checkpoints only; every-byte torn-tail test. |
 | I9 | Memory/work queues are bounded. | `crossbeam_channel::bounded`; per-stream buffers/profile caps. |
 | I10 | No source-tree writes. | All write constructors accept destination/audit paths; preflight audit containment. |
-| I11 | Destination mutations revalidate targets. | Identity/kind/size/mtime/attributes/reparse-tag snapshot immediately before metadata repair or replacement. |
+| I11 | Destination mutations revalidate targets. | Identity/kind/size/mtime/attributes/reparse-tag snapshot before repair/replacement; directory stream, EA, and metadata updates recheck identity on their write handle. |
 | I12 | One writer per exact destination. | Global mutex with exact-root hash. |
-| I13 | Resume verifies the prefix. | Prefix reread, exact xxh3 boundary digest, size/source snapshot checks. |
+| I13 | Resume verifies the prefix. | Source/temp identities, source size/mtime, prefix reread, and exact xxh3 boundary digest must all match. |
 
 Changes to an invariant require a focused test and an ADR. The current suite is
 not a substitute for the plan's future fault-injection and chaos release gates.
@@ -79,9 +79,12 @@ counters/audit/integrity closure. A missing `run_end` means interruption or
 audit failure, not failure of already committed files.
 
 Journal records are not user reports. Each line contains version, tagged event,
-and CRC. A torn last line is ignored. A checkpoint records a temp sibling,
-stream key, source size/mtime, watermark, and prefix digest. Never repair a
-journal manually or infer completion from `part_done`; rerun normal copy.
+and CRC. A torn last line is ignored; an unsupported version is left untouched
+and disables checkpointing for that run. A new checkpoint records a temp
+sibling, source and temp filesystem identities, stream key, source size/mtime,
+watermark, and prefix digest. Older identity-less records load but cannot
+authorize resume. Never repair a journal manually or infer completion from
+`part_done`; rerun normal copy.
 
 Reports are versioned aggregate JSON. `bigcp report FILE --plain` provides a
 stable terminal summary; the full document contains devices, timeline,

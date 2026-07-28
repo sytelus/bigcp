@@ -10,7 +10,11 @@ by the frozen plan.
 
 - Read-only source primitives and non-following link handling.
 - Uniform opaque-temp plus atomic-rename publication for files and links.
+- Checkpoint source/temp identity binding, non-following resume opens, and
+  exact-handle delete-on-close ownership.
 - Destination snapshot revalidation before replacement and metadata repair.
+- Handle-bound source/destination identity checks for named streams, EAs, and
+  post-order directory metadata finalization.
 - File, directory, ADS, EA, sparse-data, symlink, junction, rerun, dry-run,
   cancellation, report-fallback, and both verification paths.
 - Exact terminal counter reconciliation and a durably synchronized `run_end`.

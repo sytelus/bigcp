@@ -13,10 +13,11 @@ use std::time::{Duration, Instant};
 
 use bigcp_win::{
     DestinationLock, DestinationStream, DirectoryEntry, FileSystem, ObjectKind, ObjectMetadata,
-    SourceStream, VolumeInfo, absolute_extended, clear_extended_attributes, copy_reparse,
+    SourceStream, VolumeInfo, absolute_extended, clear_extended_attributes_checked, copy_reparse,
     create_directory, display_path, enumerate_directory, final_path, is_cloud_placeholder,
     is_compressed, is_same_or_descendant, list_streams, metadata_at, open_root, ordinal_case_key,
-    probe_volume, read_extended_attributes, set_basic_at, write_extended_attributes,
+    probe_volume, read_extended_attributes_checked, set_basic_at_checked,
+    write_extended_attributes_checked,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -603,7 +604,36 @@ impl Runner<'_> {
                             action: "created".to_owned(),
                             rel: AuditPath::from_path(&child_relative),
                         })?;
-                        (true, None)
+                        match metadata_at(&child_destination) {
+                            Ok(metadata) if metadata.kind == ObjectKind::Directory => {
+                                (true, Some(metadata))
+                            }
+                            Ok(_) => {
+                                self.account_failed_subtree(
+                                    &source_entry.path,
+                                    &child_relative,
+                                    OperationError::semantic(
+                                        ErrorCategory::DestinationChanged,
+                                        "revalidate_dst_dir",
+                                        child_relative.clone(),
+                                        "new destination directory changed type after creation",
+                                    ),
+                                )?;
+                                continue;
+                            }
+                            Err(error) => {
+                                self.account_failed_subtree(
+                                    &source_entry.path,
+                                    &child_relative,
+                                    destination_access_error(
+                                        "revalidate_dst_dir",
+                                        &child_relative,
+                                        &error,
+                                    ),
+                                )?;
+                                continue;
+                            }
+                        }
                     } else {
                         (false, None)
                     }
@@ -656,10 +686,46 @@ impl Runner<'_> {
             }
             return Ok(());
         }
+        let Some(expected_destination) = destination_metadata else {
+            self.counters.dirs_meta_failed = self.counters.dirs_meta_failed.saturating_add(1);
+            self.record_error(OperationError::semantic(
+                ErrorCategory::Internal,
+                "revalidate_dst_dir",
+                relative.to_path_buf(),
+                "destination directory has no captured identity",
+            ))?;
+            return Ok(());
+        };
+        match metadata_at(destination) {
+            Ok(observed)
+                if observed.kind == ObjectKind::Directory
+                    && observed.identity == expected_destination.identity => {}
+            Ok(_) => {
+                self.counters.dirs_meta_failed = self.counters.dirs_meta_failed.saturating_add(1);
+                self.record_error(OperationError::semantic(
+                    ErrorCategory::DestinationChanged,
+                    "revalidate_dst_dir",
+                    relative.to_path_buf(),
+                    "destination directory identity or type changed during the run",
+                ))?;
+                return Ok(());
+            }
+            Err(error) => {
+                self.counters.dirs_meta_failed = self.counters.dirs_meta_failed.saturating_add(1);
+                self.record_error(destination_access_error(
+                    "revalidate_dst_dir",
+                    relative,
+                    &error,
+                ))?;
+                return Ok(());
+            }
+        }
         // Directory last-write updates can be committed lazily by NTFS after
-        // child creation handles close. Re-read at post-order finalization so
-        // the destination receives the stable value, while still requiring
-        // the enumerated directory identity to remain unchanged.
+        // a fixture or other prior child/ADS creation handle closes. Re-read
+        // at post-order finalization for the stable value, while requiring the
+        // enumerated directory identity and type to remain unchanged. The
+        // exclusive-source precondition remains responsible for tree-shape
+        // stability; the refreshed snapshot is checked again after aux I/O.
         let current_source_metadata = match metadata_at(source) {
             Ok(metadata)
                 if metadata.kind == ObjectKind::Directory
@@ -679,16 +745,18 @@ impl Runner<'_> {
             }
             Err(error) => {
                 self.counters.dirs_meta_failed = self.counters.dirs_meta_failed.saturating_add(1);
-                self.record_error(OperationError::from_io(
-                    "revalidate_dir",
-                    relative.to_path_buf(),
-                    &error,
-                ))?;
+                self.record_error(source_access_error("revalidate_dir", relative, &error))?;
                 return Ok(());
             }
         };
-        let stream_result = self.copy_directory_streams(source, destination, relative);
-        let ea_result = if source_metadata.ea_size > 0 && !self.destination_supports_eas {
+        let stream_result = self.copy_directory_streams(
+            source,
+            destination,
+            relative,
+            current_source_metadata.identity,
+            expected_destination.identity,
+        );
+        let auxiliary_result = if source_metadata.ea_size > 0 && !self.destination_supports_eas {
             self.increment_warning("ea_dropped");
             self.audit.emit(&AuditEvent::Warning {
                 kind: "ea_dropped".to_owned(),
@@ -702,45 +770,84 @@ impl Runner<'_> {
                     || destination_metadata.is_some_and(|metadata| metadata.ea_size > 0)
                     || relative.as_os_str().is_empty()
                 {
-                    read_extended_attributes(source).and_then(|source_eas| {
-                        let destination_eas = read_extended_attributes(destination)?;
-                        if source_eas == destination_eas {
-                            Ok(())
-                        } else {
-                            if !destination_eas.is_empty() {
-                                clear_extended_attributes(destination)?;
-                            }
-                            if source_eas.is_empty() {
+                    read_extended_attributes_checked(source, current_source_metadata.identity)
+                        .map_err(|error| source_access_error("read_dir_ea", relative, &error))
+                        .and_then(|source_eas| {
+                            let destination_eas = read_extended_attributes_checked(
+                                destination,
+                                expected_destination.identity,
+                            )
+                            .map_err(|error| {
+                                destination_access_error("read_dir_ea", relative, &error)
+                            })?;
+                            if source_eas == destination_eas {
                                 Ok(())
                             } else {
-                                write_extended_attributes(destination, &source_eas)
+                                if !destination_eas.is_empty() {
+                                    clear_extended_attributes_checked(
+                                        destination,
+                                        expected_destination.identity,
+                                    )
+                                    .map_err(|error| {
+                                        destination_access_error("clear_dir_ea", relative, &error)
+                                    })?;
+                                }
+                                if source_eas.is_empty() {
+                                    Ok(())
+                                } else {
+                                    write_extended_attributes_checked(
+                                        destination,
+                                        expected_destination.identity,
+                                        &source_eas,
+                                    )
+                                    .map_err(|error| {
+                                        destination_access_error("write_dir_ea", relative, &error)
+                                    })
+                                }
                             }
-                        }
-                    })
+                        })
                 } else {
                     Ok(())
                 }
             })
         };
-        let metadata_result =
-            ea_result.and_then(|()| set_basic_at(destination, current_source_metadata.basic));
-        match metadata_result {
-            Ok(()) => {
-                self.counters.dir_done = self.counters.dir_done.saturating_add(1);
-                self.audit.emit(&AuditEvent::Directory {
-                    action: "stamped".to_owned(),
-                    rel: AuditPath::from_path(relative),
-                })?;
+        if let Err(error) = auxiliary_result {
+            self.counters.dirs_meta_failed = self.counters.dirs_meta_failed.saturating_add(1);
+            self.record_error(error)?;
+            return Ok(());
+        }
+        match metadata_at(source) {
+            Ok(observed) if same_directory_source(&observed, &current_source_metadata) => {}
+            Ok(_) => {
+                self.counters.dirs_meta_failed = self.counters.dirs_meta_failed.saturating_add(1);
+                self.record_error(OperationError::semantic(
+                    ErrorCategory::SourceChanged,
+                    "revalidate_dir",
+                    relative.to_path_buf(),
+                    "source directory changed during metadata finalization",
+                ))?;
+                return Ok(());
             }
             Err(error) => {
                 self.counters.dirs_meta_failed = self.counters.dirs_meta_failed.saturating_add(1);
-                self.record_error(OperationError::from_io(
-                    "set_dir_meta",
-                    relative.to_path_buf(),
-                    &error,
-                ))?;
+                self.record_error(source_access_error("revalidate_dir", relative, &error))?;
+                return Ok(());
             }
         }
+        if let Err(error) = set_basic_at_checked(
+            destination,
+            expected_destination.identity,
+            current_source_metadata.basic,
+        ) {
+            self.counters.dirs_meta_failed = self.counters.dirs_meta_failed.saturating_add(1);
+            self.record_error(destination_access_error("set_dir_meta", relative, &error))?;
+            return Ok(());
+        }
+        self.counters.dir_done = self.counters.dir_done.saturating_add(1);
+        self.audit.emit(&AuditEvent::Directory {
+            action: "stamped".to_owned(),
+            rel: AuditPath::from_path(relative),
+        })?;
         Ok(())
     }
 
@@ -749,8 +856,11 @@ impl Runner<'_> {
         source: &Path,
         destination: &Path,
         relative: &Path,
-    ) -> std::io::Result<()> {
-        let streams = list_streams(source)?;
+        expected_source: bigcp_win::FileIdentity,
+        expected_destination: bigcp_win::FileIdentity,
+    ) -> Result<(), OperationError> {
+        let streams = list_streams(source)
+            .map_err(|error| source_access_error("list_dir_streams", relative, &error))?;
         let named: Vec<_> = streams
             .iter()
             .filter(|stream| !stream.is_unnamed())
@@ -763,15 +873,47 @@ impl Runner<'_> {
         }
         let mut buffer = vec![0_u8; self.chunk_bytes.clamp(64 * 1024, 8 * 1024 * 1024)];
         for stream in named {
-            let mut input = SourceStream::open(source, stream)?;
-            let mut output = DestinationStream::create(destination, stream, true)?;
+            let mut input = SourceStream::open_reparse(source, stream)
+                .map_err(|error| source_access_error("open_dir_stream", relative, &error))?;
+            if input
+                .identity()
+                .map_err(|error| source_access_error("identify_dir_stream", relative, &error))?
+                != expected_source
+            {
+                return Err(OperationError::semantic(
+                    ErrorCategory::SourceChanged,
+                    "identify_dir_stream",
+                    relative.to_path_buf(),
+                    "directory stream belongs to a different source object",
+                ));
+            }
+            let mut output =
+                DestinationStream::create_checked(destination, expected_destination, stream, true)
+                    .map_err(|error| {
+                        destination_access_error("create_dir_stream", relative, &error)
+                    })?;
+            if output.identity().map_err(|error| {
+                destination_access_error("identify_dir_stream", relative, &error)
+            })? != expected_destination
+            {
+                return Err(OperationError::semantic(
+                    ErrorCategory::DestinationChanged,
+                    "identify_dir_stream",
+                    relative.to_path_buf(),
+                    "directory stream belongs to a different destination object",
+                ));
+            }
             let mut copied = 0_u64;
             loop {
-                let count = input.read(&mut buffer)?;
+                let count = input
+                    .read(&mut buffer)
+                    .map_err(|error| source_access_error("read_dir_stream", relative, &error))?;
                 if count == 0 {
                     break;
                 }
-                output.write_all(&buffer[..count])?;
+                output.write_all(&buffer[..count]).map_err(|error| {
+                    destination_access_error("write_dir_stream", relative, &error)
+                })?;
                 copied = copied.saturating_add(count as u64);
                 self.counters.bytes_read_source =
                     self.counters.bytes_read_source.saturating_add(count as u64);
@@ -781,16 +923,19 @@ impl Runner<'_> {
                     .saturating_add(count as u64);
             }
             if copied != stream.size {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
+                return Err(OperationError::semantic(
+                    ErrorCategory::SourceChanged,
+                    "read_dir_stream",
+                    relative.to_path_buf(),
                     format!(
-                        "directory stream {} at {} changed size during copy",
-                        stream.name.to_string_lossy(),
-                        relative.display()
+                        "directory stream {} changed size during copy",
+                        stream.name.to_string_lossy()
                     ),
                 ));
             }
-            output.flush()?;
+            output
+                .flush()
+                .map_err(|error| destination_access_error("flush_dir_stream", relative, &error))?;
         }
         Ok(())
     }
@@ -937,6 +1082,55 @@ impl Runner<'_> {
             }
             (None, _) => None,
         };
+        if let Err(error) = revalidate_source(source, relative) {
+            return self.record_file(
+                relative,
+                FileOutcome::Failed {
+                    bytes: source.metadata.size,
+                    error,
+                },
+                replacement.map(|(fields, _)| fields),
+            );
+        }
+        let streams = match list_streams(&source.path) {
+            Ok(streams) => streams,
+            Err(error) => {
+                let error = if error.kind() == std::io::ErrorKind::NotFound {
+                    OperationError::from_io_as(
+                        ErrorCategory::SourceChanged,
+                        "list_streams",
+                        relative.to_path_buf(),
+                        &error,
+                    )
+                } else {
+                    OperationError::from_io("list_streams", relative.to_path_buf(), &error)
+                };
+                return self.record_file(
+                    relative,
+                    FileOutcome::Failed {
+                        bytes: source.metadata.size,
+                        error,
+                    },
+                    replacement.map(|(fields, _)| fields),
+                );
+            }
+        };
+        let logical_bytes = streams
+            .iter()
+            .filter(|stream| !stream.is_unnamed())
+            .fold(source.metadata.size, |total, stream| {
+                total.saturating_add(stream.size)
+            });
+        if let Err(error) = revalidate_source(source, relative) {
+            return self.record_file(
+                relative,
+                FileOutcome::Failed {
+                    bytes: logical_bytes,
+                    error,
+                },
+                replacement.map(|(fields, _)| fields),
+            );
+        }
         if self.options.dry_run {
             let reason = if replacement.is_some() && replacement_old.is_some() {
                 self.counters.would_copy_replaced =
@@ -947,29 +1141,12 @@ impl Runner<'_> {
                 "dry_run_would_copy_new"
             };
             let outcome = FileOutcome::NotAttempted {
-                bytes: source.metadata.size,
+                bytes: logical_bytes,
                 reason: reason.to_owned(),
             };
             return self.record_file(relative, outcome, replacement.map(|(fields, _)| fields));
         }
         let destination_path = self.destination_root.join(relative);
-        let streams = match list_streams(&source.path) {
-            Ok(streams) => streams,
-            Err(error) => {
-                return self.record_file(
-                    relative,
-                    FileOutcome::Failed {
-                        bytes: source.metadata.size,
-                        error: OperationError::from_io(
-                            "list_streams",
-                            relative.to_path_buf(),
-                            &error,
-                        ),
-                    },
-                    replacement.map(|(fields, _)| fields),
-                );
-            }
-        };
         let largest_stream = streams
             .iter()
             .map(|stream| stream.size)
@@ -998,6 +1175,7 @@ impl Runner<'_> {
                 chunk_bytes: self.chunk_bytes,
                 checkpoint_threshold: self.options.checkpoint_threshold(),
                 streams,
+                logical_bytes,
             };
             return self.submit_small_job(job);
         }
@@ -1029,6 +1207,7 @@ impl Runner<'_> {
             replacement,
             counters,
             result,
+            logical_bytes,
         })
     }
 
@@ -1085,7 +1264,7 @@ impl Runner<'_> {
                     self.audit.emit(&AuditEvent::Warning {
                         kind: "checkpointing_disabled".to_owned(),
                         rel: Some(AuditPath::from_path(relative)),
-                        message: "checkpoint journal append failed; this run continues without further resume checkpoints".to_owned(),
+                        message: "checkpoint persistence failed; this run continues without further resume checkpoints".to_owned(),
                     })?;
                 }
                 if result.efs_downgraded {
@@ -1167,7 +1346,7 @@ impl Runner<'_> {
                 }
             }
             Err(error) => FileOutcome::Failed {
-                bytes: completed.source_snapshot.metadata.size,
+                bytes: completed.logical_bytes,
                 error,
             },
         };
@@ -1306,9 +1485,19 @@ impl Runner<'_> {
                     )?;
                     return Ok(());
                 }
+                if let Err(error) = revalidate_source(&source, &relative) {
+                    self.counters.links_failed = self.counters.links_failed.saturating_add(1);
+                    self.record_link_event(
+                        &relative,
+                        "failed_link",
+                        None,
+                        replacement_event,
+                        Some(error),
+                    )?;
+                    return Ok(());
+                }
                 let mut protected_dacl = None;
                 if let Some(expected) = destination.as_ref() {
-                    let destination_path = self.destination_root.join(&relative);
                     if let Err(error) = revalidate_destination(expected, &relative) {
                         self.counters.links_failed = self.counters.links_failed.saturating_add(1);
                         self.record_link_event(
@@ -1320,6 +1509,7 @@ impl Runner<'_> {
                         )?;
                         return Ok(());
                     }
+                    let destination_path = self.destination_root.join(&relative);
                     match bigcp_win::read_protected_dacl(&destination_path) {
                         Ok(value) => protected_dacl = value,
                         Err(error) => {
@@ -1343,8 +1533,10 @@ impl Runner<'_> {
                     &source.path,
                     &destination_path,
                     self.run_id,
-                    destination_snapshot.is_some(),
-                    source.metadata.basic,
+                    &source.metadata,
+                    destination_snapshot
+                        .as_ref()
+                        .map(|snapshot| &snapshot.metadata),
                     self.options.raw_reparse,
                     self.options.flush,
                     protected_dacl.as_ref(),
@@ -1369,7 +1561,23 @@ impl Runner<'_> {
                             None,
                         )?;
                     }
-                    Err(error) => {
+                    Err(bigcp_win::ReparseCopyError::SourceChanged) => {
+                        self.counters.links_failed = self.counters.links_failed.saturating_add(1);
+                        let operation_error = OperationError::semantic(
+                            ErrorCategory::SourceChanged,
+                            "copy_reparse",
+                            relative.clone(),
+                            "source reparse point changed while it was being copied",
+                        );
+                        self.record_link_event(
+                            &relative,
+                            "failed_link",
+                            None,
+                            replacement_event,
+                            Some(operation_error),
+                        )?;
+                    }
+                    Err(bigcp_win::ReparseCopyError::Io(error)) => {
                         self.counters.links_failed = self.counters.links_failed.saturating_add(1);
                         let operation_error = if error.kind() == std::io::ErrorKind::Unsupported {
                             OperationError::from_io_as(
@@ -1509,6 +1717,10 @@ impl Runner<'_> {
                         self.counters.dirs_discovered =
                             self.counters.dirs_discovered.saturating_add(1);
                         self.counters.dirs_failed = self.counters.dirs_failed.saturating_add(1);
+                        self.audit.emit(&AuditEvent::Directory {
+                            action: "not_attempted_parent_failed".to_owned(),
+                            rel: AuditPath::from_path(&child_relative),
+                        })?;
                         directories.push((entry.path, child_relative));
                     }
                     ObjectKind::Reparse => {
@@ -1516,6 +1728,13 @@ impl Runner<'_> {
                             self.counters.links_discovered.saturating_add(1);
                         self.counters.links_not_attempted =
                             self.counters.links_not_attempted.saturating_add(1);
+                        self.record_link_event(
+                            &child_relative,
+                            "not_attempted_link",
+                            Some("parent_dir_failed".to_owned()),
+                            None,
+                            None,
+                        )?;
                     }
                 }
             }
@@ -2175,35 +2394,144 @@ fn repair_metadata(
     differences: &[&str],
     relative: &Path,
 ) -> Result<(), OperationError> {
-    let source_eas =
-        if differences.contains(&"ea_size") {
-            Some(read_extended_attributes(&source.path).map_err(|error| {
-                OperationError::from_io("read_ea", relative.to_path_buf(), &error)
-            })?)
-        } else {
-            None
-        };
+    revalidate_source(source, relative)?;
+    let source_eas = if differences.contains(&"ea_size") {
+        Some(
+            read_extended_attributes_checked(&source.path, source.metadata.identity)
+                .map_err(|error| source_access_error("read_ea", relative, &error))?,
+        )
+    } else {
+        None
+    };
+    revalidate_source(source, relative)?;
     revalidate_destination(destination, relative)?;
     if let Some(source_eas) = source_eas {
-        clear_extended_attributes(&destination.path)
-            .map_err(|error| OperationError::from_io("clear_ea", relative.to_path_buf(), &error))?;
+        clear_extended_attributes_checked(&destination.path, destination.metadata.identity)
+            .map_err(|error| destination_access_error("clear_ea", relative, &error))?;
         if !source_eas.is_empty() {
-            write_extended_attributes(&destination.path, &source_eas).map_err(|error| {
-                OperationError::from_io("write_ea", relative.to_path_buf(), &error)
-            })?;
+            write_extended_attributes_checked(
+                &destination.path,
+                destination.metadata.identity,
+                &source_eas,
+            )
+            .map_err(|error| destination_access_error("write_ea", relative, &error))?;
         }
     }
-    set_basic_at(&destination.path, source.metadata.basic)
-        .map_err(|error| OperationError::from_io("set_meta", relative.to_path_buf(), &error))
+    set_basic_at_checked(
+        &destination.path,
+        destination.metadata.identity,
+        source.metadata.basic,
+    )
+    .map_err(|error| destination_access_error("set_meta", relative, &error))
+}
+
+fn same_directory_source(observed: &ObjectMetadata, expected: &ObjectMetadata) -> bool {
+    observed.identity == expected.identity
+        && observed.kind == ObjectKind::Directory
+        && observed.basic.last_write_time == expected.basic.last_write_time
+        && observed.basic.attributes == expected.basic.attributes
+        && observed.reparse_tag == expected.reparse_tag
+}
+
+fn source_access_error(operation: &str, relative: &Path, error: &std::io::Error) -> OperationError {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::InvalidData
+    ) {
+        OperationError::from_io_as(
+            ErrorCategory::SourceChanged,
+            operation,
+            relative.to_path_buf(),
+            error,
+        )
+    } else {
+        OperationError::from_io(operation, relative.to_path_buf(), error)
+    }
+}
+
+fn destination_access_error(
+    operation: &str,
+    relative: &Path,
+    error: &std::io::Error,
+) -> OperationError {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::AlreadyExists
+            | std::io::ErrorKind::InvalidData
+    ) {
+        OperationError::from_io_as(
+            ErrorCategory::DestinationChanged,
+            operation,
+            relative.to_path_buf(),
+            error,
+        )
+    } else {
+        OperationError::from_io(operation, relative.to_path_buf(), error)
+    }
+}
+
+fn revalidate_source(source: &DirectoryEntry, relative: &Path) -> Result<(), OperationError> {
+    let observed = match metadata_at(&source.path) {
+        Ok(observed) => observed,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(OperationError::from_io_as(
+                ErrorCategory::SourceChanged,
+                "revalidate_src",
+                relative.to_path_buf(),
+                &error,
+            ));
+        }
+        Err(error) => {
+            return Err(OperationError::from_io(
+                "revalidate_src",
+                relative.to_path_buf(),
+                &error,
+            ));
+        }
+    };
+    let expected = &source.metadata;
+    if observed.identity != expected.identity
+        || observed.kind != expected.kind
+        || observed.size != expected.size
+        || observed.basic.last_write_time != expected.basic.last_write_time
+        || observed.basic.attributes != expected.basic.attributes
+        || observed.reparse_tag != expected.reparse_tag
+    {
+        return Err(OperationError::semantic(
+            ErrorCategory::SourceChanged,
+            "revalidate_src",
+            relative.to_path_buf(),
+            "source changed after enumeration",
+        ));
+    }
+    Ok(())
 }
 
 fn revalidate_destination(
     destination: &DirectoryEntry,
     relative: &Path,
 ) -> Result<(), OperationError> {
-    let observed = metadata_at(&destination.path).map_err(|error| {
-        OperationError::from_io("revalidate_dst", relative.to_path_buf(), &error)
-    })?;
+    let observed = match metadata_at(&destination.path) {
+        Ok(observed) => observed,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(OperationError::semantic(
+                ErrorCategory::DestinationChanged,
+                "revalidate_dst",
+                relative.to_path_buf(),
+                "destination disappeared after classification",
+            ));
+        }
+        Err(error) => {
+            return Err(OperationError::from_io(
+                "revalidate_dst",
+                relative.to_path_buf(),
+                &error,
+            ));
+        }
+    };
     let expected = &destination.metadata;
     if observed.identity != expected.identity
         || observed.kind != expected.kind

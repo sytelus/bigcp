@@ -166,3 +166,61 @@ were not accessed—their only test appearances remained inert path values sent
 to the guard that rejects them before any filesystem query. Long-running,
 destructive, external-drive, VHDX/ReFS, chaos, and endurance gates remained
 unrun for the safety reasons documented above.
+
+## 2026-07-28 second independent safety review
+
+The follow-up whole-repository review hardened resume ownership, final-component
+reparse handling, destination-race detection, reparse finalization, named-stream
+accounting, and failed-subtree audit completeness. It added ADR 0026 for the
+additive journal identity fields and recorded newly confirmed performance and
+architecture differences in `PLAN_DEVIATIONS.md`.
+
+The final serial workspace run used:
+
+`C:\Users\shitals\AppData\Local\Temp\bigcp-final-second-review-v7-b18003f8d7a0429787a795703c7c83a1`
+
+It passed 54 tests with zero failures: 3 CLI, 19 core unit, 9 core end-to-end,
+3 testkit safety, 1 TUI, and 19 Windows-boundary tests. New cases proved that:
+
+- a reused opaque temp name cannot authorize mutation or deletion when its
+  filesystem identity differs;
+- legacy identity-less and future-version journal records fail safe without
+  trusting or truncating unsupported state;
+- ordinary source opens and directory ADS handles do not follow a final
+  reparse point;
+- an opened named stream belongs to the enumerated source file identity and
+  the default stream reader does not follow a substituted link;
+- checked ADS/EA access refuses a mismatched object identity without changing
+  the test-owned stream or file, while directory ADS/EA copying still converges;
+- a dangling-link new-name collision remains intact;
+- dry-run and failure accounting include discovered named-stream bytes;
+- standalone verification rejects file roots without changing them; and
+- every discoverable descendant of a failed parent subtree receives an audit
+  outcome while the conflicting destination sentinel remains unchanged.
+
+The following final gates also passed: frozen-input hashes, automated
+test-storage checks, rustfmt, warning-denied Clippy, locked workspace tests,
+rustdoc, optimized release build, `cargo deny check`, and `cargo audit` over
+146 locked dependencies. Cargo-deny reported only the existing informational
+transitive `hashbrown` and `syn` duplicates; every advisory, ban, license, and
+source policy passed, and cargo-audit found no vulnerability.
+
+The optimized executable smoke workflow used:
+
+`C:\Users\shitals\AppData\Local\Temp\bigcp-final-second-review-smoke-v7-526028d5543a4a46afd4e68b75497d11`
+
+It generated 78,848 source bytes, proved dry-run left the destination absent,
+copied and post-copy verified five files, passed the independent nine-object
+oracle and standalone verification with zero mismatch or extra, skipped all
+five files on rerun, reopened the saved report, and left no opaque temp. The
+entire retained smoke fixture occupied 184,712 bytes.
+
+Both roots were newly created on C: beneath the system temporary directory and
+were left as evidence; no broad cleanup command ran. Tests changed only their
+own files, links, streams, journals, reports, and sentinels. F:, G:, and H:
+were never queried or opened; their only appearances remained inert arguments
+to the pre-access rejection test. No routine test mounted, formatted, filled,
+dismounted, benchmarked, or issued raw writes to any drive, and no existing
+user file or external/removable drive was used. The unrun destructive,
+long-running, VHDX/ReFS, chaos, differential, million-entry, and endurance
+gates remain explicitly release-blocking in `PLAN_DEVIATIONS.md`.

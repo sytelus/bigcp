@@ -12,11 +12,12 @@ use windows_sys::Win32::Foundation::{
     INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FindClose, FindFirstStreamW, FindNextStreamW, FindStreamInfoStandard,
-    WIN32_FIND_STREAM_DATA,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FindClose, FindFirstStreamW,
+    FindNextStreamW, FindStreamInfoStandard, WIN32_FIND_STREAM_DATA,
 };
 
+use crate::metadata::{FileIdentity, metadata_from_file};
 use crate::util::{bool_result, last_error, wide_null};
 
 /// One data stream reported by Windows.
@@ -68,19 +69,47 @@ impl DestinationStream {
     /// Opens or creates one destination named stream.
     ///
     /// `truncate` is true for a fresh transfer and false only for a
-    /// journal-owned resume candidate.
+    /// journal-owned resume candidate. The base object's final component is
+    /// never followed if it changes to a reparse point.
     pub fn create(base: &Path, stream: &StreamInfo, truncate: bool) -> io::Result<Self> {
-        Self::create_with_flags(base, stream, truncate, 0)
-    }
-
-    /// Opens or creates a named stream on a reparse object without following it.
-    pub fn create_reparse(base: &Path, stream: &StreamInfo, truncate: bool) -> io::Result<Self> {
         Self::create_with_flags(
             base,
             stream,
             truncate,
             FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
         )
+    }
+
+    /// Opens or creates a named stream on a reparse object without following it.
+    pub fn create_reparse(base: &Path, stream: &StreamInfo, truncate: bool) -> io::Result<Self> {
+        Self::create(base, stream, truncate)
+    }
+
+    /// Opens or creates a stream only after pinning the expected base object.
+    ///
+    /// The short-lived base handle omits delete sharing, so its verified path
+    /// cannot be replaced between the identity check and stream creation.
+    pub fn create_checked(
+        base: &Path,
+        expected: FileIdentity,
+        stream: &StreamInfo,
+        truncate: bool,
+    ) -> io::Result<Self> {
+        let mut options = OpenOptions::new();
+        options
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);
+        let pin = options.open(base)?;
+        if metadata_from_file(&pin)?.identity != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "base object identity changed before stream creation",
+            ));
+        }
+        let stream = Self::create(base, stream, truncate)?;
+        drop(pin);
+        Ok(stream)
     }
 
     fn create_with_flags(
@@ -122,6 +151,11 @@ impl DestinationStream {
         Ok(self.len()? == 0)
     }
 
+    /// Returns the stable identity of the base object that owns this stream.
+    pub fn identity(&self) -> io::Result<FileIdentity> {
+        Ok(metadata_from_file(&self.file)?.identity)
+    }
+
     /// Truncates uncheckpointed tail bytes before continuation.
     pub fn set_len(&self, length: u64) -> io::Result<()> {
         self.file.set_len(length)
@@ -151,18 +185,22 @@ impl Seek for DestinationStream {
 }
 
 impl SourceStream {
-    /// Opens one stream suffix on a base path using read-only access.
+    /// Opens one stream suffix using read-only, final-component-safe access.
+    ///
+    /// This deliberately applies `FILE_FLAG_OPEN_REPARSE_POINT` even for an
+    /// enumerated ordinary file. If the path is replaced between enumeration
+    /// and this open, Windows must not redirect the read through a new link.
     pub fn open(base: &Path, stream: &StreamInfo) -> io::Result<Self> {
-        Self::open_with_flags(base, stream, 0)
-    }
-
-    /// Opens a named stream on a reparse object without following it.
-    pub fn open_reparse(base: &Path, stream: &StreamInfo) -> io::Result<Self> {
         Self::open_with_flags(
             base,
             stream,
             FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
         )
+    }
+
+    /// Opens a named stream on a reparse object without following it.
+    pub fn open_reparse(base: &Path, stream: &StreamInfo) -> io::Result<Self> {
+        Self::open(base, stream)
     }
 
     fn open_with_flags(base: &Path, stream: &StreamInfo, flags: u32) -> io::Result<Self> {
@@ -175,6 +213,11 @@ impl SourceStream {
         Ok(Self {
             file: options.open(path)?,
         })
+    }
+
+    /// Returns the stable identity of the base object that owns this stream.
+    pub fn identity(&self) -> io::Result<FileIdentity> {
+        Ok(metadata_from_file(&self.file)?.identity)
     }
 }
 
@@ -282,8 +325,12 @@ pub fn stream_bool_result_for_test(value: i32) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::StreamInfo;
+    use super::{DestinationStream, SourceStream, StreamInfo};
+    use crate::metadata::metadata_at;
     use std::ffi::OsString;
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::os::windows::fs::symlink_file;
 
     #[test]
     fn filesystem_implementation_streams_are_not_user_data() {
@@ -302,5 +349,57 @@ mod tests {
         assert!(unnamed.is_data());
         assert!(alternate.is_data());
         assert!(!directory_index.is_data());
+    }
+
+    #[test]
+    fn source_stream_identity_is_the_base_file_and_links_are_not_followed() {
+        let sandbox = tempfile::tempdir();
+        assert!(sandbox.is_ok());
+        let Some(sandbox) = sandbox.ok() else {
+            return;
+        };
+        let target = sandbox.path().join("target.txt");
+        let link = sandbox.path().join("link.txt");
+        assert!(fs::write(&target, b"base").is_ok());
+        let stream = StreamInfo {
+            name: OsString::from(":identity:$DATA"),
+            size: 4,
+        };
+        let output = DestinationStream::create(&target, &stream, true);
+        assert!(output.is_ok());
+        let Some(mut output) = output.ok() else {
+            return;
+        };
+        assert!(output.write_all(b"safe").is_ok());
+        drop(output);
+
+        let source = SourceStream::open(&target, &stream);
+        assert!(source.is_ok());
+        let Some(source) = source.ok() else {
+            return;
+        };
+        assert_eq!(
+            source.identity().ok(),
+            metadata_at(&target).ok().map(|m| m.identity)
+        );
+        let identity = source.identity();
+        assert!(identity.is_ok());
+        let Some(mut wrong_identity) = identity.ok() else {
+            return;
+        };
+        wrong_identity.file_id[0] ^= 0xff;
+        assert!(DestinationStream::create_checked(&target, wrong_identity, &stream, true).is_err());
+        let reopened = SourceStream::open(&target, &stream);
+        assert!(reopened.is_ok());
+        let Some(mut reopened) = reopened.ok() else {
+            return;
+        };
+        let mut stream_bytes = Vec::new();
+        assert!(reopened.read_to_end(&mut stream_bytes).is_ok());
+        assert_eq!(stream_bytes, b"safe");
+
+        if symlink_file(&target, &link).is_ok() {
+            assert!(SourceStream::open(&link, &stream).is_err());
+        }
     }
 }

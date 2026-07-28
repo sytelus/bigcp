@@ -16,9 +16,11 @@ use std::ptr;
 use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
 use windows_sys::Win32::Storage::FileSystem::{
     BACKUP_EA_DATA, BackupRead, BackupSeek, BackupWrite, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE,
 };
 
+use crate::metadata::{FileIdentity, metadata_from_file};
 use crate::util::{bool_result, last_error};
 
 const STREAM_HEADER_BYTES: usize = 20;
@@ -105,12 +107,17 @@ impl ExtendedAttributes {
 
 /// Reads only the EA backup stream from a file, directory, or reparse point.
 pub fn read_extended_attributes(path: &Path) -> io::Result<ExtendedAttributes> {
-    let mut options = OpenOptions::new();
-    options
-        .access_mode(GENERIC_READ)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
-    let file = options.open(path)?;
+    let file = open_ea(path, GENERIC_READ)?;
+    read_from_file(&file)
+}
+
+/// Reads EAs only when the non-following handle has the expected object ID.
+pub fn read_extended_attributes_checked(
+    path: &Path,
+    expected: FileIdentity,
+) -> io::Result<ExtendedAttributes> {
+    let file = open_ea(path, GENERIC_READ)?;
+    require_identity(&file, expected)?;
     read_from_file(&file)
 }
 
@@ -120,12 +127,18 @@ pub fn read_extended_attributes(path: &Path) -> io::Result<ExtendedAttributes> {
 /// [`clear_extended_attributes`] first when the destination may contain names
 /// absent from the source snapshot.
 pub fn write_extended_attributes(path: &Path, attributes: &ExtendedAttributes) -> io::Result<()> {
-    let mut options = OpenOptions::new();
-    options
-        .access_mode(GENERIC_WRITE)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
-    let file = options.open(path)?;
+    let file = open_ea(path, GENERIC_WRITE)?;
+    write_to_file(&file, attributes)
+}
+
+/// Writes EAs only when the non-following handle has the expected object ID.
+pub fn write_extended_attributes_checked(
+    path: &Path,
+    expected: FileIdentity,
+    attributes: &ExtendedAttributes,
+) -> io::Result<()> {
+    let file = open_ea(path, GENERIC_WRITE)?;
+    require_identity(&file, expected)?;
     write_to_file(&file, attributes)
 }
 
@@ -136,12 +149,44 @@ pub fn write_extended_attributes(path: &Path, attributes: &ExtendedAttributes) -
 /// directory reconciliation uses this explicit operation before writing the
 /// source set.
 pub fn clear_extended_attributes(path: &Path) -> io::Result<()> {
-    let existing = read_extended_attributes(path)?;
+    let file = open_ea(path, GENERIC_READ | GENERIC_WRITE)?;
+    clear_from_file(&file)
+}
+
+/// Clears EAs only when the non-following handle has the expected object ID.
+pub fn clear_extended_attributes_checked(path: &Path, expected: FileIdentity) -> io::Result<()> {
+    let file = open_ea(path, GENERIC_READ | GENERIC_WRITE)?;
+    require_identity(&file, expected)?;
+    clear_from_file(&file)
+}
+
+fn clear_from_file(file: &File) -> io::Result<()> {
+    let existing = read_from_file(file)?;
     if existing.is_empty() {
         return Ok(());
     }
     let tombstones = ExtendedAttributes(ea_tombstones(existing.as_bytes())?);
-    write_extended_attributes(path, &tombstones)
+    write_to_file(file, &tombstones)
+}
+
+fn open_ea(path: &Path, access: u32) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options
+        .access_mode(access | FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    options.open(path)
+}
+
+fn require_identity(file: &File, expected: FileIdentity) -> io::Result<()> {
+    if metadata_from_file(file)?.identity == expected {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "object identity changed before EA access",
+        ))
+    }
 }
 
 fn ea_tombstones(payload: &[u8]) -> io::Result<Vec<u8>> {
@@ -482,7 +527,12 @@ impl Drop for BackupWriter<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExtendedAttributes, read_extended_attributes, write_extended_attributes};
+    use super::{
+        ExtendedAttributes, clear_extended_attributes_checked, read_extended_attributes,
+        read_extended_attributes_checked, write_extended_attributes,
+        write_extended_attributes_checked,
+    };
+    use crate::metadata::metadata_at;
     use std::fs;
 
     #[test]
@@ -500,7 +550,12 @@ mod tests {
         let Some(requested) = requested.ok() else {
             return;
         };
-        assert!(write_extended_attributes(&path, &requested).is_ok());
+        let identity = metadata_at(&path).map(|metadata| metadata.identity);
+        assert!(identity.is_ok());
+        let Some(identity) = identity.ok() else {
+            return;
+        };
+        assert!(write_extended_attributes_checked(&path, identity, &requested).is_ok());
         let canonical = read_extended_attributes(&path);
         assert!(canonical.is_ok());
         // NTFS stores EA names case-insensitively and canonicalizes their
@@ -510,8 +565,20 @@ mod tests {
             return;
         };
         assert!(write_extended_attributes(&path, &canonical).is_ok());
-        assert_eq!(read_extended_attributes(&path).ok(), Some(canonical));
-        assert!(super::clear_extended_attributes(&path).is_ok());
+        assert_eq!(
+            read_extended_attributes_checked(&path, identity).ok(),
+            Some(canonical.clone())
+        );
+        let mut wrong_identity = identity;
+        wrong_identity.file_id[0] ^= 0xff;
+        assert!(read_extended_attributes_checked(&path, wrong_identity).is_err());
+        assert!(write_extended_attributes_checked(&path, wrong_identity, &requested).is_err());
+        assert!(clear_extended_attributes_checked(&path, wrong_identity).is_err());
+        assert_eq!(
+            read_extended_attributes_checked(&path, identity).ok(),
+            Some(canonical)
+        );
+        assert!(clear_extended_attributes_checked(&path, identity).is_ok());
         assert_eq!(
             read_extended_attributes(&path).ok(),
             Some(ExtendedAttributes(Vec::new()))

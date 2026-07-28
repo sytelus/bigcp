@@ -13,6 +13,16 @@ versioning once its 1.0 release gates are complete.
   two verification forms, CLI, TUI, and independent sandbox testkit.
 - Structurally confined unit/end-to-end tests and maintainer documentation.
 
+### Changed
+
+- Hardened checkpoint resume with source/temp filesystem identities,
+  non-following temp opens, fail-closed journal version handling, and
+  handle-bound cleanup that cannot delete a path replacement.
+- Made ordinary source, ADS, EA, directory-finalization, and reparse-copy
+  handles non-following and identity-checked, strengthened new-destination
+  collision detection, and reject non-directory standalone verification roots
+  before traversal.
+
 ### Known pre-1.0 work
 
 - IOCP/no-buffering engine and its sans-I/O model, comprehensive fault/chaos

@@ -14,6 +14,37 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::BigcpError;
 
+/// Stable identity of the bigcp-owned temporary named by a checkpoint.
+///
+/// The name alone is not proof of ownership: an old temporary can be removed
+/// and an unrelated object can later appear at the same path. Resume therefore
+/// requires both this identity and the checkpointed prefix digest to match.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CheckpointFileIdentity {
+    /// Volume serial reported by Windows `FileIdInfo`.
+    volume_serial: u64,
+    /// Lowercase hexadecimal encoding of the 128-bit filesystem file ID.
+    file_id: String,
+}
+
+impl CheckpointFileIdentity {
+    /// Captures a filesystem identity in the journal's stable JSON shape.
+    #[must_use]
+    pub fn from_file(identity: bigcp_win::FileIdentity) -> Self {
+        Self {
+            volume_serial: identity.volume_serial,
+            file_id: hex::encode(identity.file_id),
+        }
+    }
+
+    /// Returns whether a currently opened object is the checkpointed temp.
+    #[must_use]
+    pub fn matches(&self, identity: bigcp_win::FileIdentity) -> bool {
+        self.volume_serial == identity.volume_serial
+            && self.file_id == hex::encode(identity.file_id)
+    }
+}
+
 /// One resumable stream checkpoint.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Checkpoint {
@@ -23,6 +54,19 @@ pub struct Checkpoint {
     pub stream: String,
     /// Opaque sibling temporary path.
     pub temp_name: String,
+    /// Identity of the temporary at checkpoint time.
+    ///
+    /// This is optional only so version-one journals written by older builds
+    /// remain parseable. Identity-less records are never eligible for resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temp_identity: Option<CheckpointFileIdentity>,
+    /// Identity of the source file that produced this partial.
+    ///
+    /// Size and last-write time remain the user-visible equality heuristic,
+    /// but a replacement file that happens to share both must not be spliced
+    /// onto an older temporary prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_identity: Option<CheckpointFileIdentity>,
     /// Source stream size at checkpoint time.
     pub source_size: u64,
     /// Source last-write FILETIME.
@@ -125,6 +169,12 @@ impl Journal {
                     torn_tail = true;
                     break;
                 };
+                if stored.j != 1 {
+                    return Err(BigcpError::Format(format!(
+                        "unsupported journal version {}; this build supports 1",
+                        stored.j
+                    )));
+                }
                 if !crc_matches(&stored)? {
                     torn_tail = true;
                     break;
@@ -321,8 +371,78 @@ pub fn stream_key(stream: &std::ffi::OsStr) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Journal, JournalEvent};
+    use super::{Checkpoint, CheckpointFileIdentity, Journal, JournalEvent};
+    use bigcp_win::FileIdentity;
     use std::fs;
+
+    #[test]
+    fn old_checkpoint_without_temp_identity_is_parseable_but_not_resumable() {
+        let checkpoint = serde_json::from_value::<Checkpoint>(serde_json::json!({
+            "relative_path": "u16:00",
+            "stream": "",
+            "temp_name": ".bigcp-old-000000000000.part",
+            "source_size": 8,
+            "source_mtime": 9,
+            "watermark": 4,
+            "prefix_digest": "xxh3:00000000000000000000000000000000"
+        }));
+        assert!(checkpoint.is_ok());
+        assert!(
+            checkpoint.ok().is_some_and(
+                |value| value.temp_identity.is_none() && value.source_identity.is_none()
+            )
+        );
+    }
+
+    #[test]
+    fn checkpoint_identity_requires_both_volume_and_file_id() {
+        let original = FileIdentity {
+            volume_serial: 7,
+            file_id: [3; 16],
+        };
+        let recorded = CheckpointFileIdentity::from_file(original);
+        assert!(recorded.matches(original));
+        assert!(!recorded.matches(FileIdentity {
+            volume_serial: 8,
+            ..original
+        }));
+        assert!(!recorded.matches(FileIdentity {
+            file_id: [4; 16],
+            ..original
+        }));
+    }
+
+    #[test]
+    fn unsupported_journal_version_is_rejected_without_truncation() {
+        let directory = tempfile::tempdir();
+        assert!(directory.is_ok());
+        let Some(directory) = directory.ok() else {
+            return;
+        };
+        let path = directory.path().join("journal.jsonl");
+        let event = JournalEvent::End {
+            run_id: "future".to_owned(),
+        };
+        let unsigned = super::UnsignedRecord {
+            j: 2,
+            event: event.clone(),
+        };
+        let serialized = serde_json::to_vec(&unsigned);
+        assert!(serialized.is_ok());
+        let Some(serialized) = serialized.ok() else {
+            return;
+        };
+        let stored = super::StoredRecord {
+            j: 2,
+            event,
+            crc: format!("{:08x}", crc32c::crc32c(&serialized)),
+        };
+        let mut bytes = serde_json::to_vec(&stored).unwrap_or_default();
+        bytes.push(b'\n');
+        assert!(fs::write(&path, &bytes).is_ok());
+        assert!(Journal::open(path.clone(), false).is_err());
+        assert_eq!(fs::read(path).ok(), Some(bytes));
+    }
 
     #[test]
     fn torn_tail_never_panics_or_trusts_following_records() {

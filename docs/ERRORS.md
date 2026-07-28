@@ -13,7 +13,7 @@ reference must remain synchronized.
 | `device_gone` | Device unavailable (433/1167). | Reconnect and rerun to resume. |
 | `fs_limit` | Destination lacks a required feature. | Use capable NTFS/ReFS storage. |
 | `source_changed` | Source identity/size/mtime changed. | Quiesce source writers and rerun. |
-| `destination_changed` | Target changed after classification. | Stop destination writers and rerun. |
+| `destination_changed` | Target changed after classification or a new-name collision occurred (80/183). | Stop destination writers and rerun. |
 | `unsupported_reparse` | Unknown link/filter tag. | Use `--raw-reparse` only with the owning filter and understood risk. |
 | `parent_dir_failed` | Parent could not be prepared. | Resolve the parent error first. |
 | `type_conflict` | File/directory/link types disagree. | Resolve manually; bigcp never deletes it. |

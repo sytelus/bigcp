@@ -66,8 +66,9 @@ bigcp report C:\audit\run.report.json
 ```
 
 The normal rerun command is the same command again. Completed files are
-skipped; CRC-valid checkpoints can resume large partials only after the prefix
-is reread and its xxh3-128 digest matches.
+skipped; CRC-valid checkpoints can resume large partials only when the current
+source and opaque temp identities still match and the reread prefix's
+xxh3-128 digest agrees.
 
 ### Copy flags
 

@@ -51,7 +51,9 @@ Every file, including a new small file, follows one protocol:
 
 A crash before publication leaves no final-named partial. Checkpointed partials
 may persist under opaque names, but resume never trusts them: current source
-size/mtime and the exact temp prefix digest must match before continuation.
+size/mtime, source and temporary filesystem identities, and the exact temp
+prefix digest must match before continuation. Legacy identity-less checkpoint
+records are parseable but intentionally restart from zero.
 
 ## Streams, EAs, sparse files, EFS, and reparse points
 
@@ -61,9 +63,11 @@ owner to the journal-aware streaming path and successfully copied file ADS
 bytes are included in logical copy accounting. EA transfer uses separate
 synchronous buffered handles through `BackupRead`/`BackupWrite`.
 
-Source-named streams on directories and reparse objects are copied through
-non-following handles. Destination-only streams are not deleted: a full verify
-reports them as divergence, preserving the product's no-delete contract.
+Every source/destination named-stream handle is non-following and must report
+the expected base-object identity before I/O. Directory EA and final metadata
+updates perform the same identity check on the handle used for mutation.
+Destination-only streams are not deleted: a full verify reports them as
+divergence, preserving the product's no-delete contract.
 
 Sparse files are marked sparse before EOF is established, are not densely
 preallocated, and copy allocated ranges only. Holes participate in hashing as

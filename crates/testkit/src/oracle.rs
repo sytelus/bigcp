@@ -54,7 +54,7 @@ pub fn check_trees(
         &source,
         &destination,
         false,
-        false,
+        true,
     )?;
     let mut tasks = vec![(source, destination, PathBuf::new())];
     while let Some((source_dir, destination_dir, relative_dir)) = tasks.pop() {
@@ -106,7 +106,7 @@ pub fn check_trees(
                         &source_entry.path,
                         &destination_entry.path,
                         false,
-                        false,
+                        true,
                     )?;
                     tasks.push((source_entry.path, destination_entry.path, relative));
                 }

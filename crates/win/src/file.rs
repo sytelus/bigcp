@@ -30,7 +30,9 @@ use windows_sys::Win32::System::WindowsProgramming::{
 };
 
 use crate::ea::{ExtendedAttributes, write_to_file};
-use crate::metadata::{BasicMetadata, ObjectMetadata, metadata_from_file};
+use crate::metadata::{
+    BasicMetadata, FileIdentity, ObjectKind, ObjectMetadata, metadata_from_file,
+};
 use crate::security::ProtectedDacl;
 use crate::sparse::{AllocatedRange, mark_sparse, query_allocated_ranges};
 use crate::streams::{DestinationStream, StreamInfo};
@@ -89,9 +91,15 @@ impl SourceFile {
         options
             .access_mode(GENERIC_READ | FILE_READ_ATTRIBUTES)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-            .custom_flags(FILE_FLAG_SEQUENTIAL_SCAN);
+            .custom_flags(FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OPEN_REPARSE_POINT);
         let file = options.open(path)?;
         let opened_metadata = metadata_from_file(&file)?;
+        if opened_metadata.kind != ObjectKind::File {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ordinary source path changed to a reparse point or directory",
+            ));
+        }
         Ok(Self {
             file,
             opened_metadata,
@@ -134,7 +142,6 @@ impl Seek for SourceFile {
 pub struct DestinationTemp {
     file: Option<File>,
     path: PathBuf,
-    owned: bool,
     persistent: bool,
 }
 
@@ -151,19 +158,20 @@ impl DestinationTemp {
                 .read(true)
                 .write(true)
                 .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE | FILE_WRITE_ATTRIBUTES)
-                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
                 .create_new(true);
             match options.open(&path) {
                 Ok(file) => {
                     if let Err(error) = set_delete_on_close(&file, true) {
                         drop(file);
-                        let _ = fs::remove_file(&path);
+                        // Prefer a harmless opaque orphan over path-based
+                        // cleanup after closing the identity-owning handle.
+                        // Another actor could replace the name in that gap.
                         return Err(error);
                     }
                     return Ok(Self {
                         file: Some(file),
                         path,
-                        owned: true,
                         persistent: false,
                     });
                 }
@@ -180,8 +188,9 @@ impl DestinationTemp {
     /// Reopens a journal-owned sibling temporary for verified resume.
     ///
     /// Only bigcp's opaque ASCII naming shape is accepted, and `name` must be
-    /// exactly one normal path component. The caller still must verify its
-    /// contents against a CRC-valid checkpoint before writing.
+    /// exactly one normal path component. The final component is opened
+    /// without following a reparse point and must be an ordinary file. The
+    /// caller still must verify its identity and contents before writing.
     pub fn resume(parent: &Path, name: &str) -> io::Result<Self> {
         let relative = Path::new(name);
         if !name.starts_with(".bigcp-")
@@ -202,12 +211,18 @@ impl DestinationTemp {
         let mut options = OpenOptions::new();
         options
             .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE | FILE_WRITE_ATTRIBUTES)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
         let file = options.open(&path)?;
+        if metadata_from_file(&file)?.kind != ObjectKind::File {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "journal temporary is not an ordinary file",
+            ));
+        }
         Ok(Self {
             file: Some(file),
             path,
-            owned: true,
             persistent: true,
         })
     }
@@ -216,6 +231,11 @@ impl DestinationTemp {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Returns the stable filesystem identity of the opened temporary.
+    pub fn identity(&self) -> io::Result<FileIdentity> {
+        Ok(metadata_from_file(self.file_ref()?)?.identity)
     }
 
     /// Returns the current logical size of the owned temporary.
@@ -287,7 +307,7 @@ impl DestinationTemp {
         if armed {
             set_delete_on_close(self.file_ref()?, false)?;
         }
-        let opened = DestinationStream::create(&self.path, stream, true);
+        let opened = DestinationStream::create_reparse(&self.path, stream, true);
         if armed && let Err(error) = set_delete_on_close(self.file_ref()?, true) {
             drop(opened);
             return Err(error);
@@ -297,7 +317,7 @@ impl DestinationTemp {
 
     /// Reopens one named stream belonging to this journal-owned temporary.
     pub fn resume_stream(&self, stream: &StreamInfo) -> io::Result<DestinationStream> {
-        DestinationStream::create(&self.path, stream, false)
+        DestinationStream::create_reparse(&self.path, stream, false)
     }
 
     /// Applies an explicitly protected DACL captured from a replace target.
@@ -342,7 +362,6 @@ impl DestinationTemp {
 
         // From this instant the handle names the final file. A metadata error
         // must never trigger deletion of that user-visible name.
-        self.owned = false;
         self.path = final_path.to_path_buf();
         set_basic_by_handle(&file, metadata)?;
         if flush {
@@ -394,9 +413,9 @@ impl Drop for DestinationTemp {
         if let Some(file) = self.file.take() {
             drop(file);
         }
-        if self.owned && !self.persistent && self.path.exists() {
-            let _ = fs::remove_file(&self.path);
-        }
+        // Non-persistent temporaries are deleted by the disposition attached
+        // to this exact handle. Never fall back to deleting by path after the
+        // handle closes: the opaque name could have been replaced meanwhile.
     }
 }
 
@@ -413,6 +432,30 @@ pub fn set_basic_at(path: &Path, metadata: BasicMetadata) -> io::Result<()> {
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
     let file = options.open(path)?;
+    set_basic_by_handle(&file, metadata)
+}
+
+/// Applies basic metadata only when the opened object has the expected ID.
+///
+/// Identity validation and mutation use the same non-following handle, which
+/// closes the stable path-replacement window around directory metadata repair.
+pub fn set_basic_at_checked(
+    path: &Path,
+    expected: FileIdentity,
+    metadata: BasicMetadata,
+) -> io::Result<()> {
+    let mut options = OpenOptions::new();
+    options
+        .access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = options.open(path)?;
+    if metadata_from_file(&file)?.identity != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "object identity changed before metadata update",
+        ));
+    }
     set_basic_by_handle(&file, metadata)
 }
 
@@ -538,6 +581,128 @@ mod tests {
     use crate::metadata::BasicMetadata;
     use std::fs;
     use std::io::{Read, Write};
+    use std::os::windows::fs::symlink_file;
+
+    #[test]
+    fn uncommitted_temp_is_deleted_by_its_handle() {
+        let sandbox = tempfile::tempdir();
+        assert!(sandbox.is_ok());
+        let Some(sandbox) = sandbox.ok() else {
+            return;
+        };
+        let temp = DestinationTemp::create(sandbox.path(), "delete-on-close");
+        assert!(temp.is_ok(), "temporary creation failed: {:?}", temp.err());
+        let Some(temp) = temp.ok() else {
+            return;
+        };
+        let path = temp.path().to_path_buf();
+        assert!(path.exists());
+        drop(temp);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn resume_rejects_a_directory_with_an_opaque_temp_name() {
+        let sandbox = tempfile::tempdir();
+        assert!(sandbox.is_ok());
+        let Some(sandbox) = sandbox.ok() else {
+            return;
+        };
+        let name = ".bigcp-stale-000000000000.part";
+        assert!(fs::create_dir(sandbox.path().join(name)).is_ok());
+        let result = DestinationTemp::resume(sandbox.path(), name);
+        assert!(result.is_err());
+        assert!(sandbox.path().join(name).is_dir());
+    }
+
+    #[test]
+    fn resumed_temp_identity_detects_name_reuse_without_harming_replacement() {
+        let sandbox = tempfile::tempdir();
+        assert!(sandbox.is_ok());
+        let Some(sandbox) = sandbox.ok() else {
+            return;
+        };
+        let temp = DestinationTemp::create(sandbox.path(), "identity-reuse");
+        assert!(temp.is_ok());
+        let Some(mut temp) = temp.ok() else {
+            return;
+        };
+        let original_identity = temp.identity();
+        let path = temp.path().to_path_buf();
+        let name = path.file_name().and_then(|value| value.to_str());
+        assert!(original_identity.is_ok());
+        assert!(name.is_some());
+        assert!(temp.persist_for_resume().is_ok());
+        drop(temp);
+        assert!(fs::remove_file(&path).is_ok());
+        assert!(fs::write(&path, b"unrelated replacement").is_ok());
+
+        let resumed = name.and_then(|name| DestinationTemp::resume(sandbox.path(), name).ok());
+        assert!(resumed.is_some());
+        assert!(
+            resumed
+                .as_ref()
+                .is_some_and(|candidate| { candidate.identity().ok() != original_identity.ok() })
+        );
+        drop(resumed);
+        assert_eq!(fs::read(path).ok(), Some(b"unrelated replacement".to_vec()));
+    }
+
+    #[test]
+    fn ordinary_source_open_never_follows_a_reparse_point() {
+        let sandbox = tempfile::tempdir();
+        assert!(sandbox.is_ok());
+        let Some(sandbox) = sandbox.ok() else {
+            return;
+        };
+        let target = sandbox.path().join("target.txt");
+        let link = sandbox.path().join("link.txt");
+        assert!(fs::write(&target, b"must not be read through the link").is_ok());
+        if symlink_file(&target, &link).is_err() {
+            return;
+        }
+        assert!(SourceFile::open(&link).is_err());
+        assert_eq!(
+            fs::read(target).ok(),
+            Some(b"must not be read through the link".to_vec())
+        );
+    }
+
+    #[test]
+    fn nonreplacing_commit_preserves_a_dangling_link_collision() {
+        let sandbox = tempfile::tempdir();
+        assert!(sandbox.is_ok());
+        let Some(sandbox) = sandbox.ok() else {
+            return;
+        };
+        let final_path = sandbox.path().join("final.txt");
+        if symlink_file(sandbox.path().join("missing-target"), &final_path).is_err() {
+            return;
+        }
+        let temp = DestinationTemp::create(sandbox.path(), "new-collision");
+        assert!(temp.is_ok());
+        let Some(mut temp) = temp.ok() else {
+            return;
+        };
+        assert!(temp.write_all(b"new data").is_ok());
+        let result = temp.commit(
+            &final_path,
+            false,
+            BasicMetadata {
+                creation_time: 0,
+                last_access_time: 0,
+                last_write_time: 0,
+                attributes: 0,
+            },
+            false,
+        );
+        assert!(result.is_err());
+        assert!(fs::symlink_metadata(&final_path).is_ok_and(|value| value.is_symlink()));
+        assert_eq!(
+            fs::read_link(final_path).ok(),
+            Some(sandbox.path().join("missing-target"))
+        );
+    }
 
     #[test]
     fn temp_is_not_visible_under_final_name_until_commit() {
