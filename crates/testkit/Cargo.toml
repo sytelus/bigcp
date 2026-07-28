@@ -1,0 +1,24 @@
+[package]
+name = "bigcp-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bigcp-win = { path = "../win", version = "0.1.0" }
+clap.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+xxhash-rust.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

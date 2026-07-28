@@ -1,0 +1,21 @@
+# Harmless 77 KiB smoke scenario. All paths are sandbox-relative.
+write_budget_bytes: 78848
+directories:
+  - empty
+  - nested/deeper
+files:
+  - path: empty.bin
+    size: 0
+    pattern: 1
+  - path: hello.txt
+    size: 128
+    pattern: 2
+  - path: nested/deeper/unicode-Résumé-東京.bin
+    size: 1312
+    pattern: 3
+  - path: boundary-64KiB.bin
+    size: 65536
+    pattern: 4
+  - path: nested/mixed.bin
+    size: 11872
+    pattern: 5

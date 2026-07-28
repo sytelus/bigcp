@@ -1,0 +1,27 @@
+[package]
+name = "bigcp-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bigcp-win = { path = "../win", version = "0.1.0" }
+crc32c.workspace = true
+crossbeam-channel.workspace = true
+hex.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+time.workspace = true
+uuid.workspace = true
+xxhash-rust.workspace = true
+
+[dev-dependencies]
+bigcp-testkit = { path = "../testkit", version = "0.1.0" }
+tempfile.workspace = true
+
+[lints]
+workspace = true

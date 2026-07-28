@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/shitals/bigcp/docs/schemas/report-v1.schema.json",
+  "title": "bigcp run report v1",
+  "type": "object",
+  "required": [
+    "v", "run", "config", "devices", "counters", "replacements", "errors",
+    "warnings", "extras", "folders", "timeline", "phases", "bottleneck", "hints", "integrity"
+  ],
+  "properties": {
+    "v": { "const": 1 },
+    "run": {
+      "type": "object",
+      "required": ["id", "started", "ended", "duration_seconds", "exit", "dry_run", "durability", "audit", "source", "destination", "log_path", "report_path"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "started": { "type": "string" },
+        "ended": { "type": "string" },
+        "duration_seconds": { "type": "number", "minimum": 0 },
+        "exit": { "type": "integer" },
+        "dry_run": { "type": "boolean" },
+        "durability": { "enum": ["logical", "durable"] },
+        "audit": { "enum": ["ok", "degraded", "failed"] },
+        "source": { "type": "string" },
+        "destination": { "type": "string" },
+        "log_path": { "type": ["string", "array"] },
+        "report_path": { "type": ["string", "array"] }
+      },
+      "additionalProperties": true
+    },
+    "config": { "type": "object" },
+    "devices": { "type": "object" },
+    "counters": { "type": "object" },
+    "replacements": { "type": "object" },
+    "errors": { "type": "array" },
+    "warnings": { "type": "object" },
+    "extras": { "type": "object" },
+    "folders": { "type": "object" },
+    "timeline": { "type": "array", "maxItems": 3600 },
+    "phases": { "type": "object" },
+    "bottleneck": { "type": "object" },
+    "hints": { "type": "array" },
+    "verify": { "type": ["object", "null"] },
+    "integrity": { "enum": ["ok", "failed"] }
+  },
+  "additionalProperties": true
+}

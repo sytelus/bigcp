@@ -1,0 +1,8 @@
+/target/
+/.idea/
+/.vscode/
+*.pdb
+*.ilk
+*.profraw
+*.log.jsonl
+*.report.json

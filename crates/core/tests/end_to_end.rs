@@ -1,0 +1,258 @@
+//! Harmless end-to-end contract test on a newly created system-drive sandbox.
+
+use std::ffi::OsString;
+use std::fs;
+use std::io::{Seek, SeekFrom, Write};
+use std::path::Path;
+
+use bigcp_core::{CopyOptions, RunObserver, RunSnapshot, VerifyOptions, run_copy};
+use bigcp_testkit::sandbox::{initialize_empty, validated_system_temp};
+use bigcp_testkit::{SandboxRoot, check_trees};
+use bigcp_win::{
+    BasicMetadata, DestinationStream, DestinationTemp, ExtendedAttributes, StreamInfo,
+    clear_extended_attributes, read_extended_attributes, write_extended_attributes,
+};
+
+const FIXTURE_WRITE_BUDGET: u64 = 16 * 1024 * 1024;
+
+struct SilentObserver;
+
+impl RunObserver for SilentObserver {
+    fn on_snapshot(&self, _snapshot: &RunSnapshot) {}
+
+    fn on_message(&self, _message: &str) {}
+}
+
+struct ImmediateCancel;
+
+impl RunObserver for ImmediateCancel {
+    fn on_snapshot(&self, _snapshot: &RunSnapshot) {}
+
+    fn on_message(&self, _message: &str) {}
+
+    fn cancellation_requested(&self) -> bool {
+        true
+    }
+}
+
+#[test]
+fn copy_rerun_and_both_verification_forms_converge() -> Result<(), Box<dyn std::error::Error>> {
+    let allowed_temp = validated_system_temp()?;
+    let lease = tempfile::Builder::new()
+        .prefix("bigcp-e2e-")
+        .tempdir_in(allowed_temp)?;
+    let sandbox = initialize_empty(lease.path())?;
+    let source = sandbox.child(Path::new("source"))?;
+    let destination = sandbox.child(Path::new("destination"))?;
+    let state = sandbox.child(Path::new("state"))?;
+    fs::create_dir(&source)?;
+    fs::create_dir(source.join("nested"))?;
+
+    let small = source.join("small.txt");
+    fs::write(&small, b"small, deterministic fixture")?;
+    let source_eas = ExtendedAttributes::from_pairs(&[(b"bigcp.test", b"ea-value")])?;
+    write_extended_attributes(&small, &source_eas)?;
+    let large_bytes = vec![0x5a_u8; 2 * 1024 * 1024];
+    assert!(large_bytes.len() as u64 <= FIXTURE_WRITE_BUDGET);
+    fs::write(source.join("nested").join("large.bin"), &large_bytes)?;
+
+    let stream = StreamInfo {
+        name: OsString::from(":bigcp-test:$DATA"),
+        size: 8 * 1024,
+    };
+    let mut alternate = DestinationStream::create(&small, &stream, true)?;
+    let stream_size = usize::try_from(stream.size)?;
+    alternate.write_all(&vec![0xa5_u8; stream_size])?;
+    alternate.flush()?;
+    drop(alternate);
+
+    let sparse_path = source.join("sparse.bin");
+    let mut sparse = DestinationTemp::create(&source, "fixture")?;
+    sparse.mark_sparse()?;
+    sparse.set_len(4 * 1024 * 1024)?;
+    sparse.seek(SeekFrom::Start(3 * 1024 * 1024))?;
+    sparse.write_all(&vec![0x3c_u8; 4096])?;
+    sparse.flush()?;
+    sparse.commit(
+        &sparse_path,
+        false,
+        BasicMetadata {
+            creation_time: 0,
+            last_access_time: 0,
+            last_write_time: 0,
+            attributes: 0,
+        },
+        false,
+    )?;
+
+    let mut options = CopyOptions::new(source.clone(), destination.clone());
+    options.verify = true;
+    options.state_dir = Some(state.clone());
+    options.tune.large_threshold = Some(1024 * 1024);
+    options.tune.checkpoint_threshold = Some(1024 * 1024);
+    let first = run_copy(&options, &SilentObserver)?;
+    let destination_names = fs::read_dir(&destination)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .collect::<Vec<_>>();
+    let source_sparse_bytes = fs::read(&sparse_path)?;
+    let destination_sparse_bytes = fs::read(destination.join("sparse.bin"))?;
+    assert_eq!(
+        source_sparse_bytes, destination_sparse_bytes,
+        "sparse logical content differs"
+    );
+    assert_eq!(first.run.exit, 0, "copy errors: {:?}", first.errors);
+    assert_eq!(first.counters.failed, 0);
+    assert_eq!(first.counters.copied_new, 3);
+    assert!(
+        first.verify.as_ref().is_some_and(|value| value.failed == 0),
+        "post-copy verification: {:?}",
+        (first.verify.as_ref(), destination_names)
+    );
+
+    let oracle = check_trees(
+        &SandboxRoot::open(lease.path())?,
+        Path::new("source"),
+        Path::new("destination"),
+    )?;
+    assert_eq!(oracle.mismatches, 0, "oracle samples: {:?}", oracle.samples);
+
+    let full = bigcp_core::run_standalone_verify(&VerifyOptions {
+        source: source.clone(),
+        destination: destination.clone(),
+        report_path: None,
+    })?;
+    assert_eq!(full.failed, 0, "verify mismatches: {:?}", full.mismatches);
+
+    let destination_small = destination.join("small.txt");
+    clear_extended_attributes(&destination_small)?;
+    let repaired = run_copy(&options, &SilentObserver)?;
+    assert_eq!(repaired.run.exit, 0);
+    assert_eq!(repaired.counters.meta_fixed, 1);
+    assert_eq!(repaired.counters.skipped_same, 2);
+    assert_eq!(
+        read_extended_attributes(&small)?,
+        read_extended_attributes(&destination_small)?
+    );
+
+    let second = run_copy(&options, &SilentObserver)?;
+    assert_eq!(second.run.exit, 0);
+    assert_eq!(second.counters.copied_new, 0);
+    assert_eq!(second.counters.copied_replaced, 0);
+    assert_eq!(second.counters.skipped_same, 3);
+    Ok(())
+}
+
+#[test]
+fn dry_run_never_creates_destination_and_replacement_is_atomic()
+-> Result<(), Box<dyn std::error::Error>> {
+    let allowed_temp = validated_system_temp()?;
+    let lease = tempfile::Builder::new()
+        .prefix("bigcp-dry-run-")
+        .tempdir_in(allowed_temp)?;
+    let sandbox = initialize_empty(lease.path())?;
+    let source = sandbox.child(Path::new("source"))?;
+    let destination = sandbox.child(Path::new("destination"))?;
+    fs::create_dir(&source)?;
+    fs::write(source.join("replace.txt"), b"first version")?;
+
+    let mut options = CopyOptions::new(source.clone(), destination.clone());
+    options.dry_run = true;
+    options.state_dir = Some(sandbox.child(Path::new("dry-state"))?);
+    let modeled = run_copy(&options, &SilentObserver)?;
+    assert_eq!(modeled.run.exit, 0);
+    assert_eq!(modeled.counters.would_copy_new, 1);
+    assert!(
+        !destination.exists(),
+        "dry-run created the destination tree"
+    );
+
+    options.dry_run = false;
+    options.state_dir = Some(sandbox.child(Path::new("copy-state"))?);
+    let initial = run_copy(&options, &SilentObserver)?;
+    assert_eq!(initial.run.exit, 0, "copy errors: {:?}", initial.errors);
+    assert_eq!(initial.counters.copied_new, 1);
+
+    fs::write(source.join("replace.txt"), b"second, longer version")?;
+    let replacement = run_copy(&options, &SilentObserver)?;
+    assert_eq!(
+        replacement.run.exit, 0,
+        "replacement errors: {:?}",
+        replacement.errors
+    );
+    assert_eq!(replacement.counters.copied_replaced, 1);
+    assert_eq!(
+        fs::read(destination.join("replace.txt"))?,
+        b"second, longer version"
+    );
+    assert!(
+        fs::read_dir(&destination)?.all(|entry| entry
+            .ok()
+            .is_some_and(|value| !value.file_name().to_string_lossy().starts_with(".bigcp-"))),
+        "completed replacement left an opaque temporary"
+    );
+    Ok(())
+}
+
+#[test]
+fn cancellation_accounts_every_directory_already_discovered()
+-> Result<(), Box<dyn std::error::Error>> {
+    let allowed_temp = validated_system_temp()?;
+    let lease = tempfile::Builder::new()
+        .prefix("bigcp-cancel-")
+        .tempdir_in(allowed_temp)?;
+    let sandbox = initialize_empty(lease.path())?;
+    let source = sandbox.child(Path::new("source"))?;
+    let destination = sandbox.child(Path::new("destination"))?;
+    fs::create_dir(&source)?;
+    fs::create_dir(source.join("not-visited"))?;
+
+    let mut options = CopyOptions::new(source, destination);
+    options.state_dir = Some(sandbox.child(Path::new("state"))?);
+    let report = run_copy(&options, &ImmediateCancel)?;
+    assert_eq!(report.run.exit, 3);
+    assert_eq!(report.counters.dirs_discovered, 1);
+    assert_eq!(report.counters.dirs_failed, 1);
+    assert!(report.counters.reconcile().is_ok());
+    let audit = fs::read_to_string(&report.run.log_path)?;
+    let has_complete_error = audit.lines().any(|line| {
+        serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .is_some_and(|event| {
+                event.get("ev").and_then(serde_json::Value::as_str) == Some("error")
+                    && event
+                        .pointer("/error/operation")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("cancel_before_enumerate")
+                    && event.pointer("/error/category").is_some()
+                    && event.pointer("/error/path").is_some()
+                    && event.pointer("/error/hint").is_some()
+            })
+    });
+    assert!(has_complete_error, "non-file failure was absent from JSONL");
+    Ok(())
+}
+
+#[test]
+fn unsafe_audit_path_is_rejected_before_destination_creation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let allowed_temp = validated_system_temp()?;
+    let lease = tempfile::Builder::new()
+        .prefix("bigcp-audit-path-")
+        .tempdir_in(allowed_temp)?;
+    let sandbox = initialize_empty(lease.path())?;
+    let source = sandbox.child(Path::new("source"))?;
+    let destination = sandbox.child(Path::new("destination"))?;
+    fs::create_dir(&source)?;
+    fs::write(source.join("fixture.txt"), b"bounded fixture")?;
+
+    let mut options = CopyOptions::new(source, destination.clone());
+    options.state_dir = Some(destination.join("state"));
+    let result = run_copy(&options, &SilentObserver);
+    assert!(result.is_err());
+    assert!(
+        !destination.exists(),
+        "preflight created destination before rejecting its unsafe audit path"
+    );
+    Ok(())
+}

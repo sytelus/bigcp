@@ -1,0 +1,67 @@
+[workspace]
+members = [
+    "crates/win",
+    "crates/core",
+    "crates/tui",
+    "crates/cli",
+    "crates/testkit",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/shitals/bigcp"
+
+[workspace.dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+crc32c = "0.6"
+crossbeam-channel = "0.5"
+crossterm = "0.29"
+hex = "0.4"
+parking_lot = "0.12"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "crossterm_0_29"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+sha2 = "0.10"
+tempfile = "3.14"
+thiserror = "2.0"
+time = { version = "0.3", features = ["formatting", "macros", "serde"] }
+uuid = { version = "1.11", features = ["serde", "v4"] }
+windows-sys = "0.61"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "deny"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unused_lifetimes = "deny"
+unused_qualifications = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+module_name_repetitions = "allow"
+too_many_lines = "allow"
+missing_errors_doc = "allow"
+doc_markdown = "allow"
+struct_excessive_bools = "allow"
+too_many_arguments = "allow"
+needless_pass_by_value = "allow"
+cast_precision_loss = "allow"
+if_not_else = "allow"
+needless_option_as_deref = "allow"
+collapsible_if = "allow"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+strip = "symbols"
