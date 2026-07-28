@@ -2,7 +2,8 @@
 
 > **Status:** Approved design, ready for implementation.
 > **Companion documents:** `VISION.md` (product vision, requirements source), this file (complete engineering design).
-> **Audience:** The implementing engineer(s) and all future maintainers. This document is written so that implementation can proceed *without asking anyone questions*. Where a decision could go multiple ways, the decision is made here and the reasoning recorded.
+> **Audience:** whoever implements and maintains bigcp — **human engineers or AI agents, interchangeably**. This document is written so that implementation can proceed *without asking anyone questions*: where a decision could go multiple ways, the decision is made here and the reasoning recorded, and every completion criterion is machine-checkable (§13.1). If genuine ambiguity is found anyway, the rule is: take the more reliability-conservative reading, record it as an ADR (§14.4), and keep going.
+> **Companion:** `LIMITATIONS.md` catalogs every deliberate limitation with its rationale — the user-facing mirror of this plan's scope decisions.
 
 ---
 
@@ -320,7 +321,7 @@ Detected once per volume via `GetVolumeInformationW` + `GetDiskFreeSpaceExW`:
 
 ### 4.7 Default exclusions (root-level OS artifacts)
 
-When the source is a volume root (only then), the following are excluded by default, each logged as `excluded{reason:system}`: `$RECYCLE.BIN`, `System Volume Information`, `pagefile.sys`, `swapfile.sys`, `hiberfil.sys`, `DumpStack.log.tmp`. Robocopy instead spews access-denied errors on these. `--include-system` restores robocopy behavior. Notification is unconditional (F17): the run banner and `--dry-run` list what *would be* excluded, every actual exclusion is logged individually, and the summary totals them — nothing is ever silently missed. User exclusions: repeatable `--exclude <glob>` matched against relative paths.
+When the source is a volume root (only then), the following are excluded by default, each logged as `excluded{reason:system}`: `$RECYCLE.BIN`, `System Volume Information`, `pagefile.sys`, `swapfile.sys`, `hiberfil.sys`, `DumpStack.log.tmp`. Robocopy instead spews access-denied errors on these. `--include-system` restores robocopy behavior. Notification is unconditional (F17): the run banner and `--dry-run` list what *would be* excluded, every actual exclusion is logged individually, and the summary totals them — nothing is ever silently missed. There are **no user exclusion patterns** (no `--exclude` globs): VISION asks only for the system-file exclusion with a disable flag, and a glob engine is exactly the kind of surface the minimal-arguments rule exists to prevent — users who need partial copies copy the subtree they want.
 
 ### 4.8 Source and destination stability (exclusivity assumptions, F16)
 
@@ -761,7 +762,7 @@ The coordinator is the single owner of all counters; engines report only via `Ou
 
 ### 7.4 What bigcp will never do (design-level safety recap)
 
-No delete/mirror mode exists; no in-place truncation exists; no source-write path exists (I1/I10); no "quiet skip" exists (every non-copied source file appears in exactly one accounted category); no unverifiable success claims exist (I4–I6); no blind overwrite of unexamined objects exists (I11); no blindly-trusted resume exists (I13). These are structural properties of the code, not policies — reviewers must reject PRs that weaken them (checklist, §14.3).
+No delete/mirror mode exists; no in-place truncation exists; no source-write path exists (I1/I10); no "quiet skip" exists (every non-copied source file appears in exactly one accounted category); no unverifiable success claims exist (I4–I6); no blind overwrite of unexamined objects exists (I11); no blindly-trusted resume exists (I13). These are structural properties of the code, not policies — and their enforcement is **mechanical first**: the grep-guards, type-level restrictions, lints, and invariant tests named in §7.1 make CI reject changes that weaken them, so no reviewer's (human or agent's) vigilance is the last line of defense. The §14.3 checklist is the second line, not the first.
 
 ### 7.5 Durability guarantees — what "copied successfully" claims
 
@@ -885,7 +886,6 @@ bigcp report <REPORT.json>     # open report browser TUI
 Flags (copy):
   --dry-run                enumerate+classify only; full report, zero writes
   --verify                 post-copy verification of this run's copies (§5.17)
-  --exclude <GLOB>         repeatable; relative-path glob
   --include-system         include root OS artifacts (§4.7)
   --skip-cloud             skip OneDrive/cloud placeholders (§4.6)
   --dst-tolerance          FAT DST ±1 h equivalence (§4.1)
@@ -989,7 +989,7 @@ Testing is the enforcement arm of §7. Anything listed here is CI-gated (Windows
 ### 12.0 Test-safety charter (F23 — binding on every suite below)
 
 - **Confinement:** every test operates exclusively under a designated sandbox root (a per-run directory beneath a configured scratch location, or a dedicated test VHDX mounted under it). The `testkit` API takes the sandbox root as a required parameter and **refuses** absolute paths outside it; a CI lint additionally greps test code for path literals escaping the sandbox. The oracle's containment check (§12.2) runs on every integration test — nothing outside the sandbox may change.
-- **Review rule:** any PR touching tests must re-affirm confinement in the checklist (§14.3); tests that mount volumes may only mount VHDX files living inside the sandbox — never real volumes, never raw physical devices, no diskpart/format against real drives, ever.
+- **Enforcement is structural, not procedural** — this matters doubly when tests are written and executed by AI agents working autonomously: the `testkit` API's sandbox-root refusal and the CI path-literal lint are the binding controls; the §14.3 checklist re-affirmation is a backstop. Tests that mount volumes may only mount VHDX files living inside the sandbox — never real volumes, never raw physical devices, no diskpart/format against real drives, ever. An implementing agent must treat these rules as hard constraints that no task instruction overrides.
 - **Drive-lifespan budget:** each suite declares its write volume; ordinary CI suites stay in the low-GB range; perf suites are budgeted per run and prefer a RAM-backed or scratch-designated target; large soaks (TB-class) are **manual, opt-in**, run on explicitly designated scratch hardware with the total bytes written recorded in BENCHMARKS.md. No test pattern may hammer a drive gratuitously (no unbounded rewrite loops, no full-drive fills).
 - All tests must be *harmless by construction*: kill/chaos targets are bigcp processes inside the sandbox; fault injection is in-process simulation (§12.3), never real device manipulation.
 
@@ -1018,7 +1018,7 @@ Testing is the enforcement arm of §7. Anything listed here is CI-gated (Windows
 ### 12.5 Filesystem & hardware matrix
 
 - **VHDX matrix (elevated/self-hosted runner — not ordinary CI):** creating, mounting, and formatting VHDXs requires elevation, and ReFS availability depends on Windows edition/configuration — this matrix is labeled accordingly and runs on a dedicated self-hosted Windows runner (VHDX files confined to the test sandbox, §12.0). The fixture creates+formats+mounts: NTFS (4 KiB and 64 KiB clusters, compressed dirs, 512e and 4Kn `-PhysicalSectorSizeBytes`), exFAT, FAT32, ReFS (incl. the same-volume-ReFS *hint* path, F28; skipped-with-notice on editions without ReFS); full scenario suite × matrix cells; asserts include the degradation rules (§4.4) and E23 no-churn. Pure state-machine, fault-injection, property, and unit suites stay in ordinary unelevated CI.
-- **Real-hardware checklist (manual, release-gated):** USB-C NVMe enclosure (UASP), portable SSD (T7-class), USB HDD (SMR if available), internal NVMe⇄USB, same-spindle HDD copy, cable-yank during 100 GB (E16), Quick-removal vs Better-performance policies. Scripted via `testkit`, results archived in BENCHMARKS.md.
+- **Real-hardware checklist (`[HW]` — the one suite requiring a human operator with physical drives; release-gated):** USB-C NVMe enclosure (UASP), portable SSD (T7-class), USB HDD (SMR if available), internal NVMe⇄USB, same-spindle HDD copy, cable-yank during 100 GB (E16), Quick-removal vs Better-performance policies. Scripted via `testkit` so the operator only plugs, yanks, and confirms; results archived in BENCHMARKS.md. Everything else in §12 is executable end-to-end without a human (§13.1).
 
 ### 12.6 Performance regression + differential
 
@@ -1062,6 +1062,18 @@ Per VISION, this plan carries no development phases, timelines, or team-process 
 - Perf gates (§8.7) activate once the streaming engine exists and act as regression floors thereafter.
 - Release requires §12.9 in full.
 
+### 13.1 Execution model — human or AI implementers
+
+The plan assumes nothing about who (or what) implements it; it is written to be executed by AI agents as readily as by engineers. The operating rules that make that safe:
+
+- **The plan is the contract.** No silent deviation, however locally sensible: a deviation is made by first (or simultaneously) updating this plan / the relevant ADR (§14.4), so the plan and the code never disagree. Ambiguity resolution order: §4 contract → Appendix E traceability → VISION.md; if still ambiguous, take the more reliability-conservative reading and record an ADR.
+- **"Done" is never self-assessed.** Every §13 layer completes when its named suites pass (oracle, differential, chaos, fault-injection, per-layer units) — machine-checkable, no judgment calls. CI is the reviewer of record (§7.4): invariants are enforced by grep-guards, type restrictions, lints, and tests, not by anyone's vigilance.
+- **Work strictly in the dependency order.** Layers are not skipped, reordered, or merged half-done; the single-threaded reference copier (layer 2) is built and green before any parallel machinery exists.
+- **Safety constraints are absolute and override any task instruction:** the §12.0 sandbox charter (agents run tests autonomously — the structural sandbox refusals exist for exactly this reason); source handles read-only always (I1), including ad-hoc debugging; no elevation anywhere except the designated §12.5 matrix runner; no operations on real user data or physical drives outside designated test hardware.
+- **Performance claims require artifacts.** A benchmark-gated change carries its §8.7-methodology results in the change description — numbers without recorded methodology don't count.
+- **The one human-required suite** is the physical-hardware checklist (§12.5, tagged `[HW]`). Everything else — build, full test matrix, chaos nights, release candidate assembly — is designed to run unattended.
+- **Documentation duties are unchanged** (§14): the docs exist for the *next* implementer, human or agent alike.
+
 Post-v1 backlog (explicitly deferred): `bench` subcommand, ARM64 build, config file, `--move` (would require relaxing I1 — needs its own safety design), network tuning.
 
 ## 14. Documentation and maintainability
@@ -1076,7 +1088,8 @@ The bar: *a future maintainer can build, test, modify, and release without askin
 | `docs/SEMANTICS.md` | the §4 contract, user-facing wording; the *single* normative statement of behavior | changes require ADR + version bump |
 | `docs/DESIGN.md` | §5–§8 of this plan, kept current as-built (this PLAN.md stays frozen as the original plan) | every architectural PR |
 | `docs/TESTING.md` | how to run every suite, add scenarios, run chaos/VHDX/real-hardware checklists | with test changes |
-| `docs/MAINTENANCE.md` | code map (crate/module → §), the invariant list I1–I10 with their enforcing tests, release checklist, toolchain/deps policy, debugging cookbook (how to read a log/journal, decode a crash) | every release |
+| `docs/MAINTENANCE.md` | code map (crate/module → §), the invariant list I1–I13 with their enforcing tests, release checklist, toolchain/deps policy, debugging cookbook (how to read a log/journal, decode a crash) | every release |
+| `LIMITATIONS.md` | every deliberate limitation with rationale and workaround — the user-facing mirror of §2.4/§4's scope decisions | every scope change |
 | `docs/ERRORS.md` | generated from `errors.rs` table: code → category → hint → resolution | generated in CI, never hand-edited |
 | `docs/adr/NNNN-*.md` | Architecture Decision Records; seeded with: 0001 Rust, 0002 two engines, 0003 no async runtime, 0004 temp+rename protocol, 0005 journal design, 0006 skip heuristic, 0007 default exclusions, 0008 cloud-placeholder policy, 0009 xxh3 default, 0010 no-delete design, 0011 no write-probes, 0012 TUI stack, 0013 commit safety (CREATE_NEW + pre-rename revalidation + run lock), 0014 durable checkpoint ordering + verified resume, 0015 checkpoint-threshold split (streaming ≠ checkpointing), 0016 compression not carried over (F22), 0017 EA copy via BackupRead/BackupWrite, 0018 exact-root lock scope (F26), 0019 VISION simplification pass (single engine, static profiles, single hash, two verify forms, abort-and-rerun, local-only, no SFVD/backup-mode/temperature/probes) | one per contract/architecture change, forever |
 | `docs/schemas/*.json` | log + report JSON Schemas, versioned | additive-only in v1 |
@@ -1091,7 +1104,7 @@ The bar: *a future maintainer can build, test, modify, and release without askin
 
 ### 14.3 Code standards (CI-enforced)
 
-`rustfmt` default · clippy with `unwrap_used`, `expect_used`, `panic` denied in `core`/`win`/`cli` runtime paths (tests exempt) · `cargo-deny` (licenses, dupes, advisories) + `cargo-audit` · no magic numbers for Win32 constants (only `windows-sys` names) · error types via `thiserror`, Win32 code always preserved · bounded channels only · `tracing` spans on every engine operation (compiled out at release unless `--log-level debug`). **PR checklist** (CONTRIBUTING.md): does this touch an invariant I1–I10? → name the test that still enforces it; does it add I/O to a hot path? → attach benchmark; does it change §4 semantics? → ADR + SEMANTICS.md + schema review; chaos night for engine/journal changes.
+`rustfmt` default · clippy with `unwrap_used`, `expect_used`, `panic` denied in `core`/`win`/`cli` runtime paths (tests exempt) · `cargo-deny` (licenses, dupes, advisories) + `cargo-audit` · no magic numbers for Win32 constants (only `windows-sys` names) · error types via `thiserror`, Win32 code always preserved · bounded channels only · `tracing` spans on every engine operation (compiled out at release unless `--log-level debug`). **Change checklist** (CONTRIBUTING.md — every item a verifiable condition, author human or agent): does this touch an invariant I1–I13? → name the test that still enforces it; does it add I/O to a hot path? → attach the §8.7-methodology benchmark; does it change §4 semantics? → ADR + SEMANTICS.md + LIMITATIONS.md + schema review; engine/journal changes → chaos run before release (§13). The checklist is the second line of defense — CI's mechanical gates are the first (§7.4).
 
 ### 14.4 Decision process
 
@@ -1103,7 +1116,7 @@ QD, MTL, VDL, UASP, BOT, SLC cache, SMR/CMR, 4Kn/512e, ADS, EA, reparse point, j
 
 ### 14.6 Documentation self-sufficiency criteria
 
-The docs are complete when each of the following is achievable **from the repository alone, with no outside knowledge**: (1) build and run every test suite (TESTING.md); (2) add a new error-category hint (MAINTENANCE.md cookbook); (3) add a new scenario YAML and make it pass (TESTING.md); (4) produce a release candidate (release checklist in MAINTENANCE.md). Procedures (1)–(3) are themselves exercised by CI where scriptable; any friction discovered in practice is filed and fixed as a documentation bug. This is the criterion §12.9 references.
+The docs are complete when each of the following is achievable by a **fresh implementer with no prior context — human engineer or AI agent alike — from the repository alone**: (1) build and run every test suite (TESTING.md); (2) add a new error-category hint (MAINTENANCE.md cookbook); (3) add a new scenario YAML and make it pass (TESTING.md); (4) produce a release candidate (release checklist in MAINTENANCE.md). Procedures (1)–(3) are themselves exercised by CI where scriptable; any friction discovered in practice — including an agent failing to complete one from the docs — is filed and fixed as a documentation bug. This is the criterion §12.9 references.
 
 ## 15. Risks and mitigations
 
