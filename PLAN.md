@@ -43,7 +43,7 @@
 | Win32 access | `windows-sys` bindings wrapped in one dedicated crate holding 100 % of the `unsafe` code | §5.2, §14 |
 | I/O strategy | **Two engines, one product engine path**: parallel buffered engine for small files, IOCP-based unbuffered overlapped streaming engine for large files; queue depths and request sizes chosen **statically from device-class profiles** (no adaptive tuning, no alternate OS-copy engines — VISION) | §5.8–§5.9, §8.2 |
 | Enumeration | Parallel work-stealing directory walk with large-fetch enumeration; destination compared via **per-directory join** (one dir listing instead of N per-file stats) | §5.6 |
-| Skip heuristic | robocopy-compatible size + mtime (compared via per-filesystem, per-field timestamp projection), plus cheap *metadata repair* (attributes + creation time) without data rewrite | §4.1 |
+| Skip heuristic | robocopy-compatible size + mtime, compared **exactly** (100 ns — NTFS/ReFS only, no tolerance machinery), plus cheap *metadata repair* (attributes + creation time) without data rewrite | §4.1 |
 | Overwrite safety | Existing destination files are **never truncated in place**; replacement is always written to a temp name and atomically renamed over; every replacement is logged with the old file's metadata and the reason | §4.3 |
 | Commit safety | New files are created `CREATE_NEW`; replacements revalidate the target's identity immediately before the atomic rename; a second run on the same destination root is refused machine-wide (run lock) | §4.3, §5.12 |
 | Resume | Idempotent re-run via the skip heuristic, plus **durable, integrity-verified checkpoints** for partially copied large files (flush-ordered watermarks + prefix digest re-verified on resume) | §5.12 |
@@ -79,7 +79,7 @@ Robocopy's problems are structural, not configurational (details in §3.3): one 
 | F12 | Very large files (40 GB+): partial resume must use a scheme (temp names) that can never be mistaken for a completed file, and resumed content must be **verified** for integrity | §4.3, §5.12 |
 | F13 | Every overwrite decision is logged with enough information for later analysis, and summarized statistically | §4.1, §10.2, §10.3 |
 | F14 | Baseline Windows 11 22H2+ — use modern APIs and simplify accordingly | §2.3, §5.2 |
-| F15 | exFAT/FAT32 supported (older HDDs); every performance/reliability advantage NTFS offers is taken when NTFS is detected | §4.4 |
+| F15 | **NTFS and ReFS volumes only**, source and destination; all other filesystems rejected pre-flight with a clear error; every advantage NTFS/ReFS offer is taken | §4.4 |
 | F16 | Source **and destination** trees assumed exclusive and stable; violations detected when detection adds no copy I/O (CPU/RAM cost acceptable, within a measured budget) and treated as errors | §4.8 |
 | F17 | System files (System Volume Information, page files, …) excluded by default; exclusions always reported (both would-be and actual); flag to disable | §4.7 |
 | F18 | Simple preallocation only; `SetFileValidData` and similar privilege-requiring / stale-data-exposing mechanisms **must not be used** | §5.9 |
@@ -109,7 +109,7 @@ Robocopy's problems are structural, not configurational (details in §3.3): one 
 ### 2.3 Supported environment (deliberately narrow)
 
 - **OS:** Windows 11 22H2 or later, x64 (ARM64 build is a stretch goal; no code may preclude it). All 22H2-era APIs (kernel-mode copy in `CopyFile2`, all `COPY_FILE_*` flags, `FileRenameInfoEx`/`FileDispositionInfoEx`, `FileIdExtdDirectoryInfo`) may be assumed present — runtime fallbacks exist only for *filesystem* differences (e.g., POSIX rename is NTFS-only), never for OS versions (§5.2).
-- **Filesystems:** NTFS and ReFS as first-class; exFAT and FAT32 supported with documented degradation (§4.4). Anything else: best-effort via the same degradation rules.
+- **Filesystems:** NTFS and ReFS only, source and destination (VISION). Any other filesystem — exFAT, FAT32, UDF, third-party — is rejected pre-flight with a clear error (§4.4). This buys exact timestamp semantics, guaranteed file IDs, POSIX rename, and one code path.
 - **Transports:** internal NVMe/SATA, and USB-C (USB 3.x / USB4 / Thunderbolt) mass storage — this is the *primary* optimization target.
 - **Elevation:** never required and confers no special modes (no backup-privilege mode — VISION; permission failures are reported with a hint).
 - **Locations:** local volumes only. Network (UNC) paths are rejected pre-flight with a clear error (VISION).
@@ -124,7 +124,7 @@ These are *decisions*, not omissions. Each cuts complexity that would endanger t
 - **No VSS snapshot integration** (locked files fail with a hint naming the locking process instead).
 - **No move/rename mode** (`/MOV`) — moving implies deleting from source; source is read-only, period.
 - **No hard-link preservation, detection, or reporting** (VISION): hard-linked source files are copied as independent files (robocopy default behaves the same); bigcp does not track file IDs to notice them.
-- **De-scoped by VISION** (each was designed in earlier drafts and deliberately removed): alternate OS-copy engines as product features and same-volume ReFS clone acceleration (test-harness use only; a hint tells the user when the OS could clone faster); adaptive auto-tuning (static class profiles + override flags instead); backup-privilege mode; `SetFileValidData`; multiple/cryptographic hash options; in-run recovery interactions (abort-and-rerun only); disk-temperature monitoring; retry arguments; device probing/benchmarking options; hash-recording options beyond verification and resume integrity; volume-level flushing.
+- **De-scoped by VISION** (each was designed in earlier drafts and deliberately removed): **exFAT/FAT32 and all non-NTFS/ReFS filesystems** (rejected pre-flight — this deleted timestamp projection/tolerances, the DST flag, the FAT32 4 GiB limit, and all rename/enumeration fallback chains); alternate OS-copy engines as product features and same-volume ReFS clone acceleration (test-harness use only; a hint tells the user when the OS could clone faster); adaptive auto-tuning (static class profiles + override flags instead); backup-privilege mode; `SetFileValidData`; multiple/cryptographic hash options; in-run recovery interactions (abort-and-rerun only); disk-temperature monitoring; retry arguments; device probing/benchmarking options; hash-recording options beyond verification and resume integrity; volume-level flushing.
 - **No EFS raw copy** (`/EFSRAW`): encrypted files are copied as readable plaintext content and re-encrypted at destination when possible (§4.2).
 - **No 32-bit builds, no Windows 7/8 support.**
 - **No config files** in v1 — flags only, with excellent defaults. (Revisit only if flag count grows past ~20.)
@@ -170,13 +170,13 @@ Findings from a structured survey (July 2026) of Microsoft documentation, OS-int
 |---|---|
 | **FastCopy** [FastCopy-help] | The reference design. Different physical drives → separate reader/writer threads pipelined; **same drive → fill a big buffer with reads, then write in bulk** (alternating bursts). All I/O unbuffered (blanket policy; default request unit 2 MiB since v5.11). Verify = hash source during read + **re-read destination** (unbuffered by construction, so read-back genuinely hits the device); xxHash3 default in v5. bigcp adopts: topology-aware split, alternating bursts, hash+unbuffered read-back, xxh3. bigcp improves: size-dependent buffering policy (FastCopy is unbuffered even for tiny files), destination join, journal resume, diagnosis. |
 | **robocopy** | §3.1. Also: classification vocabulary (Same/Newer/Older/Changed/Tweaked/Extra/Lonely) — bigcp's classifier (§4.1) is a cleaned-up version; `/DCOPY` letters confirmed as D/A/T/E/X with default `DA` (so plain robocopy does *not* preserve dir timestamps; the required `/DCOPY:DATE` default reads as D+A+T+E — Appendix A note). |
-| **rclone** [rclone-local][rclone-docs] | size+modtime skip with per-backend `--modify-window`; `name.XXXXXX.partial` + rename; preallocation via `NtSetInformationFile`; multi-thread single-file chunks ≥256 MiB (sparse-marking to dodge VDL); **no partial-content resume** (restarts file). bigcp adopts: partial suffix + rename, preallocation, modify-window concept (as per-FS tolerance). bigcp improves: verified checkpoint resume, in-order writes instead of sparse-marking. |
+| **rclone** [rclone-local][rclone-docs] | size+modtime skip with per-backend `--modify-window`; `name.XXXXXX.partial` + rename; preallocation via `NtSetInformationFile`; multi-thread single-file chunks ≥256 MiB (sparse-marking to dodge VDL); **no partial-content resume** (restarts file). bigcp adopts: partial suffix + rename, preallocation. bigcp improves: verified checkpoint resume, in-order writes instead of sparse-marking, and *no* modify-window at all — exact comparison, NTFS/ReFS only (F15). |
 | **rsync** [rsync-man] | `--whole-file` is default for local↔local (delta transfer is a *loss* locally — CPU for absent network savings; validates our no-delta non-goal). Temp-file + atomic rename; postorder directory-mtime fixup; `--modify-window` for FAT. All adopted (independently arrived at, now confirmed as the convergent design). |
 | **TeraCopy** [TeraCopy-doc] | Hash-during-copy then read-back verify phase; per-file skip-and-continue with "retry failed only"; persisted job list = resume. Confirms our verify shape. Caution: no evidence its read-back defeats the OS cache — bigcp's unbuffered read-back closes that hole. |
 | **Explorer / Vista SP1 engine** [Russinovich-SP1] | The canonical study in copy-engine tuning: cached I/O below 256 KiB, pipelined 1–2 MiB async I/O above, read-ahead at 2× I/O size; essentially serial per file. Validates the two-engine split and the size threshold's existence (exact crossover re-benchmarked on current hardware, §13 gates). |
 | **fcp / xcp (Rust, Linux)** [fcp][xcp] | Work-stealing parallel tree walk feeding per-file parallel copies; block-level parallelism reserved for large files; explicit "not tuned for HDDs" (parallelism inverts to a penalty there — confirming our HDD clamps). Same convergent structure as bigcp's enumeration/scheduler split. |
 
-**Skip-heuristic convergence:** every serious tool lands on size + mtime with a filesystem-granularity tolerance (robocopy `/FFT` 2 s, rsync/rclone `--modify-window`), with optional hash mode. FAT stores local time → DST shifts apparent mtimes by exactly 1 h (robocopy `/DST`) [MS-filetimes]. bigcp's §4.1 is this consensus plus automatic per-field projection and metadata repair.
+**Skip-heuristic convergence:** every serious tool lands on size + mtime with a filesystem-granularity tolerance (robocopy `/FFT` 2 s, rsync/rclone `--modify-window`), with optional hash mode. FAT stores local time → DST shifts apparent mtimes by exactly 1 h (robocopy `/DST`) [MS-filetimes]. bigcp goes stricter than the consensus: with only NTFS/ReFS in scope (F15), §4.1 uses exact 100 ns comparison — the tolerance machinery every other tool carries exists solely for FAT-family filesystems bigcp rejects.
 
 **Resume convergence:** no surveyed tool journals chunk state during normal copies; the universal pattern is per-file atomicity + source size/mtime revalidation. bigcp's two-layer design (§5.12) keeps that as layer 1 and adds cheap watermarks only for large files — the one place restart cost is real.
 
@@ -188,7 +188,7 @@ Findings from a structured survey (July 2026) of Microsoft documentation, OS-int
 - **Portable-SSD write cliffs are normal:** pSLC caches (e.g. T9 ≈ 180 GB class) then sustained rates drop — some drives hold ~1 GB/s (T7 Shield, X10 Pro), others fall to ~500 MB/s (SanDisk Extreme class) [SR-T9][Shutter-sustained]. DRAM-less drives lose HMB over USB (the bridge is the NVMe host) → weaker sustained/random behavior *(uncertain quantitatively)*. Consequence: the bottleneck analyzer *detects and explains* the cliff (burst vs sustained rates reported separately; ETA switches to sustained rate) instead of "fighting" it — backing off cannot help; the cache drains at its folding rate regardless (§5.14).
 - **HDDs:** DM-SMR external drives collapse from ~130–190 MB/s to ~10–30 MB/s once their CMR media-cache fills [STH-SMR]; **not detectable in software** (DM-SMR reports as ordinary; the only reliable route is model lists) — bigcp detects the *behavioral signature* and hints honestly. Pure sequential HDD wants large requests at QD 1–2 (NCQ helps random, not sequential); same-spindle copy alternates 64–256 MiB bursts — at 150–250 MB/s media rate a 256 MiB burst amortizes the seek pair to ~1–2 % (derived; §8.3).
 - **Removal policy:** Windows ≥1809 defaults external drives to "Quick removal" (OS write caching off) [MS-removal] — per-file latency dominates small files there; detectable via hotplug IOCTL (§5.5); bigcp explains rather than overrides (§8.6). Even "completed" writes can sit in the *drive's* DRAM; only `FlushFileBuffers` (real cache-flush command) is universally honored — the basis of `--flush` (§8.6).
-- **exFAT on external drives:** no metadata journal (interrupted metadata updates can corrupt the volume — flush more aggressively, §8.6); slower than NTFS for many-small-file metadata; large default clusters. Feeds the FS matrix (§4.4) and hints.
+- **exFAT on external drives:** no metadata journal (interrupted metadata updates can corrupt the volume), slower small-file metadata than NTFS. Originally in scope; this fragility contributed to the VISION decision to support **NTFS/ReFS only** and reject exFAT/FAT32 pre-flight (§4.4, F15) — external drives get reformatted to NTFS instead.
 
 ### 3.5 Techniques adopted / improved / rejected
 
@@ -202,7 +202,7 @@ Findings from a structured survey (July 2026) of Microsoft documentation, OS-int
 | Temp + atomic rename; timestamps after rename | **Adopt/Improve** (rsync/rclone shape + tunneling fix) | §4.3 |
 | Watermark partial resume | **Improve** — no surveyed tool has cheap large-file resume (`/Z` ≈ 3× cost; rclone restarts) | §5.12 |
 | Attribute repair without data rewrite | **Improve** (robocopy needs `/IT` and recopies) | §4.1 |
-| Per-FS timestamp tolerance (auto) | **Improve** (others need manual flags) | §4.1 |
+| Per-FS timestamp tolerance | **Obsolete** — NTFS/ReFS-only scope (F15) makes exact 100 ns comparison possible; every other tool's tolerance machinery exists for filesystems bigcp rejects | §4.1 |
 | Bottleneck attribution + hints | **New** — no surveyed tool explains its own performance | §5.14 |
 | Counter reconciliation as hard invariant | **New** (borrowed from storage-system design, not copy tools) | §7.3 |
 | `SetFileValidData` by default | **Reject** — admin-only + stale-data exposure; in-order window is nearly as good | §5.9 |
@@ -222,22 +222,20 @@ For every source file with a corresponding destination entry (matched by relativ
 
 | Classification | Condition | Action |
 |---|---|---|
-| **Same** | size equal AND last-write time equal under projection (below) AND both plain files (or matching reparse type) | Skip. No data I/O. |
-| **Same, metadata differs** | Same as above but copied attributes (§4.2) or creation time (under projection) differ | *Metadata repair*: one `FileBasicInfo` write fixes attributes + creation time. No data I/O. Counted as `meta_fixed` (disjoint outcome, §7.3). |
+| **Same** | size equal AND last-write time **exactly** equal (§ below) AND both plain files (or matching reparse type) | Skip. No data I/O. |
+| **Same, metadata differs** | Same as above but copied attributes (§4.2) or creation time differ | *Metadata repair*: one `FileBasicInfo` write fixes attributes + creation time. No data I/O. Counted as `meta_fixed` (disjoint outcome, §7.3). |
 | **Different** | size differs, or projected mtime differs | With `--replace=true` (default, F20): **Replace** via §4.3. With `--replace=false`: leave untouched, outcome **`skipped_diff`**. Either way the decision is fully logged: which fields differed, the old file's size/mtime/attributes, and whether the destination was *newer* than the source — and the report aggregates the statistics (F13). |
 | **Type conflict** | file vs. directory vs. reparse-point mismatch (including a destination directory that is a reparse point where the source has a real directory) | **Error** (`type_conflict`), never a silent replacement or a write *through* the unexpected object (§9, E27). |
 | **New** | no destination entry | Copy (created `CREATE_NEW`; concurrent appearance of the name is a `destination_changed` error, §4.3). |
 | **Extra** | destination entry with no source counterpart | Never touched. Counted, sampled into the report. |
 
-**Timestamp comparison is per-field projection, not blanket tolerance.** Each filesystem stores each timestamp field at a different resolution — NTFS/ReFS: 100 ns all fields; exFAT: 10 ms create/write, 2 s access; FAT32: 10 ms create, 2 s write, date-only access. Define `project(ts, fs, field)` = the value `ts` becomes when stored in that field on that filesystem (truncation per the FS spec). Comparison rule: destination field equals `project(src_ts, dstFS, field)` **exactly**. This is simultaneously stricter than robocopy on NTFS→NTFS (exact 100 ns compare) and exactly right on FAT-family (no false "different" churn — a completed run must reach a stable all-Same state on re-run; pinned by E23). Only creation and last-write participate in classification/repair; **last-access is set on copy but never compared** — it drifts by the act of reading and would cause perpetual churn.
-
-With `--dst-tolerance`, a last-write difference of exactly ±1 h (after projection) is *also* treated as equal — FAT stores local time, so DST transitions shift apparent mtimes by exactly one hour (robocopy `/DST` equivalent). Default **off**, mirroring robocopy.
+**Timestamp comparison is exact.** NTFS and ReFS — the only supported filesystems (F15) — both store every timestamp field at 100 ns resolution in UTC, so comparison is plain 64-bit FILETIME equality: no tolerance windows, no per-filesystem projection, no DST compensation (those were all FAT-family artifacts, deleted with FAT support). This is strictly stricter than robocopy's 2 s default, and a completed run trivially reaches a stable all-Same state on re-run (pinned by E23). Only creation and last-write participate in classification/repair; **last-access is set on copy but never compared** — it drifts by the act of reading and would cause perpetual churn.
 
 **Sparse/compressed state never affects sameness.** Logical size and mtime are the comparands; a dense or uncompressed destination copy of a sparse/compressed source is *correct* (those are storage-layout attributes, not content) and must not cause recopy churn.
 
 **Scope note — alternate streams and classification.** A file classified *Same* is judged on its unnamed stream (size + mtime); an ADS-only divergence on an otherwise-Same file is **not** detected at copy time — doing so would cost a stream query per skipped file, violating F11/F21 for a vanishingly rare case. It *is* detected by standalone `bigcp verify`, which compares full stream sets (§5.17). This is the same trade the size+mtime heuristic already makes for content, applied consistently (E43).
 
-**Why size+mtime and not hashes:** it requires zero additional I/O (both values arrive in the directory enumeration record), it is the proven industry heuristic (robocopy, rsync `--whole-file`, rclone all default to it), and its false-negative mode (same size, same mtime, different content) requires either deliberate tampering or a broken program that rewrites content while restoring timestamps. Users who need stronger guarantees run `--verify` or `bigcp verify` (§5.17). We *improve* on robocopy by: (a) per-field projection instead of a blanket 2 s tolerance, so NTFS→NTFS comparisons are exact and FAT comparisons are churn-free; (b) metadata repair (attributes + creation time) without data rewrite; (c) large-file digests computed in flight by default (§5.11), so the log/report carry content hashes for later analysis at zero extra I/O.
+**Why size+mtime and not hashes:** it requires zero additional I/O (both values arrive in the directory enumeration record), it is the proven industry heuristic (robocopy, rsync `--whole-file`, rclone all default to it), and its false-negative mode (same size, same mtime, different content) requires either deliberate tampering or a broken program that rewrites content while restoring timestamps. Users who need stronger guarantees run `--verify` or `bigcp verify` (§5.17). We *improve* on robocopy by: (a) exact 100 ns comparison instead of a blanket 2 s tolerance (possible because only NTFS/ReFS are in scope); (b) metadata repair (attributes + creation time) without data rewrite; (c) large-file digests computed in flight by default (§5.11), so the log/report carry content hashes for later analysis at zero extra I/O.
 
 **Direction rule:** source always wins. A "different" file is replaced even if the destination is newer (robocopy's default also copies older files). bigcp is a copier, not a synchronizer; the report calls out how many replaced files were newer at destination so the user can notice a mistake.
 
@@ -248,13 +246,13 @@ Per the required `/COPY:DTA /DCOPY:DATE` defaults:
 | Item | Copied? | Mechanism | Notes |
 |---|---|---|---|
 | File data (default `$DATA` stream) | ✔ | engines §5.8/§5.9 | |
-| Alternate data streams (files **and directories**) | ✔ | Stream check via `GetFileInformationByHandleEx(FileStreamInfo)` **on the already-open handle** — zero extra opens, one in-memory syscall, skipped entirely on non-NTFS sources (F21); each `:name:$DATA` copied like file data (directory ADS = the `D` in `/DCOPY:DATE`, queried on the enumeration dir handle) | Destination without ADS support (exFAT/FAT32): streams are **dropped with a per-file warning** and counted (`streams_dropped`) — never silently (robocopy silently drops them). |
+| Alternate data streams (files **and directories**) | ✔ | Stream check via `GetFileInformationByHandleEx(FileStreamInfo)` **on the already-open handle** — zero extra opens, one in-memory syscall (F21); each `:name:$DATA` copied like file data (directory ADS = the `D` in `/DCOPY:DATE`, queried on the enumeration dir handle) | If a destination volume reports no named-stream capability (capability flags, §4.4): streams are **dropped with a per-file warning** and counted (`streams_dropped`) — never silently. |
 | Timestamps (create, last-write, last-access) | ✔ | `SetFileInformationByHandle(FileBasicInfo)` on the write handle, **after** rename (§4.3 ordering) | |
 | Attributes (`READONLY, HIDDEN, SYSTEM, ARCHIVE, NOT_CONTENT_INDEXED, TEMPORARY, OFFLINE`) | ✔ | same `FileBasicInfo` call as timestamps (one syscall for both) | |
 | `FILE_ATTRIBUTE_COMPRESSED` | **✖ not carried over** (F22) | — | Content is copied (source reads are transparently decompressed); re-compressing the destination costs CPU/throughput for no correctness gain (§4.1: layout, not content). Count of compressed sources appears in the report; documented, no per-file warnings. |
 | `FILE_ATTRIBUTE_ENCRYPTED` (EFS) | best effort | request `FILE_ATTRIBUTE_ENCRYPTED` at destination create | Content is copied decrypted (we read plaintext); if destination cannot encrypt → warning `efs_downgrade`, file still copied. |
 | Sparse allocation | ✔ as optimization | `FSCTL_QUERY_ALLOCATED_RANGES` on source; `FSCTL_SET_SPARSE` + write only allocated ranges | `--no-sparse` disables. Destination without sparse support: full expansion, with an up-front free-space check for the *logical* size. A dense copy is still a *correct* copy (§4.1). |
-| Extended attributes (EAs, files and dirs) | ✔ when present | `EaSize ≠ 0` arrives **free** in every enumeration record (F21: zero cost in the common EA-less case); when set, the EA stream is copied via `BackupRead`/`BackupWrite` (documented Win32 backup APIs) on the already-open handles | Honors the `E` in `/DCOPY:DATE` (Appendix A). Destination without EA support (exFAT/FAT32): warn `ea_dropped`, counted, never silent. |
+| Extended attributes (EAs, files and dirs) | ✔ when present | `EaSize ≠ 0` arrives **free** in every enumeration record (F21: zero cost in the common EA-less case); when set, the EA stream is copied via `BackupRead`/`BackupWrite` (documented Win32 backup APIs) on the already-open handles | Honors the `E` in `/DCOPY:DATE` (Appendix A). If the destination volume reports no EA capability (§4.4): warn `ea_dropped`, counted, never silent. |
 | DACL/SACL/owner | ✖ by requirement | — | `/COPY:DTA` excludes them. |
 | Directories: existence, attributes, timestamps | ✔ | create → attrs at creation; timestamps set in **post-order pass** (§5.10) | Children creation bumps parent mtime; hence timestamps must be re-set after a directory's subtree is complete. |
 | Symlinks (file & dir) and junctions | ✔ as links | §4.6 | Never followed. |
@@ -272,7 +270,7 @@ Per the required `/COPY:DTA /DCOPY:DATE` defaults:
 **Completion sequence** (streaming engine; small engine is the same minus steps 2–3):
 
 1. All data writes completed (and, for unbuffered handles, EOF corrected: final tail is written padded to a sector multiple, then `FileEndOfFileInfo` trims to the exact size — works on a `FILE_FLAG_NO_BUFFERING` handle on modern NTFS; `win::file` carries a reopen-buffered fallback for stacks that refuse it, §3.2).
-2. For replacements: revalidate the target's identity (above), then rename temp → final via `FileRenameInfoEx` (`ReplaceIfExists | POSIX_SEMANTICS | IGNORE_READONLY_ATTRIBUTE`; non-NTFS fallback chain §5.2). On the fallback path, a read-only/hidden/system rename target gets its blocking attributes cleared first — but only at this final step, so the destructive action is maximally deferred — and if the rename *still* fails, the original attributes are **restored** before the failure is reported (a failed replacement must not leave the user's file modified; a failed restore is itself loudly logged, E39).
+2. For replacements: revalidate the target's identity (above), then rename temp → final via `FileRenameInfoEx` (`ReplaceIfExists | POSIX_SEMANTICS | IGNORE_READONLY_ATTRIBUTE`) — one path, no fallback chain: NTFS/ReFS support it and the startup probe guarantees it (§5.2). `IGNORE_READONLY_ATTRIBUTE` means no attribute pre-clearing is ever needed on the target.
 3. Set timestamps + attributes via `FileBasicInfo` **after** the rename. Ordering rationale: NTFS *name tunneling* can re-apply a prior file's creation time when a new name appears shortly after an old one disappears; setting timestamps after the rename overrides any tunneled value.
 4. With `--flush`: `FlushFileBuffers` on the handle **now** — *after* rename and metadata — so the flushed state includes the final name and metadata, which is what durable completion promises (§7.5). Flushing the temp before the rename would leave the rename itself unflushed.
 5. Close handle. Only now emit `file_done{action:copied}` to log/journal and increment the `copied` counter.
@@ -281,24 +279,24 @@ Per the required `/COPY:DTA /DCOPY:DATE` defaults:
 
 A crash between any two steps is recoverable: before step 3 the destination still has the old file (or nothing) plus a `.bigcp-…part` temp that the journal owns; after step 3 but before step 4/5, the file has correct content and a wrong mtime → re-run reclassifies as Different → re-copies (correct, merely wasteful — and rare). The full crash matrix is in §7.2.
 
-### 4.4 Filesystem feature matrix and degradation rules
+### 4.4 Filesystem support: NTFS and ReFS only (F15)
 
-Detected once per volume via `GetVolumeInformationW` + `GetDiskFreeSpaceExW`:
+**Pre-flight gate:** both volumes are identified once via `GetVolumeInformationW`; anything that is not NTFS or ReFS — exFAT, FAT32, UDF, third-party filesystems — is **rejected before any tree I/O** with a clear error ("bigcp supports NTFS and ReFS volumes only"; hint: reformat, or use robocopy for legacy media). This single gate is what deleted an entire compatibility layer from earlier drafts: timestamp projection/tolerances, the DST flag, the FAT32 4 GiB limit, rename and enumeration fallback chains, and the FAT-family degradation matrix (E03).
 
-| Capability | NTFS | ReFS | exFAT | FAT32 | On unsupported destination |
-|---|---|---|---|---|---|
-| ADS | ✔ | ✔ | ✖ | ✖ | warn `streams_dropped`, continue |
-| Sparse | ✔ | ✔ | ✖ | ✖ | expand; pre-check free space vs. logical size |
-| Compression attr | ✔ | ✖ | ✖ | ✖ | not propagated **by design** on any destination (F22, §4.2); capability listed for completeness |
-| EFS | ✔ | ✖ | ✖ | ✖ | warn `efs_downgrade` |
-| Reparse points (links) | ✔ | ✔ | ✖ | ✖ | error per link (`links_unsupported`) with hint |
-| Max file size | FS/config-dependent (not a practical limit) | FS/config-dependent (not a practical limit) | FS/config-dependent (not a practical limit) | **4 GiB − 1** | only the FAT32 limit is actionable: such files fail *pre-flight* (before any I/O) with a clear error |
-| Timestamp granularity | 100 ns | 100 ns | 10 ms write/create, 2 s access | 2 s write, 10 ms create, date-only access | drives per-field projection, §4.1 |
-| Block cloning | ✖ | ✔ (OS engines only) | ✖ | ✖ | **not used by bigcp** (F28); same-volume ReFS detection emits a hint that the OS copy engine would clone near-instantly (§5.5) |
+What remains is a small **capability delta between NTFS and ReFS**, handled by per-volume capability *flags* (`FILE_NAMED_STREAMS`, `FILE_SUPPORTS_EXTENDED_ATTRIBUTES`, `FILE_SUPPORTS_SPARSE_FILES`, `FILE_SUPPORTS_ENCRYPTION`, `FILE_SUPPORTS_BLOCK_REFCOUNTING`, …) — never by filesystem-name switches, so ReFS version differences and future changes are absorbed automatically:
 
-**Degradation policy — what still counts as "copied" (F15/F17 clarity):** a file counts as *copied* when its data and every piece of metadata the destination filesystem **can represent** are in place. Non-representable features (ADS, EAs, sparse layout, sub-resolution timestamp precision) produce per-item warnings and a distinct `copied-with-warnings` counter in the summary — visible, never silent, and not a failure (the user chose the destination filesystem). Reparse points are the exception: with no representable equivalent they **fail** (`links_unsupported`) — a link is identity, not decoration.
+| Capability | NTFS | ReFS | If the destination volume lacks it |
+|---|---|---|---|
+| ADS | ✔ | ✔ (modern versions) | warn `streams_dropped` per item, continue |
+| EAs | ✔ | version-dependent | warn `ea_dropped` per item, continue |
+| Sparse | ✔ | ✔ | expand dense; pre-check free space vs. logical size |
+| EFS | ✔ | ✖ | warn `efs_downgrade` (content copied) |
+| Compression attr | ✔ | ✖ | moot — never propagated by design (F22, §4.2) |
+| Reparse points (links) | ✔ | ✔ | error per link (`links_unsupported`) — should not occur on NTFS/ReFS |
+| Timestamps | 100 ns UTC | 100 ns UTC | — (identical; exact comparison, §4.1) |
+| Block cloning | ✖ | ✔ (OS engines only) | not used by bigcp (F28); same-volume ReFS emits the "OS would clone faster" hint (§5.5) |
 
-**NTFS advantage rule (F15):** whenever the destination volume supports it, bigcp engages: POSIX atomic rename-replace, ADS and EA copy, sparse-preserving copy, exact 100 ns timestamp fidelity, 128-bit file-ID commit revalidation, VDL-aware in-order streaming, and (ReFS) block cloning. exFAT/FAT32 destinations get the safe generic paths plus more aggressive journal/report flushing — those filesystems have no metadata journal to contain interrupted updates (§8.6).
+**Degradation policy — what still counts as "copied" (F15/F17 clarity):** a file counts as *copied* when its data and every piece of metadata the destination volume **can represent** are in place. A missing capability produces per-item warnings and a distinct `copied-with-warnings` counter in the summary — visible, never silent, and not a failure. Reparse points are the exception: with no representable equivalent they **fail** (`links_unsupported`) — a link is identity, not decoration.
 
 ### 4.5 Path handling
 
@@ -377,9 +375,7 @@ Dependency rules (CI-enforced via `cargo-deny`): `cli → {core,tui}`, `tui → 
 
 The `win` crate exposes only safe, documented functions returning `io::Result<T>` with the Win32 error preserved (`raw_os_error`). Every wrapper has a `# Safety`-discharging comment and a unit test. The rest of the workspace is `#![deny(unsafe_code)]`.
 
-Fallback chains in `win` are **filesystem-driven only** — the Windows 11 22H2 baseline (F14) removes every OS-version branch; probe once per volume and cache:
-- Rename: `FileRenameInfoEx(POSIX | ReplaceIfExists | IgnoreReadonly)` on NTFS/ReFS → classic `FileRenameInfo(ReplaceIfExists)` with attr-clear-and-restore (§4.3) on exFAT/FAT32.
-- Enumeration info class: `FileIdExtdDirectoryInfo` (reparse tag + 128-bit ID) where the filesystem supports it → `FileFullDirectoryInfo` otherwise (FAT-family without stable file IDs).
+There are **no fallback chains** in `win`: the Windows 11 22H2 baseline (F14) removes every OS-version branch, and the NTFS/ReFS-only gate (F15) removes every filesystem branch. `FileRenameInfoEx (POSIX | ReplaceIfExists | IgnoreReadonly)` and `FileIdExtdDirectoryInfo` are simply *required*: a one-time per-volume startup probe verifies them and **fails fast** with a clear error if a volume refuses (defensive assert for exotic NTFS/ReFS configurations — not a compatibility layer).
 
 ### 5.3 Process overview and threading model
 
@@ -458,7 +454,7 @@ Every `CopyItem` terminates in exactly **one** `Outcome`, delivered to the coord
 
 Runs once at startup (per distinct volume), before any copy I/O; results go into the log, the report, the Devices tab, and the tuning tables.
 
-1. Volume: `GetVolumePathNameW` → `GetVolumeInformationW` (FS name, flags, max component) → `GetDiskFreeSpaceExW` (free space) → `GetDiskFreeSpaceW` (cluster size) → `GetDriveTypeW`.
+1. Volume: `GetVolumePathNameW` → `GetVolumeInformationW` (FS name, capability flags, max component) — **the F15 gate runs here: FS name not NTFS/ReFS → fatal exit 5 before any tree I/O** (§4.4) → `GetDiskFreeSpaceExW` (free space) → `GetDiskFreeSpaceW` (cluster size) → `GetDriveTypeW` (`DRIVE_REMOTE` → reject, F27).
 2. Volume→disk: open `\\.\C:` with `dwDesiredAccess = 0` (query-only; works without admin) → `IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS` → physical disk number(s).
 3. Disk: open `\\.\PhysicalDriveN` (access 0) → `IOCTL_STORAGE_QUERY_PROPERTY`:
    - `StorageDeviceSeekPenaltyProperty` → HDD vs. SSD,
@@ -560,7 +556,7 @@ Journal hygiene: append-only JSONL; every record CRC-tagged; a torn tail is dete
 | `space` | 39/112 `DISK_FULL` | "Destination full: need ~X GB more (from discovery)" |
 | `media` | 23 `CRC`, 1117 `IO_DEVICE` | "Source device reported hardware read errors — check the drive (chkdsk / SMART)" |
 | `device_gone` | 433, 1167 `DEVICE_NOT_CONNECTED` | "Device disconnected — reconnect and re-run to resume" |
-| `fs_limit` | FAT32 4 GiB, no-reparse-support | per-case hint (§4.4) |
+| `fs_limit` | missing volume capability (ADS/EA/sparse/EFS on this ReFS version) | per-case hint (§4.4) |
 | `source_changed` | vanished at open; open-time or post-read metadata mismatch (§4.8) | "Source was modified during the run — quiesce writers and re-run (exclusive-source assumption, F16)" |
 | `destination_changed` | `CREATE_NEW` collision; pre-rename identity mismatch (§4.3) | "Something else is writing to the destination — nothing was overwritten; re-run to reconcile" |
 | `unsupported_reparse` | unknown third-party reparse tag (§4.6) | "Tag 0x… has no meaning without its owning filter; use --raw-reparse to copy the raw buffer at your own risk" |
@@ -579,7 +575,7 @@ Journal hygiene: append-only JSONL; every record CRC-tagged; a torn tail is dete
 - Bottleneck **hypotheses** (not verdicts) per window and for the whole run, each with a confidence level derived from how separated the evidence is: `source-bound` (src busy >90 %, dst <60 %), `dest-bound` (inverse), `balanced`, `cpu-bound` (hash pool saturated), `discovery-bound` (copy queues empty while enumeration active), `breaker-paused`. Application-side in-flight occupancy is a proxy, not physical device utilization — the report says so, and near-tied evidence yields `balanced (low confidence)` rather than a confident wrong answer. The report stores the timeline (downsampled to ≤3,600 points) plus phase extremes: fastest/slowest 5-minute segments with their dominant folders, and supporting signals (queue starvation time, p99 latency).
 - **"Maximum possible throughput" is reported as *observed peak***: the best sustained 5 s window on the bottleneck device during this run — no probing options exist (VISION); throughput observed during the run is the sole basis. Efficiency = run average ÷ observed peak. The report labels the number's provenance explicitly — an observed peak is a *proxy* for the attainable maximum, not a physical limit, and no theoretical maxima are fabricated. This satisfies the VISION "maximum possible throughput" ask with a number that is honest about what it is.
 - Disk temperatures are **not** monitored (F25, VISION): drive slowdowns are communicated through the throughput-signature detectors below, which capture the user-visible consequence (thermal throttling looks like an SLC-cliff-style sustained-rate drop) without the IOCTL surface.
-- Pattern detectors emit hints (§11 Hints tab): sustained dst-throughput cliff after tens of GB (typical SLC-cache exhaustion / SMR behavior → "expected on this class of drive, not a bigcp or cable problem"), high dst latency with low throughput on small files (AV filter → "consider a Defender exclusion for the destination during bulk restore"), `discovery-bound` verdict (→ "source metadata is the limit; nothing to tune"), FAT tolerance skips (→ "--dst-tolerance").
+- Pattern detectors emit hints (§11 Hints tab): sustained dst-throughput cliff after tens of GB (typical SLC-cache exhaustion / SMR behavior → "expected on this class of drive, not a bigcp or cable problem"), high dst latency with low throughput on small files (AV filter → "consider a Defender exclusion for the destination during bulk restore"), `discovery-bound` verdict (→ "source metadata is the limit; nothing to tune").
 
 ### 5.15 Logging and reporting
 
@@ -603,7 +599,7 @@ Exactly two forms, per VISION (F32) — no sub-modes, no variants:
 Shared rules for both forms:
 
 - **Full stream set and EAs are compared**, not just the unnamed stream (`FileStreamInfo` on the handles already open for the read — F21 cost profile; EA blobs when `EaSize ≠ 0` on either side). This is what closes the §4.1 scope note: ADS/EA divergence undetectable at copy-classification time *is* caught by standalone verify (E43).
-- Timestamps: creation and last-write are pass/fail per the projection rules (§4.1). Last-access is **reported separately, informational only** — it legitimately drifts after copy (any access rewrites it), so it can neither be an equality key nor a failure, but it is never silently ignored either.
+- Timestamps: creation and last-write are pass/fail on exact 100 ns equality (§4.1). Last-access is **reported separately, informational only** — it legitimately drifts after copy (any access rewrites it), so it can neither be an equality key nor a failure, but it is never silently ignored either.
 - Verify results land in the same report structure (`verify` section): pass/fail counts, mismatched files (these are *serious* — flagged in red, with the guidance that a mismatch after a clean copy indicates hardware/FS problems).
 - Honesty note (documented in README and report): unbuffered read-back defeats the OS cache but not the drive's internal DRAM cache entirely; verify catches bus/FS/logic corruption reliably, media decay only as well as the drive lets it. `--verify` costs one extra read of the copied bytes — the report prices it in advance in the plan line.
 
@@ -617,7 +613,8 @@ Pseudocode is normative for control flow; error handling (every call can fail �
 run(opts):
   paths   = canonicalize(opts.src, opts.dst)          # §4.5 lexical form
   roots   = open_and_pin_roots(paths)                 # §4.5 identity checks (final paths + file IDs);
-                                                      #   src==dst / nesting → fatal; handles held all run
+                                                      #   src==dst / nesting → fatal; UNC/non-NTFS/ReFS → fatal
+                                                      #   (F27/F15); handles held all run
   lock    = acquire_run_lock(roots.dst)               # §5.12: exact-root machine-wide mutex (F26); held → exit 5
   devices = profile(paths)                            # §5.5
   journal = Journal::load_or_new(state_dir(roots))    # §5.12
@@ -679,7 +676,7 @@ OnWriteDone(c): advance watermark W if contiguous; if file ≥ checkpoint_thresh
 Tail:     last chunk padded to sector multiple; after its write: FileEndOfFileInfo(exact size)
 Finalizing: revalidate source stability (§4.8) — changed → delete temp (journal-owned), emit Failed{source_changed}
             if Replace: revalidate target identity (§4.3) — changed → old file kept, emit Failed{destination_changed}
-            rename temp→final (ReplaceIfExists | IgnoreReadonly; non-NTFS fallback: attr-clear, restore on failure §4.3)
+            rename temp→final (ReplaceIfExists | IgnoreReadonly | Posix — single path, §4.3)
             FileBasicInfo(timestamps+attrs)     # after rename — tunneling, §4.3
             [--flush → FlushFileBuffers]        # after rename+meta so the flushed state is the final state (§7.5)
             close both; emit Copied{hash, replaced: old-meta if Replace}   # F13
@@ -811,7 +808,7 @@ Per VISION: no device probing or benchmarking options exist — the "observed pe
 
 ### 8.6 Write caching and removal safety
 
-Windows (≥1809) defaults external drives to "Quick removal" (OS write caching off) — small-file copies feel that as per-file latency; the profiler *infers* the likely policy via `IOCTL_STORAGE_GET_HOTPLUG_INFO` (+ `IOCTL_DISK_GET_CACHE_INFORMATION` for the device cache), reports `unknown` when indeterminate (§5.5), and the Hints tab explains the trade-off rather than changing system settings. Durability layering (README states this plainly): unbuffered writes bypass the *OS* cache; the *drive's* DRAM cache is only emptied by a real cache-flush command — `FlushFileBuffers` is universally honored, `FILE_FLAG_WRITE_THROUGH`/FUA is ignored by some USB bridges (§3.4) — so `--flush` uses `FlushFileBuffers`, and without it the standard "Safely Remove" flow covers the device cache. On exFAT destinations (no metadata journal — interrupted metadata updates can corrupt the volume, §3.4), bigcp flushes the journal-relevant state more aggressively and the Hints tab notes the fragility.
+Windows (≥1809) defaults external drives to "Quick removal" (OS write caching off) — small-file copies feel that as per-file latency; the profiler *infers* the likely policy via `IOCTL_STORAGE_GET_HOTPLUG_INFO` (+ `IOCTL_DISK_GET_CACHE_INFORMATION` for the device cache), reports `unknown` when indeterminate (§5.5), and the Hints tab explains the trade-off rather than changing system settings. Durability layering (README states this plainly): unbuffered writes bypass the *OS* cache; the *drive's* DRAM cache is only emptied by a real cache-flush command — `FlushFileBuffers` is universally honored, `FILE_FLAG_WRITE_THROUGH`/FUA is ignored by some USB bridges (§3.4) — so `--flush` uses `FlushFileBuffers`, and without it the standard "Safely Remove" flow covers the device cache. (NTFS and ReFS both journal their metadata — the exFAT no-journal fragility concern disappeared with exFAT support, F15.)
 
 ### 8.7 Expected performance targets (gates in §12.6)
 
@@ -831,12 +828,12 @@ Each case: expected behavior + the test that pins it (§12 IDs). This table is t
 |---|---|---|
 | E01 | 0-byte files | created, metadata copied, no data I/O |
 | E02 | file size exactly at threshold / chunk / sector boundaries (±1) | correct via tail-trim protocol (§4.3); property-tested sizes |
-| E03 | file > 4 GiB onto FAT32 | pre-flight fail, `fs_limit`, hint |
+| E03 | source or destination volume is exFAT/FAT32/other non-NTFS/ReFS | rejected pre-flight with a clear "NTFS and ReFS only" error + reformat/robocopy hint (§4.4, F15) |
 | E04 | path > 260 chars; component = 255; total near 32 760 | works via `\\?\`; over-limit → pre-flight `path_too_long` |
 | E05 | trailing dot/space in names; reserved names (`CON`, `NUL.txt`) | copied verbatim via `\\?\` |
 | E06 | Unicode: emoji, surrogates (incl. unpaired), RTL, combining, NFC/NFD differences | byte-preserved (no normalization ever); NFC≠NFD are distinct files |
-| E07 | hidden/system/readonly files and dirs | attrs copied; readonly *destination* replaced via deferred attr-clear (§4.3) |
-| E08 | ADS: multiple streams, large streams, stream-only size | copied on NTFS/ReFS dst; warned+counted on exFAT/FAT |
+| E07 | hidden/system/readonly files and dirs | attrs copied; readonly *destination* replaced via `IGNORE_READONLY_ATTRIBUTE` rename (§4.3) |
+| E08 | ADS: multiple streams, large streams, stream-only size | copied; warned+counted if the destination volume lacks named-stream capability (§4.4) |
 | E09 | sparse 1 TB file, 1 % allocated | allocated-ranges copy; sparse preserved; non-sparse dst → space pre-check |
 | E10 | NTFS-compressed / EFS-encrypted source | content copied; attr best-effort re-applied (§4.2) |
 | E11 | symlink file/dir: relative, absolute, dangling | reparse copied verbatim; no recursion; privilege hint if needed |
@@ -851,14 +848,14 @@ Each case: expected behavior + the test that pins it (§12 IDs). This table is t
 | E20 | locked destination file (open exe) | replace fails `locked`; Restart Manager names the process |
 | E21 | AV/indexer interference (slow closes) | correctness unaffected; detector may hint |
 | E22 | OneDrive placeholders | §4.6: hydrate+count by default; `--skip-cloud` |
-| E23 | FAT 2 s / exFAT 10 ms timestamp rounding | tolerance table §4.1; re-run steady-state = 100 % Same (test asserts no re-copy churn) |
-| E24 | DST shift on FAT dst | `--dst-tolerance` matches ±1 h |
+| E23 | re-run steady state | a completed run re-classifies 100 % Same on re-run — exact 100 ns comparison, zero churn (§4.1) |
+| E24 | *withdrawn* (FAT-only concern: DST shifts on local-time filesystems) | NTFS/ReFS store UTC; no DST handling exists (F15) |
 | E25 | dir tree depth 10 000; 1 M dirs; single dir at the ~1 M-entry target and one beyond it | iterative walk; hash join within metadata budget at target; beyond-target dir degrades to per-name probes — slower, correct (§5.6, F33); memory high-water asserted |
 | E26 | names differing only by case (WSL case-sensitive dir) | duplicate join key → per-file error, not silent overwrite (§4.5) |
 | E27 | dest has a *directory* where source has a *file* (and inverse) | error `type_conflict` (no recursive delete exists to "fix" it); hint |
 | E28 | 4Kn native / 512e mixed sector sizes | alignment from per-volume profiler values; VHDX matrix test |
 | E29 | run from non-console (redirected stdout) | auto `--plain`; no ANSI garbage |
-| E30 | clock skew: dst FS timestamps land ≠ set values | post-set read-back *in debug builds only* asserts round-trip; tolerance rules absorb known FS truncation |
+| E30 | set timestamps don't round-trip on the destination | should be impossible on NTFS/ReFS (100 ns fidelity); post-set read-back *in debug builds only* asserts exact round-trip — a failure indicates a filter driver interfering |
 | E31 | reparse tag unknown (HSM, custom filters) | not recursed; fails `unsupported_reparse` by default with the tag logged; verbatim copy only with explicit `--raw-reparse` (§4.6) |
 | E32 | source root is a drive root with system artifacts | §4.7 default exclusions, visible count |
 | E33 | second bigcp run on the same exact destination root | refused machine-wide before any tree I/O by the run lock (I12, F26); nested-root overlap is an F16 assumption, documented |
@@ -867,7 +864,7 @@ Each case: expected behavior + the test that pins it (§12 IDs). This table is t
 | E36 | destination subdirectory is a junction/symlink | guaranteed for reparses **present when the directory is examined** (dir open with `OPEN_REPARSE_POINT` → subtree `type_conflict`); mid-run swaps fall under the F16 exclusivity assumption — best-effort detection (§4.5) |
 | E37 | log/journal/report device full or disconnected mid-run | copy unaffected; audit-degradation protocol (§5.15); journal failure disables checkpointing only (§5.12) |
 | E38 | 255-character filename needs a temp sibling | opaque short temp names — temp length independent of final name (§4.3) |
-| E39 | rename fails after fallback attr-clear on the target | original attributes restored before the failure is reported; restore failure loudly logged (§4.3) |
+| E39 | *withdrawn* (the non-POSIX rename fallback no longer exists) | single rename path with `IGNORE_READONLY_ATTRIBUTE` — no attribute pre-clearing to undo (§4.3, F15) |
 | E40 | flush/journal reordering around a kill (simulated power loss) | I13 ordering means the watermark can't outrun durable data; resume prefix-verification catches any residue (§5.12, §12.3) |
 | E41 | `--replace=false` with differing destination files | files left untouched, outcome `skipped_diff` with full F13 difference detail (F20) |
 | E42 | destination root does not exist at startup | nearest-existing-ancestor pinned + identity-checked, components created reparse-safely, new root pinned and revalidated (§4.5) |
@@ -888,7 +885,6 @@ Flags (copy):
   --verify                 post-copy verification of this run's copies (§5.17)
   --include-system         include root OS artifacts (§4.7)
   --skip-cloud             skip OneDrive/cloud placeholders (§4.6)
-  --dst-tolerance          FAT DST ±1 h equivalence (§4.1)
   --replace[=true|false]   replace differing destination files (default true, F20; false → outcome skipped_diff, fully logged)
   --checkpoint-threshold <SZ>   journal checkpoints for files ≥ SZ (default 16G; §5.12)
   --flush                  FlushFileBuffers per file after rename+metadata (§7.5; per-file only — VISION)
@@ -997,14 +993,14 @@ Testing is the enforcement arm of §7. Anything listed here is CI-gated (Windows
 
 - `win`: every wrapper against real temp files (create/rename/meta/reparse/sparse FSCTL round-trips); error mapping; alignment helpers (property: any (offset,len) request the engines can produce is sector-aligned).
 - `core::path`: the normalization table — long paths, UNC, `\\?\` passthrough, trailing dot/space, reserved names, surrogates, case-fold join keys; property: normalization is idempotent; display+`path_raw` round-trips.
-- `core::classify`: the full §4.1 decision table including every tolerance row and `--dst-tolerance`; exhaustive small-case enumeration (size ±, mtime ± tolerance ± 1 unit, attr diffs, type conflicts).
+- `core::classify`: the full §4.1 decision table; exhaustive small-case enumeration (size ±, mtime ± 1 FILETIME tick — exact equality, no tolerance rows exist — attr diffs, type conflicts).
 - `core::schedule`: simulated-clock tests — no starvation, dir-before-file ordering, breaker stop, bounded queues (property: memory high-water < budget under adversarial item streams).
 - `core::journal`: round-trip; torn-tail (truncate at every byte offset of a valid file — property test) → loader never panics, never resumes unsafely (I8).
 - Ring/stream state machine: **sans-I/O** — the §6.3 machine is implemented over an abstract I/O port, driven in tests with scripted completions *in adversarial orders* (out-of-order, short reads, mid-stream errors); assertions: watermark monotone+contiguous, in-order issue, no chunk leaked/double-freed, and — critically — the **exact digest equals the single-threaded reference digest under every adversarial completion order** (offset-ordered hashing, §5.9; a merely-monotonic watermark check would miss completion-order hashing entirely). `loom` model-checks the ring's lock-free index handoff.
 
 ### 12.2 The oracle (`testkit check`) and generator (`testkit gen`)
 
-- `gen` builds trees from YAML specs: counts, size distributions (incl. lognormal small-file clouds and boundary sizes from E02), depth profiles, name alphabets (Unicode zoo), ADS, sparse maps, links, attrs, timestamps (incl. FAT-edge values), read-only/hidden/system mixes. Specs live in `testkit/scenarios/*.yaml` — **every E-case in §9 has a scenario file with its ID**.
+- `gen` builds trees from YAML specs: counts, size distributions (incl. lognormal small-file clouds and boundary sizes from E02), depth profiles, name alphabets (Unicode zoo), ADS, sparse maps, links, attrs, timestamps (incl. 100 ns boundary values), read-only/hidden/system mixes. Specs live in `testkit/scenarios/*.yaml` — **every E-case in §9 has a scenario file with its ID**.
 - `check src dst` is the **independent oracle**: deliberately naive synchronous code (no shared logic with `core` — enforced by crate dependency rules §5.2) that walks both trees and byte-compares data + compares copied metadata per the §4 contract — explicitly including full stream sets (names, sizes, contents) and EA blobs — emitting a machine-readable diff. The oracle is the arbiter of every integration test: *bigcp is correct iff the oracle finds no diff*. The oracle also asserts **containment**: a sentinel tree placed beside the destination (and the source tree itself) is snapshotted before and after every run — nothing outside the intended destination root may change.
 
 ### 12.3 Fault injection
@@ -1017,7 +1013,7 @@ Testing is the enforcement arm of §7. Anything listed here is CI-gated (Windows
 
 ### 12.5 Filesystem & hardware matrix
 
-- **VHDX matrix (elevated/self-hosted runner — not ordinary CI):** creating, mounting, and formatting VHDXs requires elevation, and ReFS availability depends on Windows edition/configuration — this matrix is labeled accordingly and runs on a dedicated self-hosted Windows runner (VHDX files confined to the test sandbox, §12.0). The fixture creates+formats+mounts: NTFS (4 KiB and 64 KiB clusters, compressed dirs, 512e and 4Kn `-PhysicalSectorSizeBytes`), exFAT, FAT32, ReFS (incl. the same-volume-ReFS *hint* path, F28; skipped-with-notice on editions without ReFS); full scenario suite × matrix cells; asserts include the degradation rules (§4.4) and E23 no-churn. Pure state-machine, fault-injection, property, and unit suites stay in ordinary unelevated CI.
+- **VHDX matrix (elevated/self-hosted runner — not ordinary CI):** creating, mounting, and formatting VHDXs requires elevation, and ReFS availability depends on Windows edition/configuration — this matrix is labeled accordingly and runs on a dedicated self-hosted Windows runner (VHDX files confined to the test sandbox, §12.0). The fixture creates+formats+mounts: NTFS (4 KiB and 64 KiB clusters, compressed dirs, 512e and 4Kn `-PhysicalSectorSizeBytes`), ReFS (incl. the same-volume-ReFS *hint* path, F28; skipped-with-notice on editions without ReFS), plus **one exFAT cell that exists solely to test the pre-flight rejection** (E03 — a clean "NTFS and ReFS only" error, no tree I/O); full scenario suite × supported cells; asserts include the capability rules (§4.4) and E23 no-churn. Pure state-machine, fault-injection, property, and unit suites stay in ordinary unelevated CI.
 - **Real-hardware checklist (`[HW]` — the one suite requiring a human operator with physical drives; release-gated):** USB-C NVMe enclosure (UASP), portable SSD (T7-class), USB HDD (SMR if available), internal NVMe⇄USB, same-spindle HDD copy, cable-yank during 100 GB (E16), Quick-removal vs Better-performance policies. Scripted via `testkit` so the operator only plugs, yanks, and confirms; results archived in BENCHMARKS.md. Everything else in §12 is executable end-to-end without a human (§13.1).
 
 ### 12.6 Performance regression + differential
@@ -1091,7 +1087,7 @@ The bar: *a future maintainer can build, test, modify, and release without askin
 | `docs/MAINTENANCE.md` | code map (crate/module → §), the invariant list I1–I13 with their enforcing tests, release checklist, toolchain/deps policy, debugging cookbook (how to read a log/journal, decode a crash) | every release |
 | `LIMITATIONS.md` | every deliberate limitation with rationale and workaround — the user-facing mirror of §2.4/§4's scope decisions | every scope change |
 | `docs/ERRORS.md` | generated from `errors.rs` table: code → category → hint → resolution | generated in CI, never hand-edited |
-| `docs/adr/NNNN-*.md` | Architecture Decision Records; seeded with: 0001 Rust, 0002 two engines, 0003 no async runtime, 0004 temp+rename protocol, 0005 journal design, 0006 skip heuristic, 0007 default exclusions, 0008 cloud-placeholder policy, 0009 xxh3 default, 0010 no-delete design, 0011 no write-probes, 0012 TUI stack, 0013 commit safety (CREATE_NEW + pre-rename revalidation + run lock), 0014 durable checkpoint ordering + verified resume, 0015 checkpoint-threshold split (streaming ≠ checkpointing), 0016 compression not carried over (F22), 0017 EA copy via BackupRead/BackupWrite, 0018 exact-root lock scope (F26), 0019 VISION simplification pass (single engine, static profiles, single hash, two verify forms, abort-and-rerun, local-only, no SFVD/backup-mode/temperature/probes) | one per contract/architecture change, forever |
+| `docs/adr/NNNN-*.md` | Architecture Decision Records; seeded with: 0001 Rust, 0002 two engines, 0003 no async runtime, 0004 temp+rename protocol, 0005 journal design, 0006 skip heuristic, 0007 default exclusions, 0008 cloud-placeholder policy, 0009 xxh3 default, 0010 no-delete design, 0011 no write-probes, 0012 TUI stack, 0013 commit safety (CREATE_NEW + pre-rename revalidation + run lock), 0014 durable checkpoint ordering + verified resume, 0015 checkpoint-threshold split (streaming ≠ checkpointing), 0016 compression not carried over (F22), 0017 EA copy via BackupRead/BackupWrite, 0018 exact-root lock scope (F26), 0019 VISION simplification pass (single engine, static profiles, single hash, two verify forms, abort-and-rerun, local-only, no SFVD/backup-mode/temperature/probes), 0020 NTFS/ReFS only — all other filesystems rejected pre-flight (deleted timestamp tolerances, DST handling, FAT32 limits, and all FS fallback chains) | one per contract/architecture change, forever |
 | `docs/schemas/*.json` | log + report JSON Schemas, versioned | additive-only in v1 |
 | `BENCHMARKS.md`, `CHANGELOG.md`, `CONTRIBUTING.md` | numbers per release · keep-a-changelog · PR checklist + dev setup | per release / per PR |
 
@@ -1150,7 +1146,7 @@ The docs are complete when each of the following is achievable by a **fresh impl
 | `/MIR /PURGE /MOV` | deletion modes | **intentionally absent** (§2.4, I2) |
 | `/Z` | restartable | superseded by verified checkpoint resume (§5.12) without `/Z`'s throughput cost |
 | `/B` | backup mode | **not implemented** (VISION): permission failures are reported with a repair hint |
-| `/DST` | DST tolerance | `--dst-tolerance` |
+| `/DST` | DST tolerance | not needed — NTFS/ReFS store UTC; FAT (the reason `/DST` exists) is rejected (F15) |
 | `/MT:n` | thread count | automatic per device profile; `--threads` override |
 
 ¹ Robocopy's `/DCOPY` letters are `D` (directory data, i.e. dir ADS), `A` (attributes), `T` (timestamps), `E` (dir EAs), `X` (skip ADS); its default is `DA` — plain robocopy does *not* preserve directory timestamps. `/DCOPY:DATE` therefore reads as D+A+T+E, and bigcp implements **all four**: directory ADS, attributes, post-order timestamps, and EAs when present (`EaSize ≠ 0` — free detection, §4.2). File EAs are copied on the same mechanism (CopyFileEx-parity; strictly a superset of `/COPY:DTA`). One deliberate divergence: the NTFS compression attribute is not re-applied at the destination (F22, §4.2).
@@ -1161,7 +1157,7 @@ The docs are complete when each of the following is achievable by a **fresh impl
 |---|---|
 | Handles/files | `CreateFileW` (all flag combos §5.8/§5.9), `ReadFile`/`WriteFile` (+OVERLAPPED), `CloseHandle`, `FlushFileBuffers` |
 | Metadata | `GetFileInformationByHandleEx` (`FileBasicInfo`, `FileStandardInfo`, `FileIdInfo`, `FileIdExtdDirectoryInfo`, `FileStreamInfo` — ADS check on open handles §4.2), `SetFileInformationByHandle` (`FileBasicInfo`, `FileEndOfFileInfo`, `FileAllocationInfo`, `FileRenameInfo(Ex)`, `FileDispositionInfo(Ex)`), `BackupRead`/`BackupWrite` (EA stream copy §4.2) |
-| Enumeration | `FindFirstFileExW`(`FindExInfoBasic`, `FIND_FIRST_EX_LARGE_FETCH`) fallback path, `FindFirstStreamW`/`FindNextStreamW` (fallback only — primary ADS check is `FileStreamInfo` on open handles, §4.2) |
+| Enumeration | `FileIdExtdDirectoryInfo` is the sole enumeration path (probed at startup, §5.2); `FindFirstStreamW`/`FindNextStreamW` retained as an ADS-listing fallback only — primary ADS check is `FileStreamInfo` on open handles (§4.2) |
 | IOCP | `CreateIoCompletionPort`, `GetQueuedCompletionStatusEx`, `PostQueuedCompletionStatus`, `CancelIoEx`, `SetFileCompletionNotificationModes` |
 | Reparse/sparse | `FSCTL_GET_REPARSE_POINT`, `FSCTL_SET_REPARSE_POINT`, `FSCTL_SET_SPARSE`, `FSCTL_QUERY_ALLOCATED_RANGES` (compression and block-clone FSCTLs deliberately absent — F22/F28; `FILE_SUPPORTS_BLOCK_REFCOUNTING` capability *checked* only for the hint §5.5) |
 | Volume/device | `GetVolumePathNameW`, `GetVolumeInformationW`(`ByHandleW`), `GetDiskFreeSpaceW/ExW`, `GetDriveTypeW` (`DRIVE_REMOTE` → reject, F27), `IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS`, `IOCTL_STORAGE_QUERY_PROPERTY` (device/adapter/seek-penalty/access-alignment), `IOCTL_STORAGE_GET_HOTPLUG_INFO`, `IOCTL_DISK_GET_CACHE_INFORMATION`, `GetFinalPathNameByHandleW` |
@@ -1266,14 +1262,14 @@ Each explicit VISION.md requirement (F-numbers from §2.1) mapped to its normati
 | F12 40 GB+ verified partial resume | §5.12 (checkpoints + prefix verify) | E40; kill-during-100 GB real-hardware case (§12.5) |
 | F13 overwrite decisions logged + summarized | §4.1, §10.2/§10.3 | replacement-logging assertions in scenario suite |
 | F14 Windows 11 22H2 baseline | §2.3, §5.2 | CI runners ≥22H2; no OS-version branches (code review rule) |
-| F15 exFAT/FAT32 support; NTFS advantages | §4.4 | VHDX filesystem matrix (§12.5) |
+| F15 NTFS/ReFS only; other filesystems rejected pre-flight | §4.4 | E03 rejection cell + NTFS/ReFS cells in the VHDX matrix (§12.5) |
 | F16 both trees assumed exclusive/stable; violations detected | §4.8 | E14, E34, E36; chaos mutator (§12.3/§12.4) |
 | F17 system-file exclusion + notification + flag | §4.7 | E32 |
 | F18 simple preallocation only; SFVD prohibited | §5.9 | grep-guard test: no `SetFileValidData` call site exists |
 | F19 no mid-run prompts; arguments instead | §10.1, §5.13 | TUI/plain snapshot tests assert no blocking prompt states (§12.7) |
 | F20 `--replace` (default true) | §4.1 | E41 |
 | F21 ADS/EA near-zero cost when absent | §4.2, §5.8 | syscall-budget bench asserts no stream/EA calls on plain trees (§12.6) |
-| F22 compression dropped; sparse maintained | §4.2 | VHDX matrix cells assert both (§12.5) |
+| F22 compression dropped; sparse maintained | §4.2 | NTFS/ReFS VHDX matrix cells assert both (§12.5) |
 | F23 tests confined + harmless | §12.0 | sandbox lint + containment oracle on every integration run |
 | F24 class-based tuning, relative gates | §8.2, §8.7 | gate definitions reviewed for machine-relative form (§12.6) |
 | F25 no temperature monitoring (withdrawn) | §5.14 | slowdown communicated via throughput-signature hints — SLC/thermal detector test |

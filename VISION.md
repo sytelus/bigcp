@@ -12,7 +12,7 @@ When destination file is detected to be different and decision is to overwrite, 
 
 You may assume that we will have 1. Windows 11 22H2 or later versions so you can use advanced modern better APIs and simplify things.
 
-The exFAT/FAT32 support is needed for older HDD drives. However, when NTFS is detected, any advantage for performance and reliability offered should be taken.
+Only NTFS and ReFS volumes are supported, for both source and destination; exFAT, FAT32, and any other filesystems are out of scope and should be rejected upfront with a clear error. Any advantage NTFS and ReFS offer for performance and reliability should be taken.
 
 The tool should have exactly one copy engine of its own. Alternative engines built on OS copy APIs are not product features, although they may be used inside the test harness to validate correctness. Likewise, special-case acceleration for copies within the same volume (such as ReFS block cloning) is not needed because the primary scenario is copying between drives; it is fine, however, to inform the user when the OS itself could perform such a same-volume copy faster.
 

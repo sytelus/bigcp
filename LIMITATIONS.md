@@ -5,6 +5,7 @@ Every limitation below is **deliberate** — a scope decision from `VISION.md` o
 ## Platform and environment
 
 - **Windows 11 22H2 or later only.** Older Windows versions are unsupported by design; the tool assumes modern APIs unconditionally and carries no OS-version fallbacks (§2.3). *Workaround: use robocopy on older systems.*
+- **NTFS and ReFS volumes only, source and destination.** exFAT, FAT32, UDF, and any other filesystem are rejected pre-flight with a clear error (§4.4, F15). This decision is what makes exact timestamp comparison, guaranteed file IDs, atomic POSIX renames, and a single code path possible. *Workaround: reformat external drives to NTFS, or use robocopy for legacy media.*
 - **Local volumes only.** Network (UNC) paths and mapped drives to shares are rejected pre-flight with a clear error (§4.5, F27). Network copying brings SMB semantics the tool deliberately does not own. *Workaround: copy to a local staging drive, or use robocopy for network legs.*
 - **x64 only at v1.** ARM64 is a stretch goal; nothing in the design precludes it, but it is not built or tested (§2.3).
 - **Elevation confers nothing.** There is no backup-privilege mode: files the current user cannot read fail with a repair hint (fix ACLs / take ownership) rather than being force-copied (§5.13, F-table). This keeps the privilege model trivial.
@@ -26,7 +27,6 @@ Every limitation below is **deliberate** — a scope decision from `VISION.md` o
 - **The skip heuristic is size + last-write time, not content.** A destination file with identical size and mtime is skipped without reading it. Content that changed while size and mtime were preserved (deliberate tampering, or a program that restores timestamps) is not detected at copy time — this is the industry-standard trade (robocopy/rsync/rclone) for zero-I/O re-runs. *Standalone `bigcp verify` catches it* (§4.1, §5.17, E-catalog).
 - **ADS/EA divergence on an otherwise-identical file is not detected at copy time.** Checking streams on every skipped file would cost a per-file query for a vanishingly rare case (F11/F21). *Standalone `bigcp verify` compares full stream sets and EA blobs* (§4.1 scope note, E43).
 - **Last-access time is set but never compared or strictly verified.** Reading a file rewrites its atime; using it as an equality key would cause perpetual re-copy churn. Verification reports it separately as informational (§4.1, §5.17).
-- **FAT daylight-saving shifts need an explicit flag.** FAT stores local time; a DST transition shifts apparent mtimes by exactly one hour, making everything look "different". `--dst-tolerance` treats ±1 h as equal (robocopy `/DST` equivalent); it is off by default, matching robocopy (§4.1).
 - **Destination files not present in the source are never touched — or removed.** bigcp has no mirror/purge capability *by design* (it structurally cannot delete user files). Consequence: re-running against an evolving source accumulates stale extra files at the destination. Extras are counted and sampled in the report (§4.1, §2.4).
 - **Names differing only by case collide.** The destination join is case-insensitive (Windows semantics). Two source files distinguishable only by case (possible in WSL case-sensitive directories) are detected as a duplicate-key conflict and reported as errors rather than silently overwriting each other (§4.5, E26).
 - **Type conflicts are errors, not resolutions.** A destination directory where the source has a file (or vice versa, or an unexpected reparse point) fails with `type_conflict`; bigcp will not delete or write through the conflicting object — the user resolves it manually (§4.1, E27/E36).
@@ -58,12 +58,10 @@ Every limitation below is **deliberate** — a scope decision from `VISION.md` o
 - **Free-space forecasting is approximate.** The early warning uses a conservative range (cluster rounding, replacement double-occupancy); the authoritative stop is the actual disk-full breaker (§5.5, E15).
 - **Same-spindle HDD copies are inherently slow.** Alternating-burst mode amortizes seeks but cannot eliminate the physics of one head serving reads and writes (§8.3).
 
-## Filesystem-specific degradation (destination)
+## Filesystem-capability degradation (NTFS ↔ ReFS deltas)
 
-- **exFAT/FAT32 cannot represent** ADS (dropped with per-file warning), EAs (warned), reparse points/links (fail per link), sparse layout (expanded dense), or NTFS timestamp precision (10 ms / 2 s granularity absorbed by per-field projection). Files still count as copied-with-warnings; links do not (§4.4).
-- **FAT32 caps files at 4 GiB − 1.** Oversized files fail pre-flight with a clear error before any I/O (§4.4, E03).
-- **exFAT has no metadata journal.** An interrupted metadata update can corrupt the volume itself — a filesystem property bigcp mitigates with more aggressive flushing but cannot remove (§8.6).
-- **FAT-family lacks stable file IDs and POSIX rename**, so commit revalidation and atomic replace run in reduced (still safe, attr-restore-guarded) forms there (§4.3, §5.2).
+- **ReFS versions vary in capability.** Where a destination volume reports no support for named streams or EAs (capability flags, not FS names), those items are dropped with per-file warnings and counted — never silently; the file still counts as copied-with-warnings (§4.4). EFS files land decrypted on ReFS (`efs_downgrade` warning) since ReFS has no EFS.
+- All FAT-family limitations (4 GiB cap, timestamp granularity, DST shifts, missing file IDs, no journal) are gone from this list because those filesystems are **rejected outright** rather than degraded — see the scope section above.
 
 ## Reporting and audit
 
