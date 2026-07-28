@@ -14,11 +14,27 @@ You may assume that we will have 1. Windows 11 22H2 or later versions so you can
 
 The exFAT/FAT32 support is needed for older HDD drives. However, when NTFS is detected, any advantage for performance and reliability offered should be taken.
 
-To simplify things, you may assume exclusive stable source tree. You may add detection for violation for this assumption if it doesn't add copy performance overhead (RAM or CPU overhead is ok).
+To simplify things, you may assume exclusive stable source tree. Similarly, you may assume that destination tree is also available to you exclusively and stable. You may add detection for violation for these assumptions if it doesn't add copy performance overhead (RAM or CPU overhead is ok).
 
 The tool should avoid copying system files by default such as System Volume Information, and paging files. It should always notify which files would be and were excluded and argument should be provided to turn this off.
 
 If fast pre-allocations, SetFileValidData etc are used then you must ensure that reliability goals are not violated.
+
+Prompting to user in middle of copy should be avoided and tool should use arguments instead.
+
+Add argument to allow replacements when destination file differs (default is true).
+
+For Alternate Data Streams and Extended Attributes consider the fact that they may not exist most of the time and so optimizations may be possible.
+
+There is no need to carry over file system compression feature to destination is that impacts performance. For sparse layout, we should attempt to maintain it on destination when supported to avoid unnecessary cost in storage.
+
+Any unit tests or other tests must be confined to specific new folders in order to avoid unintentional changes or data loss or any other harm on any existing files or folders on the drives due to running those tests. A careful review of all tests must be performed to ensure they do not alter anything outside of their designated folders. Additionally, all tests including stress tests or any other performance tests must ensure drives such as SSDs or HDDs does not get damaged or corrupt in any way or aggressively written to which would shorten their lifespans. All tests of any kind must be harmless.
+
+Do not over-optimize for this specific PC in general although you can assume availability of many cores and large RAM and recent PCIe generation and USB-C connection. You should make choices for algorithms considering the fact that a PC may have variety of HDDs and SSDs of varying generations (connected as either internal drive or external drive via USB-C) and therefore it is best to rely on general performance characteristics of these hardware rather than characteristics of disks on this specific PC. Make sure any gates or tests takes this into consideration.
+
+if it is easy to do and possible, tool should monitor disk temperatures (for example, periodically on background thread) to make sure they are not getting overheated. If this is done then it should be reported.
+
+You may assume and enforce only one run for the exact destination root per machine to simplify things.
 
 Above everything, reliability is the most important goal for this tool. This means when tool says X was successfully copied and Y failed, user can be sure that is indeed correct and that file paths, content, attributes are correct. However, tool should strive to avoid unnecessary checks that may reduce throughput. The tool should never corrupt files or delete them when they also didn't exist in source as it will cause data loss. The tool should also not produce any extra files that user didn't expect. The tool must treat source strictly as read-only (except for generating log or reports or temporary files if source drive is specified for those purposes). The tool should produce summary of how many files were successfully copied, how many failed, breakdown of failures by top level folders and reason, throughput achieved, maximum possible throughput and so on. In terminal UX, user should be able to navigate and examine more details about different aspects of your report. User should be able to also invoke tool latter with report file as argument to re-examine report at later date. The report should include any other useful details such as throughput bottlenecks, time started, time ended, slowest portion, fastest portion, any hints to improve throughput for next run when possible and so on.
 
