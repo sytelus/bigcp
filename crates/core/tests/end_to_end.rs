@@ -2,15 +2,16 @@
 
 use std::ffi::OsString;
 use std::fs;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::windows::fs::symlink_file;
 use std::path::Path;
 
 use bigcp_core::{CopyOptions, RunObserver, RunSnapshot, VerifyOptions, run_copy};
 use bigcp_testkit::sandbox::{initialize_empty, validated_system_temp};
 use bigcp_testkit::{SandboxRoot, check_trees};
 use bigcp_win::{
-    BasicMetadata, DestinationStream, DestinationTemp, ExtendedAttributes, StreamInfo,
-    clear_extended_attributes, read_extended_attributes, write_extended_attributes,
+    BasicMetadata, DestinationStream, DestinationTemp, ExtendedAttributes, SourceStream,
+    StreamInfo, clear_extended_attributes, read_extended_attributes, write_extended_attributes,
 };
 
 const FIXTURE_WRITE_BUDGET: u64 = 16 * 1024 * 1024;
@@ -88,9 +89,16 @@ fn copy_rerun_and_both_verification_forms_converge() -> Result<(), Box<dyn std::
     let mut options = CopyOptions::new(source.clone(), destination.clone());
     options.verify = true;
     options.state_dir = Some(state.clone());
-    options.tune.large_threshold = Some(1024 * 1024);
+    options.tune.large_threshold = Some(4 * 1024 * 1024);
     options.tune.checkpoint_threshold = Some(1024 * 1024);
     let first = run_copy(&options, &SilentObserver)?;
+    let journal = fs::read_to_string(state.join("journal.jsonl"))?;
+    assert!(
+        journal
+            .lines()
+            .any(|line| line.contains("\"ev\":\"checkpoint\"")),
+        "a checkpoint-eligible file below the large-file threshold bypassed the coordinator"
+    );
     let destination_names = fs::read_dir(&destination)?
         .filter_map(Result::ok)
         .map(|entry| entry.file_name())
@@ -253,6 +261,102 @@ fn unsafe_audit_path_is_rejected_before_destination_creation()
     assert!(
         !destination.exists(),
         "preflight created destination before rejecting its unsafe audit path"
+    );
+    Ok(())
+}
+
+#[test]
+fn report_fallback_and_terminal_audit_record_agree() -> Result<(), Box<dyn std::error::Error>> {
+    let sandbox = SandboxRoot::create_system_temp("report-fallback")?;
+    let source = sandbox.child(Path::new("source"))?;
+    let destination = sandbox.child(Path::new("destination"))?;
+    let state = sandbox.child(Path::new("state"))?;
+    let unusable_report_path = sandbox.child(Path::new("existing-directory"))?;
+    fs::create_dir(&source)?;
+    fs::create_dir(&unusable_report_path)?;
+
+    let mut options = CopyOptions::new(source, destination);
+    options.state_dir = Some(state);
+    options.report_path = Some(unusable_report_path.clone());
+    let report = run_copy(&options, &SilentObserver)?;
+
+    assert_eq!(report.run.audit, "degraded");
+    assert_ne!(report.run.report_path, unusable_report_path);
+    assert!(report.run.report_path.is_file());
+    let audit = fs::read_to_string(&report.run.log_path)?;
+    let terminal = audit.lines().last().ok_or("audit log was empty")?;
+    let terminal: serde_json::Value = serde_json::from_str(terminal)?;
+    assert_eq!(
+        terminal.get("ev").and_then(serde_json::Value::as_str),
+        Some("run_end")
+    );
+    assert_eq!(
+        terminal.get("audit").and_then(serde_json::Value::as_str),
+        Some("degraded")
+    );
+    Ok(())
+}
+
+#[test]
+fn existing_file_is_rejected_as_a_destination_root() -> Result<(), Box<dyn std::error::Error>> {
+    let sandbox = SandboxRoot::create_system_temp("destination-file")?;
+    let source = sandbox.child(Path::new("source"))?;
+    let destination = sandbox.child(Path::new("destination.txt"))?;
+    fs::create_dir(&source)?;
+    fs::write(&destination, b"sentinel must remain unchanged")?;
+
+    let mut options = CopyOptions::new(source, destination.clone());
+    options.state_dir = Some(sandbox.child(Path::new("state"))?);
+    assert!(run_copy(&options, &SilentObserver).is_err());
+    assert_eq!(fs::read(&destination)?, b"sentinel must remain unchanged");
+    Ok(())
+}
+
+#[test]
+fn relative_symbolic_links_are_recreated_as_links_when_available()
+-> Result<(), Box<dyn std::error::Error>> {
+    let sandbox = SandboxRoot::create_system_temp("symbolic-link")?;
+    let source = sandbox.child(Path::new("source"))?;
+    let destination = sandbox.child(Path::new("destination"))?;
+    fs::create_dir(&source)?;
+    fs::write(source.join("target.txt"), b"target")?;
+    let source_link = source.join("link.txt");
+    if symlink_file("target.txt", &source_link).is_err() {
+        return Ok(());
+    }
+    let stream = StreamInfo {
+        name: OsString::from(":link-metadata:$DATA"),
+        size: 16,
+    };
+    let mut output = DestinationStream::create_reparse(&source_link, &stream, true)?;
+    output.write_all(b"link stream data")?;
+    output.flush()?;
+    drop(output);
+
+    let mut options = CopyOptions::new(source, destination.clone());
+    options.state_dir = Some(sandbox.child(Path::new("state"))?);
+    let report = run_copy(&options, &SilentObserver)?;
+    assert_eq!(report.run.exit, 0, "link errors: {:?}", report.errors);
+    assert_eq!(report.counters.links_copied, 1);
+    assert_eq!(
+        fs::read_link(destination.join("link.txt"))?,
+        Path::new("target.txt")
+    );
+    let mut copied_stream = SourceStream::open_reparse(&destination.join("link.txt"), &stream)?;
+    let mut bytes = Vec::new();
+    copied_stream.read_to_end(&mut bytes)?;
+    assert_eq!(bytes, b"link stream data");
+    let oracle = check_trees(&sandbox, Path::new("source"), Path::new("destination"))?;
+    assert_eq!(oracle.mismatches, 0, "oracle samples: {:?}", oracle.samples);
+    let verification = bigcp_core::run_standalone_verify(&VerifyOptions {
+        source: sandbox.child(Path::new("source"))?,
+        destination,
+        report_path: None,
+    })?;
+    assert_eq!(
+        verification.failed, 0,
+        "verify: {:?}",
+        verification.mismatches
     );
     Ok(())
 }

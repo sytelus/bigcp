@@ -54,6 +54,7 @@ pub fn select_copy_profile(
     destination_override: DeviceClass,
     tune: &TuneOptions,
 ) -> Result<CopyProfile, BigcpError> {
+    validate_tuning(tune)?;
     let cores = std::thread::available_parallelism().map_or(4, usize::from);
     let mut source = side_profile(source_info, source_override, cores, true);
     let mut destination = side_profile(destination_info, destination_override, cores, false);
@@ -69,6 +70,20 @@ pub fn select_copy_profile(
         source.workers = workers;
         destination.workers = workers;
     }
+    if let Some(memory_bytes) = tune.memory_bytes {
+        let large_threshold = tune.large_threshold.unwrap_or(4 * 1024 * 1024);
+        let large_threshold = usize::try_from(large_threshold).map_err(|_| {
+            BigcpError::Invalid("large-file threshold does not fit this address space".to_owned())
+        })?;
+        if memory_bytes < large_threshold {
+            return Err(BigcpError::Invalid(format!(
+                "memory budget {memory_bytes} is smaller than the large-file threshold {large_threshold}"
+            )));
+        }
+        let budgeted_workers = (memory_bytes / large_threshold).clamp(1, 256);
+        source.workers = source.workers.min(budgeted_workers);
+        destination.workers = destination.workers.min(budgeted_workers);
+    }
     let mut chunk_bytes = tune
         .chunk_bytes
         .unwrap_or_else(|| source.chunk_bytes.min(destination.chunk_bytes));
@@ -82,6 +97,9 @@ pub fn select_copy_profile(
         if maximum > 0 {
             chunk_bytes = chunk_bytes.min(maximum as usize);
         }
+    }
+    if let Some(memory_bytes) = tune.memory_bytes {
+        chunk_bytes = chunk_bytes.min(memory_bytes);
     }
     if chunk_bytes == 0 {
         return Err(BigcpError::Invalid(
@@ -110,6 +128,48 @@ pub fn select_copy_profile(
         workers,
         same_physical_disk,
     })
+}
+
+fn validate_tuning(tune: &TuneOptions) -> Result<(), BigcpError> {
+    const MIN_CHUNK_BYTES: usize = 64 * 1024;
+    const MAX_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+    if let Some(workers) = tune.threads
+        && !(1..=256).contains(&workers)
+    {
+        return Err(BigcpError::Invalid(
+            "small-file worker count must be in 1..=256".to_owned(),
+        ));
+    }
+    if let Some(streams) = tune.streams
+        && !(1..=16).contains(&streams)
+    {
+        return Err(BigcpError::Invalid(
+            "concurrent stream count must be in 1..=16".to_owned(),
+        ));
+    }
+    if let Some(chunk) = tune.chunk_bytes
+        && !(MIN_CHUNK_BYTES..=MAX_CHUNK_BYTES).contains(&chunk)
+    {
+        return Err(BigcpError::Invalid(format!(
+            "chunk size must be in {MIN_CHUNK_BYTES}..={MAX_CHUNK_BYTES} bytes"
+        )));
+    }
+    if tune.memory_bytes == Some(0) {
+        return Err(BigcpError::Invalid(
+            "memory budget must be positive".to_owned(),
+        ));
+    }
+    if tune.large_threshold == Some(0) {
+        return Err(BigcpError::Invalid(
+            "large-file threshold must be positive".to_owned(),
+        ));
+    }
+    if tune.checkpoint_threshold == Some(0) {
+        return Err(BigcpError::Invalid(
+            "checkpoint threshold must be positive".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn side_profile(
@@ -231,6 +291,61 @@ mod tests {
         assert_eq!(
             first.ok().map(|profile| profile.chunk_bytes),
             second.ok().map(|profile| profile.chunk_bytes)
+        );
+    }
+
+    #[test]
+    fn unsafe_manual_ranges_are_rejected_by_the_library_api() {
+        for tune in [
+            TuneOptions {
+                threads: Some(0),
+                ..TuneOptions::default()
+            },
+            TuneOptions {
+                streams: Some(17),
+                ..TuneOptions::default()
+            },
+            TuneOptions {
+                chunk_bytes: Some(4096),
+                ..TuneOptions::default()
+            },
+            TuneOptions {
+                checkpoint_threshold: Some(0),
+                ..TuneOptions::default()
+            },
+        ] {
+            assert!(
+                select_copy_profile(
+                    &nvme(),
+                    &nvme(),
+                    DeviceClass::Auto,
+                    DeviceClass::Auto,
+                    &tune,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn memory_budget_caps_workers_and_chunks() {
+        let tune = TuneOptions {
+            chunk_bytes: Some(8 * 1024 * 1024),
+            threads: Some(16),
+            memory_bytes: Some(8 * 1024 * 1024),
+            large_threshold: Some(4 * 1024 * 1024),
+            ..TuneOptions::default()
+        };
+        let profile = select_copy_profile(
+            &nvme(),
+            &nvme(),
+            DeviceClass::Auto,
+            DeviceClass::Auto,
+            &tune,
+        );
+        assert!(profile.is_ok());
+        assert!(
+            profile.is_ok_and(|value| value.workers == 2 && value.chunk_bytes <= 8 * 1024 * 1024)
         );
     }
 }

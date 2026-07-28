@@ -20,7 +20,7 @@ use crate::model::{Counters, EntrySnapshot};
 
 /// Successful engine result consumed by the common outcome path.
 pub struct EngineResult {
-    /// Logical unnamed-stream bytes.
+    /// Logical bytes successfully copied across the unnamed and named streams.
     pub bytes: u64,
     /// xxh3-128 digest when policy enabled hashing.
     pub digest: Option<String>,
@@ -104,7 +104,12 @@ pub fn copy_file(
         .map(|stream| stream.size)
         .max()
         .unwrap_or(request.source_snapshot.metadata.size);
-    let should_hash = request.verify || largest_stream >= request.large_threshold;
+    let checkpoint_eligible = journal.is_some()
+        && streams
+            .iter()
+            .any(|stream| stream.size >= request.checkpoint_threshold);
+    let should_hash =
+        request.verify || largest_stream >= request.large_threshold || checkpoint_eligible;
     let extended_attributes = (request.source_snapshot.metadata.ea_size > 0)
         .then(|| read_extended_attributes(request.source_path))
         .transpose()
@@ -122,7 +127,7 @@ pub fn copy_file(
             should_hash,
             journal.as_deref_mut(),
         )
-    } else if largest_stream < request.large_threshold {
+    } else if largest_stream < request.large_threshold && !checkpoint_eligible {
         copy_small(
             request,
             counters,
@@ -345,7 +350,7 @@ fn copy_sparse(
     )
     .map_err(|error| operation_error("commit", request.relative_path, &error))?;
     Ok(EngineResult {
-        bytes: logical_size,
+        bytes: logical_size.saturating_add(named.bytes),
         digest: hasher.map(|value| format!("xxh3:{:032x}", value.digest128())),
         stream_digests: named.digests,
         ea_digest: (request.verify && !eas_dropped)
@@ -461,7 +466,7 @@ fn copy_small(
     )
     .map_err(|error| operation_error("commit", request.relative_path, &error))?;
     Ok(EngineResult {
-        bytes: bytes.len() as u64,
+        bytes: (bytes.len() as u64).saturating_add(named.bytes),
         digest: should_hash.then(|| digest_bytes(&bytes)),
         stream_digests: named.digests,
         ea_digest: (request.verify && !eas_dropped)
@@ -612,7 +617,7 @@ fn copy_streamed(
     )
     .map_err(|error| operation_error("commit", request.relative_path, &error))?;
     Ok(EngineResult {
-        bytes: total,
+        bytes: total.saturating_add(named.bytes),
         digest: hasher.map(|value| format!("xxh3:{:032x}", value.digest128())),
         stream_digests: named.digests,
         ea_digest: (request.verify && !eas_dropped)
@@ -876,6 +881,7 @@ struct NamedStreamResult {
     digests: Vec<(StreamInfo, String)>,
     dropped: u32,
     journal_degraded: bool,
+    bytes: u64,
 }
 
 fn copy_named_streams(
@@ -894,10 +900,12 @@ fn copy_named_streams(
             digests: Vec::new(),
             dropped: u32::try_from(named.len()).unwrap_or(u32::MAX),
             journal_degraded: false,
+            bytes: 0,
         });
     }
     let mut digests = Vec::new();
     let mut journal_degraded = false;
+    let mut logical_bytes = 0_u64;
     for stream in named {
         let mut source = SourceStream::open(request.source_path, stream)
             .map_err(|error| operation_error("open_src_stream", request.relative_path, &error))?;
@@ -997,12 +1005,14 @@ fn copy_named_streams(
         if let Some(hasher) = hasher {
             digests.push((stream.clone(), format!("xxh3:{:032x}", hasher.digest128())));
         }
+        logical_bytes = logical_bytes.saturating_add(stream.size);
     }
     digests.sort_by(|left, right| left.0.name.cmp(&right.0.name));
     Ok(NamedStreamResult {
         digests,
         dropped: 0,
         journal_degraded,
+        bytes: logical_bytes,
     })
 }
 

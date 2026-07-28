@@ -167,7 +167,7 @@ pub fn run_standalone_verify(options: &VerifyOptions) -> Result<VerificationSumm
             == destination_root_metadata.basic.last_write_time
         && source_root_metadata.basic.attributes & COPYABLE_ATTRIBUTES
             == destination_root_metadata.basic.attributes & COPYABLE_ATTRIBUTES;
-    let root_aux_equal = directory_aux_equal(&source, &destination, &mut counters)
+    let root_aux_equal = directory_aux_equal(&source, &destination, &mut counters, false)
         .map_err(|error| BigcpError::io("verify root streams or EAs", error))?;
     if root_metadata_equal && root_aux_equal {
         summary.passed = summary.passed.saturating_add(1);
@@ -245,6 +245,7 @@ pub fn run_standalone_verify(options: &VerifyOptions) -> Result<VerificationSumm
                         &source_entry.path,
                         &destination_entry.path,
                         &mut counters,
+                        false,
                     )
                     .unwrap_or(false);
                     if !metadata_equal || !aux_equal {
@@ -288,17 +289,21 @@ pub fn run_standalone_verify(options: &VerifyOptions) -> Result<VerificationSumm
                                 .map(|destination_data| source_data == destination_data)
                         })
                         .unwrap_or(false);
-                    let eas_equal =
-                        extended_attributes_equal(&source_entry.path, &destination_entry.path)
-                            .unwrap_or(false);
-                    if reparse_equal && metadata_equal && eas_equal {
+                    let auxiliary_equal = directory_aux_equal(
+                        &source_entry.path,
+                        &destination_entry.path,
+                        &mut counters,
+                        true,
+                    )
+                    .unwrap_or(false);
+                    if reparse_equal && metadata_equal && auxiliary_equal {
                         summary.passed = summary.passed.saturating_add(1);
                     } else {
                         summary.failed = summary.failed.saturating_add(1);
                         push_mismatch(
                             &mut summary,
                             format!(
-                                "{}: reparse payload, EA payload, or metadata differs",
+                                "{}: reparse payload, named streams, EAs, or metadata differ",
                                 relative.display()
                             ),
                         );
@@ -391,7 +396,7 @@ fn digest_file_streams_and_eas(
     let before = metadata_at(path)
         .map_err(|error| OperationError::from_io("verify_stat", path.to_path_buf(), &error))?;
     let (size, digest) = digest_file(path, counters)?;
-    let named = digest_named_streams(path, counters)?;
+    let named = digest_named_streams(path, counters, false)?;
     let attributes = read_extended_attributes(path)
         .map_err(|error| OperationError::from_io("verify_ea", path.to_path_buf(), &error))?;
     let ea_digest = format!(
@@ -418,12 +423,18 @@ fn digest_file_streams_and_eas(
 fn digest_named_streams(
     path: &Path,
     counters: &mut Counters,
+    open_reparse: bool,
 ) -> Result<Vec<(StreamInfo, String)>, OperationError> {
     let streams = list_streams(path)
         .map_err(|error| OperationError::from_io("verify_streams", path.to_path_buf(), &error))?;
     let mut named = Vec::new();
     for stream in streams.into_iter().filter(|stream| !stream.is_unnamed()) {
-        let mut source = SourceStream::open(path, &stream).map_err(|error| {
+        let opened = if open_reparse {
+            SourceStream::open_reparse(path, &stream)
+        } else {
+            SourceStream::open(path, &stream)
+        };
+        let mut source = opened.map_err(|error| {
             OperationError::from_io("verify_open_stream", path.to_path_buf(), &error)
         })?;
         let mut hasher = Xxh3::new();
@@ -454,18 +465,15 @@ fn digest_named_streams(
     Ok(named)
 }
 
-fn extended_attributes_equal(source: &Path, destination: &Path) -> std::io::Result<bool> {
-    Ok(read_extended_attributes(source)? == read_extended_attributes(destination)?)
-}
-
 fn directory_aux_equal(
     source: &Path,
     destination: &Path,
     counters: &mut Counters,
+    open_reparse: bool,
 ) -> std::io::Result<bool> {
-    let source_streams = digest_named_streams(source, counters)
+    let source_streams = digest_named_streams(source, counters, open_reparse)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
-    let destination_streams = digest_named_streams(destination, counters)
+    let destination_streams = digest_named_streams(destination, counters, open_reparse)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
     Ok(source_streams == destination_streams
         && read_extended_attributes(source)? == read_extended_attributes(destination)?)

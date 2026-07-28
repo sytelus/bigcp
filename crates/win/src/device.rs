@@ -55,7 +55,7 @@ pub struct DeviceInfo {
     pub logical_sector: Option<u32>,
     /// Physical sector bytes.
     pub physical_sector: Option<u32>,
-    /// Whether all core queries succeeded.
+    /// Whether the seek-penalty and bus-classification queries both succeeded.
     pub high_confidence: bool,
 }
 

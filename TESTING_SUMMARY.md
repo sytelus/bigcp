@@ -122,3 +122,47 @@ hardware-loss, and performance/endurance matrices were deliberately not run.
 They require dedicated disposable fixtures or designated scratch hardware and
 would have violated the harmless routine-test boundary on this machine. These
 unclaimed gates are recorded in `PLAN_DEVIATIONS.md`.
+
+## 2026-07-28 comprehensive review validation
+
+A subsequent whole-repository review added correctness and safety coverage for
+symbolic-link publication, reparse-object ADS, dangling-link sandbox escape,
+checkpoint routing below the large-file threshold, destination-root type
+validation, metadata-repair revalidation, bounded library tuning, raw error
+classification, report fallback, and terminal audit closure.
+
+The final serial workspace run used the newly created root:
+
+`C:\Users\shitals\AppData\Local\Temp\bigcp-final-review-8959731fa70e4a738a388acddff87386`
+
+It passed 43 tests with zero failures: 3 CLI, 16 core unit, 7 core
+end-to-end, 3 testkit safety, 1 TUI, and 13 Windows-boundary tests. The
+following gates also passed after the review changes:
+
+- Frozen-input hash and automated test-storage safety scripts.
+- `cargo fmt --all -- --check`.
+- Clippy across all workspace targets with warnings denied.
+- Locked full workspace tests, documentation, and optimized release build.
+- `cargo deny check` and `cargo audit`; only informational duplicate transitive
+  versions were reported, with no advisory, ban, license, source, or
+  vulnerability failure.
+
+The optimized executables were then exercised under:
+
+`C:\Users\shitals\AppData\Local\Temp\bigcp-review-smoke-5b222d21c7154398ae10f8c505fa01e7`
+
+That smoke workflow generated exactly 78,848 source bytes, confirmed dry-run
+left the destination absent, copied and post-copy verified five files, found
+zero oracle mismatches/extras across nine objects, passed standalone full-tree
+verification, skipped all five files on rerun, and reopened the saved report.
+
+Every new filesystem test created only GUID-named children of the validated C:
+system temporary directory. Link and ADS tests targeted only files created by
+the same test inside its marked sandbox. The destination-file rejection test
+verified its test-owned sentinel bytes were unchanged. No test mounted,
+formatted, filled, dismounted, benchmarked, or issued raw operations to any
+drive; no existing user file was used as source or destination. F:, G:, and H:
+were not accessed—their only test appearances remained inert path values sent
+to the guard that rejects them before any filesystem query. Long-running,
+destructive, external-drive, VHDX/ReFS, chaos, and endurance gates remained
+unrun for the safety reasons documented above.

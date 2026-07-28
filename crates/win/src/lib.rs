@@ -40,7 +40,7 @@ pub use metadata::{
 pub use path::{
     absolute_extended, display_path, final_path, is_same_or_descendant, ordinal_case_key,
 };
-pub use reparse::{ReparseData, copy_reparse, read_reparse_data};
+pub use reparse::{ReparseCopyResult, ReparseData, copy_reparse, read_reparse_data};
 pub use security::{ProtectedDacl, read_protected_dacl};
 pub use sparse::AllocatedRange;
 pub use streams::{DestinationStream, SourceStream, StreamInfo, list_streams};

@@ -32,6 +32,9 @@ and journal state.
 Both data paths use `DestinationTemp` and the same finalizer. Large transfers
 are bounded synchronous streams today; checkpoint boundaries retain exact
 offset-ordered xxh3 snapshots. Channels and buffers have explicit caps.
+Known symbolic links are created through `CreateSymbolicLinkW` so Developer
+Mode can authorize unelevated creation; junction and opted-in unknown tags use
+the raw reparse control path. All are built under owned opaque sibling names.
 
 ## Persistence and audit
 
@@ -42,7 +45,9 @@ prefix is reread and hashed before resume.
 
 The versioned JSONL audit is lossless and rolls back partial line writes. It
 reopens once, then fails over to the state directory. The final JSON report is
-serialized to a sibling temp, flushed, and atomically replaced.
+serialized to a sibling temp, flushed, and atomically replaced before the
+terminal audit event is emitted and durably synchronized. This ordering keeps
+report-fallback status consistent with `run_end`.
 
 ## Extension seams
 
@@ -72,8 +77,9 @@ and metadata guarantees.
 Device discovery uses official query-only IOCTLs: physical extents, bus type,
 seek penalty, sector sizes, and maximum transfer length. Static profiles choose
 asymmetric source/destination queue-depth metadata, chunk size, stream cap, and
-small-file workers. Manual values are range checked. Same-disk extent overlap
-is reported.
+small-file workers. Manual values are range checked; the memory override caps
+both chunk size and the number of threshold-sized small-file workers.
+Same-disk extent overlap is reported.
 
 The directory join avoids a destination `stat` per source file. Stream and EA
 work is deferred until required. Dense large files are preallocated without

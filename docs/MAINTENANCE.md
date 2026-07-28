@@ -18,7 +18,7 @@
 | ID | Rule | Mechanical enforcement/evidence |
 |---|---|---|
 | I1 | Source handles are read-only. | `SourceFile`/`SourceStream` choke points; unsafe denied outside `win`. |
-| I2 | Never delete an unowned destination. | Only `DestinationTemp` can self-delete; no mirror/purge command. |
+| I2 | Never delete an unowned destination. | Only owned `DestinationTemp`/`ReparseTemp` siblings can self-delete; no mirror/purge command. |
 | I3 | Never truncate a replacement in place. | Replacement always constructs a sibling temp. |
 | I4 | `copied` only follows commit. | `EngineResult` is returned after rename, metadata, optional flush, and close. |
 | I5 | Final names never contain partial file data. | Uniform temp/rename; end-to-end atomic replacement test. |
@@ -27,7 +27,7 @@
 | I8 | Journal never creates a skip. | Journal API exposes checkpoints only; every-byte torn-tail test. |
 | I9 | Memory/work queues are bounded. | `crossbeam_channel::bounded`; per-stream buffers/profile caps. |
 | I10 | No source-tree writes. | All write constructors accept destination/audit paths; preflight audit containment. |
-| I11 | Commit revalidates replace targets. | Identity/size/mtime snapshot immediately before rename. |
+| I11 | Destination mutations revalidate targets. | Identity/kind/size/mtime/attributes/reparse-tag snapshot immediately before metadata repair or replacement. |
 | I12 | One writer per exact destination. | Global mutex with exact-root hash. |
 | I13 | Resume verifies the prefix. | Prefix reread, exact xxh3 boundary digest, size/source snapshot checks. |
 
@@ -72,9 +72,9 @@ coverage before release.
 ## Artifact debugging
 
 JSONL records contain `ts` and `ev`. Find `run_start`, then follow `file` and
-`error` events; file failures carry their error inline, while directory/link
-failures use the dedicated event. Each contains category, operation, relative
-path, raw Win32 code, message, and hint. `run_end` is the authoritative
+`error` events; file and link failures carry their error inline, while other
+non-file failures use the dedicated event. Each contains category, operation,
+relative path, raw Win32 code, message, and hint. `run_end` is the authoritative
 counters/audit/integrity closure. A missing `run_end` means interruption or
 audit failure, not failure of already committed files.
 
@@ -125,3 +125,6 @@ replacements, warnings, grouped failures, extras, hints, and verification.
 
 Until step 4 exists and passes, label binaries pre-1.0 and do not make v1.0
 reliability/performance certification claims.
+
+The live gate status and the difference between routine confidence and release
+certification are maintained in `docs/PRODUCTION_READINESS.md`.

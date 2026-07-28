@@ -48,7 +48,14 @@ pub fn check_trees(
         return Ok(report);
     }
     compare_metadata(&mut report, Path::new("."), &source_root, &destination_root);
-    compare_auxiliary_data(&mut report, Path::new("."), &source, &destination, false)?;
+    compare_auxiliary_data(
+        &mut report,
+        Path::new("."),
+        &source,
+        &destination,
+        false,
+        false,
+    )?;
     let mut tasks = vec![(source, destination, PathBuf::new())];
     while let Some((source_dir, destination_dir, relative_dir)) = tasks.pop() {
         let source_entries = enumerate_directory(&source_dir)
@@ -99,6 +106,7 @@ pub fn check_trees(
                         &source_entry.path,
                         &destination_entry.path,
                         false,
+                        false,
                     )?;
                     tasks.push((source_entry.path, destination_entry.path, relative));
                 }
@@ -127,6 +135,7 @@ pub fn check_trees(
                         &source_entry.path,
                         &destination_entry.path,
                         false,
+                        true,
                     )?;
                 }
             }
@@ -196,9 +205,10 @@ fn compare_auxiliary_data(
     source: &Path,
     destination: &Path,
     include_unnamed: bool,
+    open_reparse: bool,
 ) -> Result<()> {
-    let source_streams = hash_selected_streams(source, include_unnamed)?;
-    let destination_streams = hash_selected_streams(destination, include_unnamed)?;
+    let source_streams = hash_selected_streams(source, include_unnamed, open_reparse)?;
+    let destination_streams = hash_selected_streams(destination, include_unnamed, open_reparse)?;
     if source_streams != destination_streams {
         mismatch(
             report,
@@ -228,10 +238,14 @@ fn compare_eas(
 }
 
 fn hash_streams(path: &Path) -> Result<Vec<(Vec<u16>, u64, u128)>> {
-    hash_selected_streams(path, true)
+    hash_selected_streams(path, true, false)
 }
 
-fn hash_selected_streams(path: &Path, include_unnamed: bool) -> Result<Vec<(Vec<u16>, u64, u128)>> {
+fn hash_selected_streams(
+    path: &Path,
+    include_unnamed: bool,
+    open_reparse: bool,
+) -> Result<Vec<(Vec<u16>, u64, u128)>> {
     use std::os::windows::ffi::OsStrExt;
 
     let mut result = Vec::new();
@@ -253,7 +267,11 @@ fn hash_selected_streams(path: &Path, include_unnamed: bool) -> Result<Vec<(Vec<
                 hasher.update(&buffer[..count]);
             }
         } else {
-            let mut source = SourceStream::open(path, &stream)?;
+            let mut source = if open_reparse {
+                SourceStream::open_reparse(path, &stream)?
+            } else {
+                SourceStream::open(path, &stream)?
+            };
             loop {
                 let count = source.read(&mut buffer)?;
                 if count == 0 {

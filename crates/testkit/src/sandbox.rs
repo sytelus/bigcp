@@ -83,14 +83,16 @@ impl SandboxRoot {
                 continue;
             }
             current.push(component.as_os_str());
-            if current.exists() {
-                let metadata = metadata_at(&current).context("inspect sandbox child")?;
-                if metadata.kind == ObjectKind::Reparse {
+            match metadata_at(&current) {
+                Ok(metadata) if metadata.kind == ObjectKind::Reparse => {
                     bail!(
                         "sandbox path crosses a reparse point: {}",
                         current.display()
                     );
                 }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("inspect sandbox child"),
             }
         }
         Ok(current)
@@ -183,6 +185,7 @@ pub fn io_other(message: impl Into<String>) -> io::Error {
 mod tests {
     use super::{SandboxRoot, initialize_empty, validated_system_temp};
     use std::fs;
+    use std::os::windows::fs::symlink_file;
     use std::path::Path;
 
     #[test]
@@ -219,5 +222,17 @@ mod tests {
         );
         let reopened = SandboxRoot::open(&root);
         assert!(reopened.is_ok());
+    }
+
+    #[test]
+    fn dangling_symlink_children_are_rejected_when_links_are_available() {
+        let Ok(sandbox) = SandboxRoot::create_system_temp("dangling-link") else {
+            return;
+        };
+        let link = sandbox.path().join("dangling");
+        if symlink_file(sandbox.path().join("missing-target"), &link).is_err() {
+            return;
+        }
+        assert!(sandbox.child(Path::new("dangling/child")).is_err());
     }
 }

@@ -12,8 +12,9 @@ use windows_sys::Win32::Foundation::{
     INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FindClose, FindFirstStreamW,
-    FindNextStreamW, FindStreamInfoStandard, WIN32_FIND_STREAM_DATA,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FindClose, FindFirstStreamW, FindNextStreamW, FindStreamInfoStandard,
+    WIN32_FIND_STREAM_DATA,
 };
 
 use crate::util::{bool_result, last_error, wide_null};
@@ -69,6 +70,25 @@ impl DestinationStream {
     /// `truncate` is true for a fresh transfer and false only for a
     /// journal-owned resume candidate.
     pub fn create(base: &Path, stream: &StreamInfo, truncate: bool) -> io::Result<Self> {
+        Self::create_with_flags(base, stream, truncate, 0)
+    }
+
+    /// Opens or creates a named stream on a reparse object without following it.
+    pub fn create_reparse(base: &Path, stream: &StreamInfo, truncate: bool) -> io::Result<Self> {
+        Self::create_with_flags(
+            base,
+            stream,
+            truncate,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+        )
+    }
+
+    fn create_with_flags(
+        base: &Path,
+        stream: &StreamInfo,
+        truncate: bool,
+        flags: u32,
+    ) -> io::Result<Self> {
         if stream.is_unnamed() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -85,7 +105,8 @@ impl DestinationStream {
             .access_mode(GENERIC_READ | GENERIC_WRITE)
             .create(true)
             .truncate(truncate)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(flags);
         Ok(Self {
             file: options.open(path)?,
         })
@@ -132,11 +153,25 @@ impl Seek for DestinationStream {
 impl SourceStream {
     /// Opens one stream suffix on a base path using read-only access.
     pub fn open(base: &Path, stream: &StreamInfo) -> io::Result<Self> {
+        Self::open_with_flags(base, stream, 0)
+    }
+
+    /// Opens a named stream on a reparse object without following it.
+    pub fn open_reparse(base: &Path, stream: &StreamInfo) -> io::Result<Self> {
+        Self::open_with_flags(
+            base,
+            stream,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+        )
+    }
+
+    fn open_with_flags(base: &Path, stream: &StreamInfo, flags: u32) -> io::Result<Self> {
         let path = stream_path(base, &stream.name);
         let mut options = OpenOptions::new();
         options
             .access_mode(GENERIC_READ)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(flags);
         Ok(Self {
             file: options.open(path)?,
         })

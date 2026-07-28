@@ -64,11 +64,20 @@ impl OperationError {
     pub fn from_io(operation: &str, path: PathBuf, error: &io::Error) -> Self {
         let code = error.raw_os_error();
         let category = category_for(code, error.kind());
+        Self::from_io_as(category, operation, path, error)
+    }
+
+    pub(crate) fn from_io_as(
+        category: ErrorCategory,
+        operation: &str,
+        path: PathBuf,
+        error: &io::Error,
+    ) -> Self {
         Self {
             category,
             operation: operation.to_owned(),
             path,
-            code,
+            code: error.raw_os_error(),
             message: error.to_string(),
             hint: hint_for(category).to_owned(),
         }
@@ -174,5 +183,31 @@ fn hint_for(category: ErrorCategory) -> &'static str {
         }
         ErrorCategory::Cloud => "Restore cloud connectivity or use --skip-cloud",
         ErrorCategory::Internal => "Retain the log and report and file a bigcp bug",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::path::PathBuf;
+
+    use super::{ErrorCategory, OperationError};
+
+    #[test]
+    fn win32_codes_preserve_raw_context_and_stable_categories() {
+        for (code, category) in [
+            (5, ErrorCategory::Permissions),
+            (32, ErrorCategory::Locked),
+            (112, ErrorCategory::Space),
+            (23, ErrorCategory::Media),
+            (1167, ErrorCategory::DeviceGone),
+            (206, ErrorCategory::Path),
+        ] {
+            let error = io::Error::from_raw_os_error(code);
+            let classified = OperationError::from_io("test", PathBuf::from("file"), &error);
+            assert_eq!(classified.category, category);
+            assert_eq!(classified.code, Some(code));
+            assert!(!classified.hint.is_empty());
+        }
     }
 }

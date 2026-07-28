@@ -105,7 +105,7 @@ pub fn run_copy(
                 run_id.clone(),
                 preflight.source.to_string_lossy().into_owned(),
                 preflight.destination.to_string_lossy().into_owned(),
-                value_hash(&option_summary(options)),
+                value_hash(&option_summary(options))?,
                 started.clone(),
             ) {
                 audit.emit(&AuditEvent::Warning {
@@ -203,28 +203,27 @@ pub fn run_copy(
         }
     };
     let exit = completed_exit(runner.canceled, &runner.counters, verify.as_ref());
+    let journal_end_failed = runner.journal.as_mut().is_some_and(|journal| {
+        journal
+            .append(JournalEvent::End {
+                run_id: run_id.clone(),
+            })
+            .is_err()
+    });
+    if journal_end_failed {
+        runner.increment_warning("checkpointing_disabled");
+        runner.audit.emit(&AuditEvent::Warning {
+            kind: "checkpointing_disabled".to_owned(),
+            rel: None,
+            message: "journal run-end marker could not be written".to_owned(),
+        })?;
+        runner.journal = None;
+    }
     let audit_status = if runner.audit.degraded() {
         "degraded"
     } else {
         "ok"
     };
-    runner.audit.emit(&AuditEvent::RunEnd {
-        counters: runner.counters.clone(),
-        durability: if options.flush {
-            "durable".to_owned()
-        } else {
-            "logical".to_owned()
-        },
-        audit: audit_status.to_owned(),
-        integrity: integrity.clone(),
-        exit,
-    })?;
-    runner.audit.flush()?;
-    if let Some(journal) = &mut runner.journal {
-        let _ = journal.append(JournalEvent::End {
-            run_id: run_id.clone(),
-        });
-    }
 
     let ended_at = OffsetDateTime::now_utc();
     let duration = runner.stats.elapsed().as_secs_f64();
@@ -317,6 +316,7 @@ pub fn run_copy(
             rel: None,
             message: fallback_message,
         })?;
+        report.run.log_path = runner.audit.path().to_path_buf();
         runner.audit.flush()?;
         report.write_atomic(&fallback).map_err(|fallback_error| {
             BigcpError::Audit(format!(
@@ -326,6 +326,14 @@ pub fn run_copy(
             ))
         })?;
     }
+    runner.audit.emit(&AuditEvent::RunEnd {
+        counters: report.counters.clone(),
+        durability: report.run.durability.clone(),
+        audit: report.run.audit.clone(),
+        integrity: report.integrity.clone(),
+        exit: report.run.exit,
+    })?;
+    runner.audit.finish()?;
     Ok(report)
 }
 
@@ -850,13 +858,13 @@ impl Runner<'_> {
                         reason: "dry_run_would_fix_metadata".to_owned(),
                     }
                 } else if let Some(destination) = destination {
-                    match repair_file_metadata(&source, &destination, &fields) {
+                    match repair_metadata(&source, &destination, &fields, &relative) {
                         Ok(()) => FileOutcome::MetadataFixed {
                             bytes: source.metadata.size,
                         },
                         Err(error) => FileOutcome::Failed {
                             bytes: source.metadata.size,
-                            error: OperationError::from_io("set_meta", relative.clone(), &error),
+                            error,
                         },
                     }
                 } else {
@@ -971,7 +979,9 @@ impl Runner<'_> {
             fields,
             destination_newer,
         });
-        if largest_stream < self.options.large_threshold() {
+        let checkpoint_eligible =
+            self.journal.is_some() && largest_stream >= self.options.checkpoint_threshold();
+        if largest_stream < self.options.large_threshold() && !checkpoint_eligible {
             let job = FileCopyJob {
                 source_path: source.path.clone(),
                 destination_path,
@@ -1179,89 +1189,151 @@ impl Runner<'_> {
             relative_path: relative.clone(),
             metadata: entry.metadata.clone(),
         });
-        match classify(
+        let classification = classify(
             &source_snapshot,
             destination_snapshot.as_ref(),
             self.options.replace,
-        ) {
+        );
+        let replacement_event = match (&classification, destination_snapshot.as_ref()) {
+            (
+                Classification::Replace {
+                    fields,
+                    destination_newer,
+                },
+                Some(old),
+            ) => Some(ReplacementEvent {
+                old_size: old.metadata.size,
+                old_mtime: old.metadata.basic.last_write_time,
+                old_attributes: old.metadata.basic.attributes,
+                destination_newer: *destination_newer,
+                differences: fields.iter().map(|field| (*field).to_owned()).collect(),
+            }),
+            _ => None,
+        };
+        match classification {
             Classification::Same => {
                 self.counters.links_skipped = self.counters.links_skipped.saturating_add(1);
-                self.audit.emit(&AuditEvent::File {
-                    action: "skipped".to_owned(),
-                    rel: AuditPath::from_path(&relative),
-                    size: 0,
-                    hash: None,
-                    replacement: None,
-                    error: None,
-                    reason: Some("same".to_owned()),
-                })?;
+                self.record_link_event(
+                    &relative,
+                    "skipped_link",
+                    Some("same".to_owned()),
+                    None,
+                    None,
+                )?;
             }
-            Classification::MetadataDiff(_) => {
+            Classification::MetadataDiff(fields) => {
                 if self.options.dry_run {
                     self.counters.links_planned = self.counters.links_planned.saturating_add(1);
-                } else if destination
-                    .as_ref()
-                    .is_some_and(|entry| set_basic_at(&entry.path, source.metadata.basic).is_ok())
-                {
-                    self.counters.links_copied = self.counters.links_copied.saturating_add(1);
+                    self.record_link_event(
+                        &relative,
+                        "not_attempted_link",
+                        Some(format!("dry_run_would_fix_metadata:{}", fields.join(","))),
+                        None,
+                        None,
+                    )?;
                 } else {
-                    self.counters.links_failed = self.counters.links_failed.saturating_add(1);
-                    self.record_error(OperationError::semantic(
-                        ErrorCategory::Internal,
-                        "set_link_meta",
-                        relative,
-                        "could not repair reparse-point metadata",
-                    ))?;
+                    let result = destination.as_ref().map_or_else(
+                        || {
+                            Err(OperationError::semantic(
+                                ErrorCategory::Internal,
+                                "set_link_meta",
+                                relative.clone(),
+                                "classifier requested link metadata repair without a destination",
+                            ))
+                        },
+                        |entry| repair_metadata(&source, entry, &fields, &relative),
+                    );
+                    match result {
+                        Ok(()) => {
+                            self.counters.links_copied =
+                                self.counters.links_copied.saturating_add(1);
+                            self.record_link_event(
+                                &relative,
+                                "meta_fixed_link",
+                                Some(fields.join(",")),
+                                None,
+                                None,
+                            )?;
+                        }
+                        Err(error) => {
+                            self.counters.links_failed =
+                                self.counters.links_failed.saturating_add(1);
+                            self.record_link_event(
+                                &relative,
+                                "failed_link",
+                                None,
+                                None,
+                                Some(error),
+                            )?;
+                        }
+                    }
                 }
             }
-            Classification::SkipDifferent { .. } => {
+            Classification::SkipDifferent { fields, .. } => {
                 self.counters.links_not_attempted =
                     self.counters.links_not_attempted.saturating_add(1);
+                self.record_link_event(
+                    &relative,
+                    "skipped_diff_link",
+                    Some(fields.join(",")),
+                    None,
+                    None,
+                )?;
             }
             Classification::TypeConflict => {
                 self.counters.links_failed = self.counters.links_failed.saturating_add(1);
-                self.record_error(OperationError::semantic(
+                let error = OperationError::semantic(
                     ErrorCategory::TypeConflict,
                     "join",
-                    relative,
+                    relative.clone(),
                     "destination object type conflicts with source reparse point",
-                ))?;
+                );
+                self.record_link_event(&relative, "failed_link", None, None, Some(error))?;
             }
             Classification::New | Classification::Replace { .. } => {
                 if self.options.dry_run {
                     self.counters.links_planned = self.counters.links_planned.saturating_add(1);
+                    self.record_link_event(
+                        &relative,
+                        "not_attempted_link",
+                        Some(if replacement_event.is_some() {
+                            "dry_run_would_replace".to_owned()
+                        } else {
+                            "dry_run_would_copy_new".to_owned()
+                        }),
+                        replacement_event,
+                        None,
+                    )?;
                     return Ok(());
                 }
                 let mut protected_dacl = None;
-                if let Some(expected) = destination_snapshot.as_ref() {
+                if let Some(expected) = destination.as_ref() {
                     let destination_path = self.destination_root.join(&relative);
-                    match metadata_at(&destination_path) {
-                        Ok(observed)
-                            if observed.identity == expected.metadata.identity
-                                && observed.basic.last_write_time
-                                    == expected.metadata.basic.last_write_time => {}
-                        Ok(_) | Err(_) => {
-                            self.counters.links_failed =
-                                self.counters.links_failed.saturating_add(1);
-                            self.record_error(OperationError::semantic(
-                                ErrorCategory::DestinationChanged,
-                                "revalidate_dst",
-                                relative,
-                                "destination reparse point changed after classification",
-                            ))?;
-                            return Ok(());
-                        }
+                    if let Err(error) = revalidate_destination(expected, &relative) {
+                        self.counters.links_failed = self.counters.links_failed.saturating_add(1);
+                        self.record_link_event(
+                            &relative,
+                            "failed_link",
+                            None,
+                            replacement_event,
+                            Some(error),
+                        )?;
+                        return Ok(());
                     }
                     match bigcp_win::read_protected_dacl(&destination_path) {
                         Ok(value) => protected_dacl = value,
                         Err(error) => {
                             self.counters.links_failed =
                                 self.counters.links_failed.saturating_add(1);
-                            self.record_error(OperationError::from_io(
-                                "read_dacl",
-                                relative,
-                                &error,
-                            ))?;
+                            let error =
+                                OperationError::from_io("read_dacl", relative.clone(), &error);
+                            self.record_link_event(
+                                &relative,
+                                "failed_link",
+                                None,
+                                replacement_event,
+                                Some(error),
+                            )?;
                             return Ok(());
                         }
                     }
@@ -1277,31 +1349,45 @@ impl Runner<'_> {
                     self.options.flush,
                     protected_dacl.as_ref(),
                 ) {
-                    Ok(_) => {
+                    Ok(result) => {
+                        self.counters.bytes_read_source = self
+                            .counters
+                            .bytes_read_source
+                            .saturating_add(result.named_stream_bytes);
+                        self.counters.bytes_written_destination = self
+                            .counters
+                            .bytes_written_destination
+                            .saturating_add(result.named_stream_bytes);
+                        self.stats
+                            .record(result.named_stream_bytes, result.named_stream_bytes, 1);
                         self.counters.links_copied = self.counters.links_copied.saturating_add(1);
-                        self.audit.emit(&AuditEvent::File {
-                            action: "copied_link".to_owned(),
-                            rel: AuditPath::from_path(&relative),
-                            size: 0,
-                            hash: None,
-                            replacement: None,
-                            error: None,
-                            reason: None,
-                        })?;
+                        self.record_link_event(
+                            &relative,
+                            "copied_link",
+                            None,
+                            replacement_event,
+                            None,
+                        )?;
                     }
                     Err(error) => {
                         self.counters.links_failed = self.counters.links_failed.saturating_add(1);
-                        let category = if error.kind() == std::io::ErrorKind::Unsupported {
-                            ErrorCategory::UnsupportedReparse
+                        let operation_error = if error.kind() == std::io::ErrorKind::Unsupported {
+                            OperationError::from_io_as(
+                                ErrorCategory::UnsupportedReparse,
+                                "copy_reparse",
+                                relative.clone(),
+                                &error,
+                            )
                         } else {
-                            ErrorCategory::Internal
+                            OperationError::from_io("copy_reparse", relative.clone(), &error)
                         };
-                        self.record_error(OperationError::semantic(
-                            category,
-                            "copy_reparse",
-                            relative,
-                            error.to_string(),
-                        ))?;
+                        self.record_link_event(
+                            &relative,
+                            "failed_link",
+                            None,
+                            replacement_event,
+                            Some(operation_error),
+                        )?;
                     }
                 }
             }
@@ -1598,6 +1684,28 @@ impl Runner<'_> {
         self.audit.emit(&AuditEvent::Error { error })
     }
 
+    fn record_link_event(
+        &mut self,
+        relative: &Path,
+        action: &str,
+        reason: Option<String>,
+        replacement: Option<ReplacementEvent>,
+        error: Option<OperationError>,
+    ) -> Result<(), BigcpError> {
+        if let Some(error) = &error {
+            self.aggregate_error(error.clone());
+        }
+        self.audit.emit(&AuditEvent::File {
+            action: action.to_owned(),
+            rel: AuditPath::from_path(relative),
+            size: 0,
+            hash: None,
+            replacement,
+            error,
+            reason,
+        })
+    }
+
     fn record_folder_outcome(&mut self, relative: &Path, outcome: &FileOutcome) {
         let summary = self.folders.entry(top_level(relative)).or_default();
         summary.files_discovered = summary.files_discovered.saturating_add(1);
@@ -1821,6 +1929,16 @@ fn preflight(options: &CopyOptions) -> Result<Preflight, BigcpError> {
         }
         (resolved, Some(pin))
     };
+    if destination_preexisted {
+        let metadata = metadata_at(&destination)
+            .map_err(|error| BigcpError::io("read destination root metadata", error))?;
+        if metadata.kind != ObjectKind::Directory {
+            return Err(BigcpError::Invalid(
+                "destination must resolve to a real directory, not a file or reparse point"
+                    .to_owned(),
+            ));
+        }
+    }
 
     Ok(Preflight {
         source,
@@ -1966,9 +2084,10 @@ fn path_hash_parts<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Result<Stri
     Ok(hex::encode(hasher.finalize()))
 }
 
-fn value_hash(value: &Value) -> String {
-    let bytes = serde_json::to_vec(value).unwrap_or_default();
-    hex::encode(Sha256::digest(bytes))
+fn value_hash(value: &Value) -> Result<String, BigcpError> {
+    let bytes = serde_json::to_vec(value)
+        .map_err(|error| BigcpError::Format(format!("serialize option hash input: {error}")))?;
+    Ok(hex::encode(Sha256::digest(bytes)))
 }
 
 fn same_path(left: &Path, right: &Path) -> Result<bool, BigcpError> {
@@ -2050,19 +2169,57 @@ fn completed_exit(
     }
 }
 
-fn repair_file_metadata(
+fn repair_metadata(
     source: &DirectoryEntry,
     destination: &DirectoryEntry,
     differences: &[&str],
-) -> std::io::Result<()> {
-    if differences.contains(&"ea_size") {
-        let source_eas = read_extended_attributes(&source.path)?;
-        clear_extended_attributes(&destination.path)?;
+    relative: &Path,
+) -> Result<(), OperationError> {
+    let source_eas =
+        if differences.contains(&"ea_size") {
+            Some(read_extended_attributes(&source.path).map_err(|error| {
+                OperationError::from_io("read_ea", relative.to_path_buf(), &error)
+            })?)
+        } else {
+            None
+        };
+    revalidate_destination(destination, relative)?;
+    if let Some(source_eas) = source_eas {
+        clear_extended_attributes(&destination.path)
+            .map_err(|error| OperationError::from_io("clear_ea", relative.to_path_buf(), &error))?;
         if !source_eas.is_empty() {
-            write_extended_attributes(&destination.path, &source_eas)?;
+            write_extended_attributes(&destination.path, &source_eas).map_err(|error| {
+                OperationError::from_io("write_ea", relative.to_path_buf(), &error)
+            })?;
         }
     }
     set_basic_at(&destination.path, source.metadata.basic)
+        .map_err(|error| OperationError::from_io("set_meta", relative.to_path_buf(), &error))
+}
+
+fn revalidate_destination(
+    destination: &DirectoryEntry,
+    relative: &Path,
+) -> Result<(), OperationError> {
+    let observed = metadata_at(&destination.path).map_err(|error| {
+        OperationError::from_io("revalidate_dst", relative.to_path_buf(), &error)
+    })?;
+    let expected = &destination.metadata;
+    if observed.identity != expected.identity
+        || observed.kind != expected.kind
+        || observed.size != expected.size
+        || observed.basic.last_write_time != expected.basic.last_write_time
+        || observed.basic.attributes != expected.basic.attributes
+        || observed.reparse_tag != expected.reparse_tag
+    {
+        return Err(OperationError::semantic(
+            ErrorCategory::DestinationChanged,
+            "revalidate_dst",
+            relative.to_path_buf(),
+            "destination changed after classification",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

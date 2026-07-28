@@ -94,7 +94,11 @@ pub(crate) struct SmallFileWorkers {
 impl SmallFileWorkers {
     /// Starts the static profile's small-file workers.
     pub fn new(worker_count: usize) -> Result<Self, BigcpError> {
-        let worker_count = worker_count.clamp(1, 256);
+        if !(1..=256).contains(&worker_count) {
+            return Err(BigcpError::Invalid(
+                "small-file worker count must be in 1..=256".to_owned(),
+            ));
+        }
         let capacity = worker_count.saturating_mul(4).max(4);
         let (job_sender, job_receiver) = crossbeam_channel::bounded::<FileCopyJob>(capacity);
         let (result_sender, result_receiver) = crossbeam_channel::bounded(capacity);

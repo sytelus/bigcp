@@ -12,9 +12,10 @@ difference is atomically replaced unless `--replace=false`. Destination-only
 objects are extras and are never changed. A file/directory/reparse type conflict
 fails and is never auto-resolved.
 
-ADS or EA divergence is not queried for otherwise-`Same` files because that
-would add per-file I/O to the common rerun path. Full standalone verification
-detects it.
+Named-stream divergence and same-length EA payload divergence are not queried
+for otherwise-`Same` files because that would add per-file I/O to the common
+rerun path. A differing EA byte count is cheap enumeration metadata and is
+repaired. Full standalone verification detects all payload divergence.
 
 Every discovered file, directory, and link reaches exactly one terminal
 counter outcome. Dry-run forecasts use separate `would_*`/`*_planned` counters
@@ -26,7 +27,7 @@ and never claim modeled work was completed.
 |---|---|
 | File | Unnamed bytes; named `$DATA` streams; EA blob; creation and last-write time; `READONLY`, `HIDDEN`, `SYSTEM`, `ARCHIVE`, `NOT_CONTENT_INDEXED`. |
 | Directory | Existence; named `$DATA` streams; EA blob; the same times and attribute mask, applied post-order; root metadata included. |
-| Symlink/junction | Complete reparse buffer and tag, plus EAs and copied basic metadata. |
+| Symlink/junction | Link target/reparse payload and tag; named `$DATA` streams; EA blob; copied basic metadata. |
 
 Last-access time is written best-effort but informational in verification
 because reads legitimately change it. Sparse allocation is preserved when
@@ -41,8 +42,9 @@ Every file, including a new small file, follows one protocol:
 2. Create a unique `.bigcp-<full-run-id>-<nonce>.part` sibling with
    delete-on-close armed.
 3. Copy data, named streams, EAs, sparse layout, and destination DACL policy.
-4. Revalidate the source. For replacement, revalidate destination identity,
-   size, and mtime and preserve a protected destination DACL.
+4. Revalidate the source. For replacement or in-place metadata repair,
+   revalidate destination identity, kind, size, last-write time, attributes,
+   and reparse tag, then preserve a protected destination DACL when replacing.
 5. Clear delete-on-close, atomically rename to the final name, then set final
    basic metadata (the ordering defeats NTFS name tunneling).
 6. With `--flush`, flush after rename and metadata; only then report `copied`.
@@ -54,9 +56,14 @@ size/mtime and the exact temp prefix digest must match before continuation.
 ## Streams, EAs, sparse files, EFS, and reparse points
 
 Only `$DATA` streams are user data; directory `::$INDEX_ALLOCATION` and other
-filesystem implementation streams are ignored. A large ADS promotes its owner
-to the streaming path and is accounted as logical bytes. EA transfer uses
-separate synchronous buffered handles through `BackupRead`/`BackupWrite`.
+filesystem implementation streams are ignored. A large file ADS promotes its
+owner to the journal-aware streaming path and successfully copied file ADS
+bytes are included in logical copy accounting. EA transfer uses separate
+synchronous buffered handles through `BackupRead`/`BackupWrite`.
+
+Source-named streams on directories and reparse objects are copied through
+non-following handles. Destination-only streams are not deleted: a full verify
+reports them as divergence, preserving the product's no-delete contract.
 
 Sparse files are marked sparse before EOF is established, are not densely
 preallocated, and copy allocated ranges only. Holes participate in hashing as
@@ -64,8 +71,10 @@ logical zero bytes in offset order. When sparse storage is unavailable or
 disabled, a dense representation with identical bytes is correct.
 
 EFS source data is read as plaintext. The destination is asked to encrypt; a
-failure is an explicit `efs_downgrade` warning. Known symlink and junction tags
-are recreated. Unknown reparse tags fail unless `--raw-reparse` is given.
+failure is an explicit `efs_downgrade` warning. Symbolic links are recreated
+with Windows' unprivileged-create flag (when Developer Mode permits it), while
+junctions use their reparse payload. Unknown tags fail unless `--raw-reparse`
+is given.
 
 ## Roots, exclusions, and audit artifacts
 
@@ -80,8 +89,9 @@ Information`, and page/hibernation files are excluded unless
 
 State, log, and report paths may share a volume with either tree but may not be
 inside either tree. JSONL is the complete event audit; the JSON report is an
-atomic aggregate. If both primary and fallback logging fail, no new work is
-claimed.
+atomic aggregate. The report is published before the terminal `run_end`, whose
+bytes are durably synchronized. If both primary and fallback logging fail, no
+new work is claimed.
 
 ## Verification
 
@@ -90,8 +100,9 @@ There are exactly two verification forms:
 - `--verify` hashes source buffers during copy, then rereads destination files
   written by that run, including named streams and EAs.
 - `bigcp verify SRC DST` reads both entire trees and compares shape, types,
-  bytes, all named data streams, EA blobs, required metadata, directory/root
-  fields, and raw reparse buffers. Extras and omissions fail.
+  bytes, all named data streams (including streams on links), EA blobs,
+  required metadata, directory/root fields, and raw reparse buffers. Extras
+  and omissions fail.
 
 xxh3-128 detects accidental corruption; it is not a cryptographic integrity
 mechanism. Verification bypasses no honest drive-internal cache guarantee.

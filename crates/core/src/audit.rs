@@ -92,7 +92,7 @@ pub enum AuditEvent {
     },
     /// File terminal outcome.
     File {
-        /// copied, skipped, skipped_diff, meta_fixed, failed, or excluded.
+        /// Stable terminal file/link action such as copied, skipped, or failed.
         action: String,
         /// Relative object path.
         rel: AuditPath,
@@ -235,6 +235,14 @@ impl AuditWriter {
             .map_err(|error| BigcpError::io("flush JSONL log", error))?;
         self.last_flush = Instant::now();
         Ok(())
+    }
+
+    /// Flushes and durably synchronizes the terminal audit record.
+    pub fn finish(&mut self) -> Result<(), BigcpError> {
+        self.flush()?;
+        self.file
+            .sync_data()
+            .map_err(|error| BigcpError::io("synchronize JSONL log", error))
     }
 
     /// Returns the actual current audit path.

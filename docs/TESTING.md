@@ -5,8 +5,9 @@
 Every filesystem test must use a newly created, uniquely named directory under
 an explicitly validated scratch root. The testkit refuses F:, G:, and H: before
 access, refuses broad roots, rejects traversal, and rejects roots whose final
-path reveals a junction, symlink, mount alias, or SUBST mapping. Tests never
-operate on source-like user data.
+path reveals a junction, symlink, mount alias, or SUBST mapping. Existing and
+dangling reparse intermediates are rejected. Tests never operate on source-like
+user data.
 
 Routine tests must not mount, format, dismount, fill, benchmark, or issue raw
 operations to any drive. No cable-removal test is routine. VHDX and hardware
@@ -71,6 +72,11 @@ bigcp-testkit check C:\scratch\bigcp-case-001 source destination
 A scenario declares `write_budget_bytes`; generation sums file sizes with
 checked arithmetic and refuses any declaration above 1 GiB. Paths are relative
 and may not traverse reparse points.
+
+Link integration tests create only test-owned links inside the marked sandbox.
+They use Developer Mode when available and skip link creation on hosts that do
+not authorize the source fixture; they never target an existing file outside
+the sandbox.
 
 ## Adding a test
 

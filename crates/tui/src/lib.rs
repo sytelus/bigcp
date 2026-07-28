@@ -506,6 +506,7 @@ impl TerminalSession {
         match Terminal::new(backend) {
             Ok(terminal) => Ok(Self { terminal }),
             Err(error) => {
+                let _ = execute!(io::stdout(), LeaveAlternateScreen);
                 let _ = disable_raw_mode();
                 Err(error)
             }

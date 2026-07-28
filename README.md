@@ -10,7 +10,9 @@ The repository is currently **pre-1.0**. The bounded reference implementation
 and safe routine suites are operational; the IOCP transport and dedicated
 fault/chaos/ReFS/performance release matrix remain open and are listed in
 [PLAN_DEVIATIONS.md](PLAN_DEVIATIONS.md). Do not treat this build as v1.0
-certified until those gates pass.
+certified until those gates pass. The current evidence and remaining release
+blockers are summarized in
+[docs/PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md).
 
 ## Safety contract
 
@@ -89,6 +91,10 @@ Run `bigcp --help` for accepted classes and syntax. Advanced tune keys are
 `qd-src`, `qd-dst`, `chunk`, `streams`, `threads`, `mem`,
 `large-threshold`, and `checkpoint-threshold`; byte sizes accept `KiB`, `MiB`,
 or `GiB`.
+Manual bounds are enforced in the core library as well as the CLI: workers are
+`1..=256`, concurrent streams `1..=16`, chunks `64 KiB..=64 MiB`, and thresholds
+must be positive. A `mem` budget must hold at least one large-threshold buffer
+and caps both chunk size and threshold-sized workers.
 
 ## Exit codes
 
@@ -103,9 +109,10 @@ or `GiB`.
 
 ## Fidelity and limits
 
-Data, named `$DATA` streams, EAs, creation/last-write times, and the user-owned
-attribute mask are preserved. Directory metadata is finalized post-order.
-Symlinks and junctions retain their raw targets. Source ACLs, owner, SACL,
+Data, named `$DATA` streams (including those on directories and links), EAs,
+creation/last-write times, and the user-owned attribute mask are preserved.
+Directory metadata is finalized post-order. Symlinks and junctions retain
+their targets without traversal. Source ACLs, owner, SACL,
 compression, hard-link topology, and system-managed attributes are not copied.
 Existing explicitly protected destination DACLs are preserved on replacement.
 See [LIMITATIONS.md](LIMITATIONS.md) and the normative
