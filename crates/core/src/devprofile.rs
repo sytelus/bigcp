@@ -233,12 +233,43 @@ fn detected_class(info: &DeviceInfo) -> DeviceClass {
         Some(DeviceBus::Nvme) => DeviceClass::Nvme,
         Some(DeviceBus::Sata) => DeviceClass::SataSsd,
         Some(DeviceBus::Usb) => DeviceClass::UsbSsd,
+        // A positive "no seek penalty" answer means definitively
+        // solid-state even when the bus is unrecognized — Intel VMD/RST
+        // NVMe controllers report BusTypeRAID, which used to demote a fast
+        // internal SSD to the conservative Unknown profile (found on this
+        // project's own D: drive, 2026-07-29). The moderate SATA-SSD row is
+        // the safe class-level choice without bus evidence for more.
+        Some(DeviceBus::Other) | None if info.incurs_seek_penalty == Some(false) => {
+            DeviceClass::SataSsd
+        }
         Some(DeviceBus::Other) | None => DeviceClass::Unknown,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn no_seek_penalty_on_unrecognized_bus_is_ssd_class() {
+        // Regression pin for the VMD/RST misclassification (2026-07-29):
+        // a drive that positively reports no seek penalty must never fall
+        // to the Unknown profile just because its bus is unrecognized.
+        let probe = |seek: Option<bool>| DeviceInfo {
+            disk_numbers: vec![1],
+            incurs_seek_penalty: seek,
+            bus: None,
+            maximum_transfer_length: None,
+            logical_sector: Some(512),
+            physical_sector: None,
+            high_confidence: false,
+        };
+        assert_eq!(
+            super::detected_class(&probe(Some(false))),
+            DeviceClass::SataSsd
+        );
+        assert_eq!(super::detected_class(&probe(Some(true))), DeviceClass::Hdd);
+        assert_eq!(super::detected_class(&probe(None)), DeviceClass::Unknown);
+    }
+
     use super::select_copy_profile;
     use crate::options::{DeviceClass, TuneOptions};
     use bigcp_win::{DeviceBus, DeviceInfo};

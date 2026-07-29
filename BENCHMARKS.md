@@ -211,6 +211,44 @@ large files **parity at device ceiling**, NVMe→NVMe large files parity
 (buffered default vs buffered default). All cells single-session
 indicative; certified median-of-5 protocol still pending.
 
+## 2026-07-29 bandwidth analysis: what "device-bound" means on the USB HDD
+
+From the H: evidence already gathered (no new runs):
+
+- **Sequential bandwidth ceiling of H: ≈ 240–256 MB/s** (bigcp large-file
+  peak 255.7 MB/s, robocopy `/J` 241 MB/s, bigcp average 224.8 MB/s across
+  file transitions). Both tools sit at this ceiling for large files.
+- **Small files do not touch that ceiling — at all.** Best small-file run:
+  80 MB in 17.7 s = **4.6 MB/s ≈ 1.9 % of the sequential bandwidth**
+  (robocopy: 3.4 MB/s ≈ 1.4 %). Moving the 80 MB of data at ceiling speed
+  would take 0.33 s — **over 98 % of small-file wall time is per-file
+  overhead**, chiefly the create and close metadata round-trips that
+  write-through (Quick-removal) USB volumes force to the device
+  (~0.9 ms/file effective at ~1,130 files/s across 32 overlapped workers).
+- **The small-vs-large throughput gap is therefore ~49×** (4.6 vs
+  224.8 MB/s), and it is a property of the destination's metadata-latency
+  regime, not of either tool's data path: robocopy lives in the same regime,
+  ~25 % behind bigcp. Further gains here need fewer device round-trips per
+  file — the user-side "Better performance" drive policy is the big lever
+  (documented in the README removal section); tool-side scheduling is
+  already saturated, as the R7 experiment below confirms.
+
+## 2026-07-29 R6/R7 dispositions
+
+- **R6 fixed:** both internal NVMe drives were misclassified as *Unknown*
+  because this board's Intel VMD/RST controller reports `BusTypeRAID`.
+  `detected_class` now trusts a positive "no seek penalty" answer as
+  definitively solid-state (→ moderate SATA-SSD profile) even when the bus
+  is unrecognized; live profile events confirm `SataSsd/SataSsd, workers 32`
+  where `Unknown/Unknown, workers 4` appeared before. Regression test pins
+  the rule.
+- **R7 measured — no advantage:** a thread-per-close deferral prototype ran
+  the H: small-file workload at parity-to-slightly-worse versus baseline in
+  two interleaved pairs (20.9→22.1 s, 15.5→15.8 s). With 32 workers the
+  device queue already receives all the close overlap it can use, so the
+  close-finalizer stage stays retired; revisit only if worker counts ever
+  drop materially.
+
 ## Outstanding
 
 The elevated ReFS matrix and the repeated-run certified benchmark protocol

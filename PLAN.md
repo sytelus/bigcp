@@ -1080,6 +1080,32 @@ Directed tests for the abuse-shaped cases (all IDs from §9): concurrent invocat
 
 All suites green: unit + property · fault-injection matrix over the wrapper-boundary sites (§12.3) · deterministic kill-point simulation exhaustive + bounded real-process chaos clean (incl. mutator mode; §12.4 — no hours-long soaks exist) · adversarial suite (§12.8) · schema validation · real-hardware checklist executed within its bounded write budget and archived in BENCHMARKS.md · bounded-workload performance evidence recorded per §8.7 (measured numbers + no-regression once baselines exist; the multiplier KPIs stay aspirational) · docs self-sufficiency criteria satisfied (§14.6). Post-v1 by owner decision: the elevated VHDX/ReFS matrix (ADR 0029 — ReFS is best-effort at v1) and differential copier runs (§12.6).
 
+### 12.10 Final production validations — executed only on explicit owner request
+
+The following validation work is **out of scope for ordinary development**
+and runs only when the owner explicitly asks for the production-validation
+pass (owner decision, 2026-07-29). Until then, the 1.0 claim is simply not
+made; nothing here blocks feature or performance work:
+
+- **Chaos/kill-convergence harness** (§12.4): bounded kill-anywhere →
+  rerun-converges cycles, oracle-verified — the evidence behind the
+  rerun-repair contract.
+- **Adversarial edge-case set** (§12.8) as directed e2e tests: aliased
+  roots, run-lock races, mid-run destination mutation, lost-write orderings.
+- **Sentinel + schema honesty checks**: a canary tree beside the destination
+  asserted untouched; emitted log/report instances validated against the
+  shipped schemas.
+- **Certified performance protocol**: median of ≥5 quiet-machine repetitions
+  for every BENCHMARKS.md scoreboard cell (single-session numbers stay
+  labeled indicative until this runs).
+
+An initial code review of the paths these validations cover was performed
+2026-07-29 (per-directory outstanding-counter symmetry including promoted
+hand-backs and worker-panic completions; exit-rotation progress guarantees;
+breaker/cancel walks still exiting partially-dispatched directories;
+stamp-at-create versus verification expectations) and found no critical
+defects — the validations remain the mechanical proof of that review.
+
 ## 13. Implementation order and technical gates
 
 Per VISION, this plan carries no development phases, timelines, or team-process material. What belongs in an engineering plan — and is recorded here — is the *technical dependency order* (what cannot be built before what) and the *quality gates* that protect reliability as the system grows.

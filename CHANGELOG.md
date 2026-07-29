@@ -264,6 +264,27 @@ versioning once its 1.0 release gates are complete.
 - Result with defaults: 17.7–18.0 s vs robocopy 23.1–24.5 s on the USB-HDD
   small-file cell — every measured small-file cell now exceeds robocopy.
 
+### 2026-07-29 registry cleared: R6 fixed, R7 measured, validations scoped
+
+- Fixed drive misclassification (R6): Intel VMD/RST controllers report
+  `BusTypeRAID`, which sent both internal NVMe drives to the conservative
+  Unknown profile (4 workers). A positive "no seek penalty" answer now
+  classifies as solid-state; live profile events confirm SataSsd/32-worker
+  selection. Regression test added.
+- Measured the close-finalizer idea (R7): thread-per-close deferral was
+  parity-to-worse on the USB-HDD workload — 32 workers already saturate the
+  device's close overlap. Stays retired with its trigger recorded.
+- Bandwidth analysis added to BENCHMARKS.md: the USB HDD's sequential
+  ceiling is ~240–256 MB/s and large files sit on it; small files run at
+  ~1.9 % of that ceiling because >98 % of their wall time is per-file
+  metadata round-trips — a ~49× small-vs-large gap that is a property of
+  write-through USB, with the drive-policy lever documented for users.
+- Remaining validations (chaos/kill-convergence, adversarial set,
+  sentinel/schema checks, certified benchmark protocol) moved to PLAN
+  §12.10: executed only on explicit owner request, otherwise out of scope.
+  Initial code review of those paths found no critical defects.
+  PLAN_DEVIATIONS.md is now clear.
+
 ### Known pre-1.0 work
 
 - IOCP/no-buffering engine and its sans-I/O model, comprehensive fault/chaos
