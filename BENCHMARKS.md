@@ -295,6 +295,40 @@ metadata-bound; consider the Better-performance policy + Safely Remove")
 is registered as a candidate — it needs behavior-based detection, since
 policy inference via IOCTL was deliberately deleted (ADR 0027).
 
+## 2026-07-29 the collapse factor, measured: Better-performance policy on H:
+
+The owner switched H: from Quick-removal to Better-performance (OS write
+caching on) and the small-file workload was rerun — same fixture shape, two
+interleaved pairs:
+
+| Tool | Quick removal (before) | Better performance (after) |
+|---|---|---|
+| bigcp (defaults) | 17.7–18.0 s | **5.19 s / 5.18 s (3,861 files/s, 15.8 MB/s)** |
+| robocopy `/MT:32` | 23.1–24.5 s | 12.7 s / 15.3 s |
+
+Findings:
+
+1. **The policy flip alone bought bigcp 3.4×**, exactly as the
+   first-principles analysis predicted: with the NTFS log batching metadata
+   transactions, the per-file close flush vanished (phase table: close cost
+   2,350 → 113 µs) and creates fell to ~58 µs effective.
+2. **bigcp is now 2.4–3.0× faster than robocopy on this cell** — robocopy
+   barely improved. Once the device stops serializing every tool equally,
+   the directory-affine scheduling, deep queues, create-time stamping, and
+   32-worker profile convert directly into throughput. This is the
+   algorithmic advantage the design carries; the write-through policy had
+   been masking it.
+3. **The small-vs-large gap collapsed 49× → ~14×** (15.8 vs 224.8 MB/s).
+   The remainder is per-file software cost across both trees plus NTFS
+   transaction work that caching amortizes but cannot eliminate.
+4. Durability note, unchanged: with Better performance the standard
+   "Safely Remove Hardware" step (or `--flush`) matters before unplugging —
+   exactly what the README's removal section already instructs.
+
+This gives the registered metadata-bound report hint its honest wording:
+"switching this destination to the Better-performance policy sped this
+workload up ~3.4× in measurement; use Safely Remove before unplugging."
+
 ## Outstanding
 
 The elevated ReFS matrix and the repeated-run certified benchmark protocol

@@ -297,6 +297,15 @@ versioning once its 1.0 release gates are complete.
   volume policy, whose factor awaits one owner-approved measurement; a
   behavior-based report hint is registered as a candidate.
 
+### 2026-07-29 Better-performance measurement: gap collapse confirmed
+
+- With the owner switching H: to the Better-performance policy, the
+  small-file workload ran at 5.18–5.19 s (3,861 files/s) versus robocopy's
+  12.7–15.3 s — bigcp 2.4–3.0× faster, the policy flip alone worth 3.4×,
+  and the small-vs-large gap collapsed from 49× to ~14×. Phase table
+  confirms the mechanism (close cost 2,350 → 113 µs). Recorded in
+  BENCHMARKS.md with the honest wording for the future metadata-bound hint.
+
 ### Known pre-1.0 work
 
 - IOCP/no-buffering engine and its sans-I/O model, comprehensive fault/chaos
