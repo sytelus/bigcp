@@ -329,6 +329,38 @@ This gives the registered metadata-bound report hint its honest wording:
 "switching this destination to the Better-performance policy sped this
 workload up ~3.4× in measurement; use Safely Remove before unplugging."
 
+## 2026-07-29 what could make small files faster still (candidate register)
+
+With the cached-policy result in hand (5.18 s, 3,861 files/s, ~14× from
+sequential), the phase table re-ranks the field: create is again the top
+item (37.2 worker-seconds — now NTFS log/MFT-allocation contention, since
+the device round-trips are gone), write 9.0, everything else small; workers
+are still idle ~70 % of wall, pointing at dispatch cadence. Candidates, in
+recommended experiment order, none implemented without its measurement:
+
+1. **Worker-count sweep under the cached policy** — 32 was tuned for the
+   write-through regime; the contention profile changed (trivial to run).
+2. **Sharding policy by destination regime** — directory affinity was the
+   write-through win; on a cached destination the per-directory
+   serialization may now be the limiter. A/B affinity vs round-robin.
+3. **Relative-handle creates** (`NtCreateFile` with `RootDirectory`) —
+   skips per-create path resolution; matters most on the NVMe cells where
+   effective create cost is already ~58 µs.
+4. **The unmeasured cell that matters next: HDD *source*** — source open +
+   read is trivial from NVMe (125 µs/file) but will dominate reading many
+   small files off a spinning source; the prefetch-pipeline idea belongs to
+   that cell's evidence, not this one's.
+5. Excluded with reasons: IoRing (no create/metadata ops — only the small
+   write phase would batch); container/split tricks (no NTFS API to
+   materialize files from a stream — the tar bound stays unreachable for
+   real files); NTFS log resizing (obscure user-side tuning, thin
+   evidence).
+
+Rough headroom estimate: per-file wall budget is ~259 µs; a cached-create
+floor near ~100–150 µs suggests up to ~2× may remain reachable before the
+irreducible per-file cost; beyond that only container semantics (not real
+files) go faster.
+
 ## Outstanding
 
 The elevated ReFS matrix and the repeated-run certified benchmark protocol

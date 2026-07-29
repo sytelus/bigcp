@@ -138,7 +138,30 @@ Safe test instructions and exact write budgets are in
 it can corrupt a volume. Device-loss behavior belongs in fault-injection
 simulation only — forced disconnects, physical or virtual, are never performed.
 
-## Removing a drive after a copy
+## External drives: write caching and safe removal
+
+Windows offers two policies for external drives (Device Manager → the drive
+→ Policies), and the choice changes small-file copy speed dramatically —
+measured at **~3.4× on a 20,000-file workload** (BENCHMARKS.md):
+
+- **Quick removal** (Windows default): you may unplug without clicking
+  anything, but every file's metadata is pushed to the drive individually —
+  the slow path. bigcp detects this before a copy starts, warns, and (in an
+  interactive terminal) asks once whether to continue.
+- **Better performance** — the recommended setting, with its two checkboxes
+  handled differently:
+  - **"Enable write caching on the device": CHECK IT.** This is where the
+    speedup lives (Windows batches metadata into large flushes). The risk is
+    bounded: if power fails or the drive is unplugged early, recently
+    written files are lost or incomplete — and re-running bigcp detects and
+    repairs exactly that. Always use **Safely Remove Hardware** before
+    unplugging.
+  - **"Turn off Windows write-cache buffer flushing": LEAVE IT UNCHECKED.**
+    That setting tells Windows the device is battery-backed and suppresses
+    the flush commands NTFS relies on to keep its own journal consistent.
+    On power loss it can corrupt the *filesystem itself* — damage a re-run
+    cannot repair. The extra speed over checkbox one is marginal for
+    copying; the added risk is not.
 
 By default a completed run guarantees *logical* completion: recently written
 data can still sit in the OS or drive cache. Either run with `--flush`

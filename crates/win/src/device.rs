@@ -19,10 +19,10 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::{
-    DEVICE_SEEK_PENALTY_DESCRIPTOR, DISK_EXTENT, IOCTL_STORAGE_QUERY_PROPERTY,
-    PropertyStandardQuery, STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR, STORAGE_ADAPTER_DESCRIPTOR,
-    STORAGE_PROPERTY_QUERY, StorageAccessAlignmentProperty, StorageAdapterProperty,
-    StorageDeviceSeekPenaltyProperty,
+    DEVICE_SEEK_PENALTY_DESCRIPTOR, DISK_CACHE_INFORMATION, DISK_EXTENT,
+    IOCTL_DISK_GET_CACHE_INFORMATION, IOCTL_STORAGE_QUERY_PROPERTY, PropertyStandardQuery,
+    STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR, STORAGE_ADAPTER_DESCRIPTOR, STORAGE_PROPERTY_QUERY,
+    StorageAccessAlignmentProperty, StorageAdapterProperty, StorageDeviceSeekPenaltyProperty,
 };
 
 use crate::util::bool_result;
@@ -56,6 +56,12 @@ pub struct DeviceInfo {
     pub logical_sector: Option<u32>,
     /// Physical sector bytes.
     pub physical_sector: Option<u32>,
+    /// Device write-cache state (query-only). `Some(false)` on an external
+    /// drive is the signature of Windows' Quick-removal policy, measured to
+    /// cost ~3.4× on metadata-heavy small-file workloads (BENCHMARKS.md
+    /// 2026-07-29) — surfaced to the user before a copy starts, never
+    /// changed by bigcp.
+    pub write_cache_enabled: Option<bool>,
     /// Whether the seek-penalty and bus-classification queries both succeeded.
     pub high_confidence: bool,
 }
@@ -71,6 +77,7 @@ pub fn profile_device(volume: &VolumeInfo) -> DeviceInfo {
             maximum_transfer_length: None,
             logical_sector: Some(volume.bytes_per_sector),
             physical_sector: None,
+            write_cache_enabled: None,
             high_confidence: false,
         };
     };
@@ -104,8 +111,30 @@ pub fn profile_device(volume: &VolumeInfo) -> DeviceInfo {
         maximum_transfer_length,
         logical_sector,
         physical_sector,
+        write_cache_enabled: query_write_cache(&handle),
         high_confidence: seek.is_some() && bus.is_some(),
     }
+}
+
+/// Queries the device's write-cache state (query-only, never modified).
+fn query_write_cache(handle: &File) -> Option<bool> {
+    let mut info = DISK_CACHE_INFORMATION::default();
+    let mut returned = 0_u32;
+    // SAFETY: the output buffer is the exact documented structure, the
+    // handle is live, and the control code is a read-only query.
+    let succeeded = unsafe {
+        DeviceIoControl(
+            handle.as_raw_handle().cast(),
+            IOCTL_DISK_GET_CACHE_INFORMATION,
+            std::ptr::null(),
+            0,
+            (&raw mut info).cast(),
+            u32::try_from(size_of::<DISK_CACHE_INFORMATION>()).ok()?,
+            &raw mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    (succeeded != 0).then_some(info.WriteCacheEnabled)
 }
 
 /// Builds the `\\.\X:` query-only device path for a drive-letter volume root.

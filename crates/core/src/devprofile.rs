@@ -260,6 +260,7 @@ mod tests {
             maximum_transfer_length: None,
             logical_sector: Some(512),
             physical_sector: None,
+            write_cache_enabled: None,
             high_confidence: false,
         };
         assert_eq!(
@@ -282,6 +283,7 @@ mod tests {
             maximum_transfer_length: Some(4 * 1024 * 1024),
             logical_sector: Some(512),
             physical_sector: Some(4096),
+            write_cache_enabled: Some(true),
             high_confidence: true,
         }
     }

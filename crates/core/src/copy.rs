@@ -108,6 +108,19 @@ pub fn run_copy(
         workers: preflight.profile.workers,
         same_physical_disk: preflight.profile.same_physical_disk,
     })?;
+    if preflight.destination_write_cache_disabled {
+        observer.on_message(
+            "destination write caching is off (Quick-removal policy): small-file copies run \
+             several times slower; see the report's hints for the measured fix",
+        );
+        audit.emit(&AuditEvent::Warning {
+            kind: "quick_removal_destination".to_owned(),
+            rel: None,
+            message: "destination device reports write caching disabled (Quick-removal policy); \
+                      metadata-heavy workloads measured ~3.4x slower under it"
+                .to_owned(),
+        })?;
+    }
 
     let journal = if options.dry_run {
         // A dry-run must not disturb resume state: appending a Job record
@@ -2488,6 +2501,11 @@ struct Preflight {
     destination_exists: bool,
     source_volume: VolumeInfo,
     destination_volume: VolumeInfo,
+    /// Destination device write cache reported disabled — the Quick-removal
+    /// signature, measured at ~3.4× cost on metadata-heavy small-file
+    /// workloads (BENCHMARKS.md 2026-07-29). Surfaced as a warning and a
+    /// hint; never changed by bigcp.
+    destination_write_cache_disabled: bool,
     profile: CopyProfile,
     state_dir: PathBuf,
     log_path: PathBuf,
@@ -2597,6 +2615,7 @@ fn preflight(options: &CopyOptions) -> Result<Preflight, BigcpError> {
         destination_exists: destination_preexisted || !options.dry_run,
         source_volume,
         destination_volume,
+        destination_write_cache_disabled: destination_device.write_cache_enabled == Some(false),
         profile,
         state_dir,
         log_path,
@@ -2755,6 +2774,17 @@ fn format_time(value: OffsetDateTime) -> String {
 
 fn derive_hints(runner: &Runner<'_>, preflight: &Preflight) -> Vec<Hint> {
     let mut hints = Vec::new();
+    if preflight.destination_write_cache_disabled {
+        hints.push(Hint {
+            id: "quick_removal_destination".to_owned(),
+            text: "Destination write caching is off (Quick-removal policy). Switching the drive to \
+                   'Better performance' with 'Enable write caching on the device' checked sped this \
+                   class of workload ~3.4x in measurement; leave 'Turn off Windows write-cache \
+                   buffer flushing' UNCHECKED, and always use Safely Remove before unplugging"
+                .to_owned(),
+            confidence: "high".to_owned(),
+        });
+    }
     if runner.counters.failed > 0 {
         hints.push(Hint {
             id: "rerun_failures".to_owned(),

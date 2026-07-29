@@ -306,6 +306,23 @@ versioning once its 1.0 release gates are complete.
   confirms the mechanism (close cost 2,350 → 113 µs). Recorded in
   BENCHMARKS.md with the honest wording for the future metadata-bound hint.
 
+### 2026-07-29 write-cache detection, pre-copy notice, and policy guidance
+
+- Revived the query-only device write-cache probe (deleted as cosmetic in
+  ADR 0027; revived by the measured ~3.4× consequence, ADR 0032). When the
+  destination reports caching disabled (Quick-removal policy) bigcp now:
+  warns at run start in the log and status output, adds a high-confidence
+  report hint carrying the measured factor, and — interactive terminals
+  only — asks one Continue? [Y/n] before any copying; scripts, `--plain`,
+  `--quiet`, and `--dry-run` never block.
+- README documents the recommended policy in plain language: Better
+  performance with "Enable write caching on the device" CHECKED (the
+  measured win; rerun-repair plus Safely Remove covers its loss window) and
+  "Turn off Windows write-cache buffer flushing" UNCHECKED (it suppresses
+  the flushes NTFS journaling needs — power loss can corrupt the
+  filesystem itself, beyond any re-run's ability to repair, for marginal
+  extra speed).
+
 ### Known pre-1.0 work
 
 - IOCP/no-buffering engine and its sans-I/O model, comprehensive fault/chaos

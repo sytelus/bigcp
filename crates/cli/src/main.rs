@@ -203,6 +203,10 @@ fn execute(cli: Cli) -> Result<u8, (u8, String)> {
             let destination = cli
                 .destination
                 .ok_or_else(|| (5, "copy requires SRC and DST; see --help".to_owned()))?;
+            warn_quick_removal_destination(
+                &destination,
+                stdout_is_terminal() && !cli.flags.plain && !cli.flags.quiet && !cli.flags.dry_run,
+            )?;
             let mut options = CopyOptions::new(source, destination);
             options.dry_run = cli.flags.dry_run;
             options.verify = cli.flags.verify;
@@ -361,6 +365,55 @@ fn exit_for_error(error: &bigcp_core::BigcpError) -> u8 {
         | bigcp_core::BigcpError::Invariant(_)
         | bigcp_core::BigcpError::Format(_) => 6,
     }
+}
+
+/// Warns — and in an interactive terminal, confirms — before copying onto a
+/// destination whose device write cache is disabled (the Quick-removal
+/// policy), which was measured at ~3.4x slower for metadata-heavy small-file
+/// workloads (BENCHMARKS.md 2026-07-29; ADR 0032). Detection failures stay
+/// silent, non-interactive runs only warn, and bigcp never changes the
+/// policy itself.
+fn warn_quick_removal_destination(
+    destination: &std::path::Path,
+    interactive: bool,
+) -> Result<(), (u8, String)> {
+    let mut probe = destination.to_path_buf();
+    let volume = loop {
+        match bigcp_win::probe_volume(&probe) {
+            Ok(volume) => break volume,
+            Err(_) => {
+                if !probe.pop() {
+                    return Ok(());
+                }
+            }
+        }
+    };
+    let device = bigcp_win::profile_device(&volume);
+    if device.write_cache_enabled != Some(false) {
+        return Ok(());
+    }
+    eprintln!(
+        "warning: the destination drive has write caching disabled (Windows 'Quick removal' \
+         policy).\n  Copies with many small files run several times slower this way (~3.4x \
+         measured).\n  To speed it up: Device Manager > the drive > Policies > 'Better \
+         performance', and check\n  'Enable write caching on the device'. Leave 'Turn off \
+         Windows write-cache buffer flushing'\n  UNCHECKED — that setting risks filesystem \
+         corruption on power loss, which a re-run cannot\n  repair. With caching on, always \
+         use Safely Remove Hardware before unplugging."
+    );
+    if interactive {
+        eprint!("Continue with the current policy? [Y/n] ");
+        let mut answer = String::new();
+        if std::io::stdin().read_line(&mut answer).is_ok()
+            && answer.trim_start().to_ascii_lowercase().starts_with('n')
+        {
+            return Err((
+                5,
+                "aborted before any copying: adjust the drive policy and run again".to_owned(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
