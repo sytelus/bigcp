@@ -94,6 +94,7 @@ pub fn copy_file(
     counters: &mut Counters,
     mut journal: Option<&mut Journal>,
 ) -> Result<EngineResult, OperationError> {
+    let timer = std::time::Instant::now();
     let mut source = SourceFile::open(request.source_path)
         .map_err(|error| source_open_error("open_src", request.relative_path, &error))?;
     ensure_source_unchanged(
@@ -102,13 +103,16 @@ pub fn copy_file(
         request.relative_path,
         "open_src",
     )?;
+    crate::phase::record(0, timer.elapsed());
 
     let discovered_streams;
     let streams = if let Some(streams) = request.known_streams {
         streams
     } else {
+        let timer = std::time::Instant::now();
         discovered_streams = list_streams(request.source_path)
             .map_err(|error| source_open_error("list_streams", request.relative_path, &error))?;
+        crate::phase::record(1, timer.elapsed());
         &discovered_streams
     };
     let largest_stream = streams
@@ -432,9 +436,11 @@ fn copy_small(
             error.to_string(),
         )
     })?;
+    let timer = std::time::Instant::now();
     source
         .read_to_end(&mut bytes)
         .map_err(|error| operation_error("read", request.relative_path, &error))?;
+    crate::phase::record(2, timer.elapsed());
     counters.bytes_read_source = counters
         .bytes_read_source
         .saturating_add(bytes.len() as u64);
@@ -457,22 +463,28 @@ fn copy_small(
     // it. Routing guarantees every stream here is below the large and
     // checkpoint thresholds, so no journal interplay exists on this path.
     let replace = request.replacement_snapshot.is_some();
+    let timer = std::time::Instant::now();
     let destination = create_final(request, replace)?;
+    crate::phase::record(3, timer.elapsed());
     let efs_downgraded =
         wants_encryption(request) && !destination.basic_attributes().is_ok_and(is_encrypted);
     let mut destination = destination;
+    let timer = std::time::Instant::now();
     destination
         .write_all(&bytes)
         .map_err(|error| operation_error("write", request.relative_path, &error))?;
+    crate::phase::record(4, timer.elapsed());
     counters.bytes_written_destination = counters
         .bytes_written_destination
         .saturating_add(bytes.len() as u64);
     let named = copy_named_streams_direct(request, counters, &destination, streams)?;
     let eas_dropped = copy_eas_direct(request, &destination, extended_attributes)?;
     post_read_validate(request, source)?;
+    let timer = std::time::Instant::now();
     destination
         .finish(request.source_snapshot.metadata.basic, request.flush)
         .map_err(|error| operation_error("set_meta", request.relative_path, &error))?;
+    crate::phase::record(5, timer.elapsed());
     Ok(EngineResult {
         bytes: (bytes.len() as u64).saturating_add(named.bytes),
         digest: should_hash.then(|| digest_bytes(&bytes)),

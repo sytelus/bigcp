@@ -14,6 +14,7 @@ pub mod error;
 pub mod journal;
 pub mod model;
 pub mod options;
+pub mod phase;
 pub mod report;
 pub mod stats;
 pub mod verify;

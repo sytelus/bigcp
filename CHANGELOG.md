@@ -215,6 +215,16 @@ versioning once its 1.0 release gates are complete.
   PLAN §8.7 and remains open. README and LIMITATIONS state the new
   contract in plain user language.
 
+### 2026-07-29 phase instrumentation and gap analysis
+
+- Added process-wide per-phase timing accumulators (`core::phase`);
+  `--analyze` runs emit a `phase_timing` log event and status line showing
+  where worker time went. First capture: destination creation is 72 % of
+  all small-file worker time (~2.5 ms/file); the GENERIC_READ-on-create
+  hypothesis was tested and falsified (handle is now write-only regardless
+  — least access). Analysis, environmental-noise caveat, and ranked
+  remaining levers (binary signing first) recorded in BENCHMARKS.md.
+
 ### Known pre-1.0 work
 
 - IOCP/no-buffering engine and its sans-I/O model, comprehensive fault/chaos

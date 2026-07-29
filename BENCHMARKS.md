@@ -88,6 +88,42 @@ decouples buffering from destination strategy so streaming also writes direct
 below the checkpoint threshold. Worker-count sweep (16/32/64) was flat within
 noise — the automatic default stands.
 
+## 2026-07-29 systematic gap analysis (phase instrumentation)
+
+`--analyze` runs now emit a `phase_timing` log line: per-phase worker-time
+totals from process-wide atomic accumulators in the engine. First capture
+(20,000 × 4 KiB, 64 workers, ~18 s wall ≈ 70 worker-seconds):
+
+| Phase | Total | Mean/file |
+|---|---|---|
+| create_dst | **50.2 s (72 %)** | **2,509 µs** |
+| set_meta | 8.3 s | 413 µs |
+| write | 4.2 s | 211 µs |
+| open_src | 4.1 s | 206 µs |
+| list_streams | 1.9 s | 93 µs |
+| read | 1.3 s | 66 µs |
+
+**Destination creation is the entire remaining story.** A/B test of the
+leading hypothesis — that requesting `GENERIC_READ` on the create routed
+files through the AV pre-read scan path — *falsified it*: write-only access
+left create_dst at 2,479 µs (the write-only handle is kept anyway — least
+access). With a single worker the whole per-file cost is ~2.4 ms, so the
+64-worker create mean of ~2.5 ms means the filter largely serializes
+concurrent creates. The same session showed robocopy `/MT:32` itself
+swinging 11.2 → 17.0 s across hours (±40 % environmental drift — Defender
+state), so single-run ratios are unreliable; the ≥1× gate must be judged by
+the median-of-≥5 protocol below.
+
+Ranked remaining levers (none is a code loop to optimize): (1) **binary
+signing** — Defender treats unknown unsigned executables to heavier
+synchronous evaluation than signed ones (robocopy is Microsoft-signed);
+this is a release/packaging action and the top candidate for the residual
+create cost; (2) measuring the certified gate on a quiet machine with the
+repetition protocol; (3) user-side environment guidance already in the
+Hints tab (Dev Drive / temporary Defender exclusion — bigcp never changes
+AV settings itself). Filter-visible operations per file are already at the
+direct-copy minimum (one create, one close, no rename).
+
 ## Outstanding
 
 The elevated ReFS matrix and the repeated-run certified benchmark protocol

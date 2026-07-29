@@ -228,6 +228,14 @@ pub fn run_copy(
         runner.audit.emit(&AuditEvent::Analysis {
             analysis: summary.clone(),
         })?;
+        // Engine phase-time breakdown — the debugging aid behind the
+        // meet-or-exceed-robocopy gate (§8.7): where each worker-second went.
+        runner.audit.emit(&AuditEvent::Warning {
+            kind: "phase_timing".to_owned(),
+            rel: None,
+            message: crate::phase::summary(),
+        })?;
+        runner.observer.on_message(&crate::phase::summary());
     }
 
     // An invariant breach must not abort before the report exists: the report
