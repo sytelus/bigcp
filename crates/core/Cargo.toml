@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-bigcp-win = { path = "../win", version = "0.2.0" }
+bigcp-win = { path = "../win", version = "0.2.1" }
 crc32c.workspace = true
 crossbeam-channel.workspace = true
 hex.workspace = true
@@ -20,7 +20,7 @@ uuid.workspace = true
 xxhash-rust.workspace = true
 
 [dev-dependencies]
-bigcp-testkit = { path = "../testkit", version = "0.2.0" }
+bigcp-testkit = { path = "../testkit", version = "0.2.1" }
 tempfile.workspace = true
 
 [lints]

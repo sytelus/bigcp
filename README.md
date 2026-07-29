@@ -7,9 +7,10 @@ promise is the one that matters: **when a run completes, every reported
 success and failure is exactly true.** If a run is interrupted, re-running it
 detects and repairs everything unfinished — including partial files an
 interruption may leave at their final names (small files write directly for
-speed; their timestamps are stamped only after the last byte, so a partial
-can never be mistaken for a finished copy). Very large files still go through
-opaque temporaries so resumed partials are verified, never trusted.
+speed; because each is truncated when created, an interrupted partial is
+always shorter than its source and can never be mistaken for a finished
+copy). Very large files still go through opaque temporaries so resumed
+partials are verified, never trusted.
 
 The repository is currently **pre-1.0**. The bounded reference implementation
 and safe routine suites are operational; the IOCP transport and dedicated
@@ -161,8 +162,9 @@ repairs it, but only after the drive is reconnected.
 - **A run was interrupted — can I trust the destination?** Not until a rerun
   completes. Small files write directly to their final names for speed, so an
   interruption can leave partial files there. They can never be mistaken for
-  finished copies (their timestamps are only stamped after the last byte),
-  and re-running the same command finds and replaces every one of them.
+  finished copies (each file is truncated at creation, so a partial is always
+  shorter than its source), and re-running the same command finds and
+  replaces every one of them.
 - **Why is a second run on the same destination refused?** One run per exact
   destination root per machine, by design (run lock).
 - **Why NTFS/ReFS only, local volumes only?** See LIMITATIONS.md — the
