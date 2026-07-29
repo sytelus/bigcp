@@ -73,15 +73,17 @@ struct CopyFlags {
     #[arg(long)]
     skip_cloud: bool,
 
-    /// Replace differing destination files.
+    /// Replace differing destination files (default true).
+    ///
+    /// `Option` so subcommand rejection can see an *explicit* `--replace=true`
+    /// too, not only `--replace=false`.
     #[arg(
         long,
-        default_value_t = true,
         num_args = 0..=1,
         default_missing_value = "true",
         require_equals = true
     )]
-    replace: bool,
+    replace: Option<bool>,
 
     /// Flush each committed file after rename and metadata.
     #[arg(long)]
@@ -95,6 +97,11 @@ struct CopyFlags {
     #[arg(long)]
     no_unbuffered: bool,
 
+    /// Collect bounded live-run insight (size-class timings, slowest files,
+    /// finer stat samples) into the log and report.
+    #[arg(long)]
+    analyze: bool,
+
     /// Copy unknown reparse buffers verbatim at the user's risk.
     #[arg(long)]
     raw_reparse: bool,
@@ -103,12 +110,13 @@ struct CopyFlags {
     #[arg(long)]
     fresh: bool,
 
-    /// Force a source profile, optionally followed by a destination profile.
-    #[arg(long, value_parser = parse_profiles)]
+    /// Device class (auto|nvme|sata-ssd|usb-ssd|hdd|unknown), or "SRC,DST".
+    #[arg(long, value_parser = parse_profiles, value_name = "CLASS[,CLASS]")]
     profile: Option<(DeviceClass, DeviceClass)>,
 
-    /// Advanced comma-separated key=value overrides.
-    #[arg(long, value_parser = parse_tune)]
+    /// Comma-separated overrides: qd-src, qd-dst, chunk, streams, threads,
+    /// mem, large-threshold, checkpoint-threshold (sizes accept KiB/MiB/GiB).
+    #[arg(long, value_parser = parse_tune, value_name = "KEY=VALUE,...")]
     tune: Option<TuneOptions>,
 
     /// Override state directory.
@@ -137,7 +145,26 @@ struct CopyFlags {
 }
 
 fn main() -> ExitCode {
-    match execute(Cli::parse()) {
+    // clap's default usage-error exit code is 2, which collides with the
+    // contract's "completed with failures" (PLAN section 10.1). Help/version
+    // exit 0; every usage or value-parse failure exits 5, so scripts can
+    // trust that 2 always means a real run finished with failed objects.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            let code = if matches!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) {
+                0
+            } else {
+                5
+            };
+            let _ = error.print();
+            return ExitCode::from(code);
+        }
+    };
+    match execute(cli) {
         Ok(code) => ExitCode::from(code),
         Err((code, message)) => {
             eprintln!("bigcp: {message}");
@@ -186,10 +213,11 @@ fn execute(cli: Cli) -> Result<u8, (u8, String)> {
             options.verify = cli.flags.verify;
             options.include_system = cli.flags.include_system;
             options.skip_cloud = cli.flags.skip_cloud;
-            options.replace = cli.flags.replace;
+            options.replace = cli.flags.replace.unwrap_or(true);
             options.flush = cli.flags.flush;
             options.no_sparse = cli.flags.no_sparse;
             options.no_unbuffered = cli.flags.no_unbuffered;
+            options.analyze = cli.flags.analyze;
             options.raw_reparse = cli.flags.raw_reparse;
             options.fresh = cli.flags.fresh;
             options.state_dir = cli.flags.state_dir;
@@ -201,7 +229,10 @@ fn execute(cli: Cli) -> Result<u8, (u8, String)> {
                 options.destination_profile = destination_profile;
             }
 
-            let report = if cli.flags.plain || cli.flags.no_color || !stdout_is_terminal() {
+            // Honor the NO_COLOR convention alongside --no-color (PLAN §11).
+            let no_color = cli.flags.no_color
+                || std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
+            let report = if cli.flags.plain || no_color || !stdout_is_terminal() {
                 let observer = PlainObserver::new(cli.flags.quiet);
                 run_copy(&options, &observer)
             } else {
@@ -219,10 +250,11 @@ fn reject_copy_only_flags(flags: &CopyFlags) -> Result<(), (u8, String)> {
         || flags.verify
         || flags.include_system
         || flags.skip_cloud
-        || !flags.replace
+        || flags.replace.is_some()
         || flags.flush
         || flags.no_sparse
         || flags.no_unbuffered
+        || flags.analyze
         || flags.raw_reparse
         || flags.fresh
         || flags.profile.is_some()

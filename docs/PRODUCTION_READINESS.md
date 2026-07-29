@@ -18,21 +18,31 @@ by the frozen plan.
 - File, directory, ADS, EA, sparse-data, symlink, junction, rerun, dry-run,
   cancellation, report-fallback, and both verification paths.
 - Exact terminal counter reconciliation and a durably synchronized `run_end`.
-- Structurally confined, budgeted tests under a new validated C: temporary root;
-  F:, G:, and H: are rejected before filesystem access.
+- Structurally confined, budgeted tests under a new validated temporary root
+  on a whitelisted drive; only the system drive and the code-checkout drive
+  are permitted, and everything else is rejected before filesystem access.
 - Formatting, warning-free Clippy, unit/integration/doc tests, locked release
-  builds, schema checks, dependency policy, and vulnerability audit.
+  builds, schema parse/version checks (full emitted-instance validation is
+  release work), dependency policy, and vulnerability audit.
 
 ## Release-blocking evidence still required
 
+All within the VISION prohibitions (no large-scale trees, no very-long runs, no
+lifespan-reducing writes, no machine-stability impact — see PLAN §12.0):
+
 - Sans-I/O and injected-fault coverage for every completion and Win32 fault
-  site, followed by 30-minute and eight-hour chaos runs.
-- Disposable VHDX coverage for NTFS and ReFS, including elevated publication,
-  crash recovery, low-space, and filesystem-specific capability probes.
-- Million-entry, 20 GiB, differential OS-copy, and topology-matched performance
-  suites on explicitly designated scratch storage.
-- Real hardware/controller coverage and the remaining scheduler, breaker,
-  restart-manager, and full TUI work listed in `PLAN_DEVIATIONS.md`.
+  site, exhaustive **deterministic kill-point simulation**, and bounded
+  (minutes-scale) real-process chaos passes.
+- Disposable VHDX coverage for NTFS and ReFS using **graceful operations only**
+  (create, mount, test, clean dismount of test-owned virtual disks), including
+  elevated publication, low-space, and capability probes. Device-loss behavior
+  is validated by fault injection only — never by forced detach of any kind.
+- **Bounded** workloads (W1s/W2s-class), differential OS-copy comparison, and
+  topology-matched performance runs on scratch-designated storage;
+  million-entry behavior via synthetic enumeration simulation, never real trees.
+- Real hardware/controller coverage within bounded write budgets, and the
+  remaining scheduler, breaker, restart-manager, and full TUI work listed in
+  PLAN §13.2 / `PLAN_DEVIATIONS.md`.
 
 No release process may reinterpret an unrun gate as a pass. `TESTING_SUMMARY.md`
 records dated evidence; `PLAN_DEVIATIONS.md` is the authoritative list of known

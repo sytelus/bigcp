@@ -11,9 +11,8 @@ use bigcp_win::{
 use uuid::Uuid;
 
 const MARKER: &str = ".bigcp-test-sandbox";
-const FORBIDDEN_TEST_DRIVES: [char; 3] = ['F', 'G', 'H'];
 
-/// Validated sandbox root that cannot represent F:, G:, or H:.
+/// Validated sandbox root confined to a whitelisted drive.
 #[derive(Clone, Debug)]
 pub struct SandboxRoot {
     root: PathBuf,
@@ -29,8 +28,16 @@ impl SandboxRoot {
         if metadata.kind != ObjectKind::Directory {
             bail!("sandbox root is not a real directory");
         }
-        if !root.join(MARKER).is_file() {
-            bail!("sandbox marker is missing; create an isolated sandbox with testkit init first");
+        // `metadata_at` reports the marker itself (non-following), so a
+        // symlinked or reparse-point "marker" cannot satisfy the check.
+        match metadata_at(&root.join(MARKER)) {
+            Ok(marker) if marker.kind == ObjectKind::File => {}
+            _ => {
+                bail!(
+                    "sandbox marker is missing or not a plain file; create an isolated sandbox \
+                     with testkit init first"
+                );
+            }
         }
         validate_depth(&root)?;
         Ok(Self { root })
@@ -38,8 +45,8 @@ impl SandboxRoot {
 
     /// Creates one fresh sandbox under the system temporary directory.
     ///
-    /// The method refuses to run if the system temporary directory resolves to
-    /// F:, G:, or H:.
+    /// The method refuses to run if the system temporary directory resolves
+    /// outside the whitelisted drives (see [`allowed_test_drives`]).
     pub fn create_system_temp(label: &str) -> Result<Self> {
         let base = validated_system_temp()?;
         let safe_label = label
@@ -107,17 +114,62 @@ impl SandboxRoot {
     }
 }
 
-fn validate_drive(path: &Path) -> Result<()> {
+/// Extracts the drive letter of a plain or `\\?\`-prefixed drive path.
+fn drive_letter(path: &Path) -> Option<char> {
     let display = path.to_string_lossy();
     let bytes = display.as_bytes();
-    let drive_index = if display.starts_with(r"\\?\") { 4 } else { 0 };
-    if bytes.len() > drive_index + 1 && bytes[drive_index + 1] == b':' {
-        let drive = (bytes[drive_index] as char).to_ascii_uppercase();
-        if FORBIDDEN_TEST_DRIVES.contains(&drive) {
-            bail!("tests are forbidden on external drive {drive}:");
+    let start = if display.starts_with(r"\\?\") { 4 } else { 0 };
+    if bytes.len() > start + 1 && bytes[start + 1] == b':' {
+        let letter = (bytes[start] as char).to_ascii_uppercase();
+        if letter.is_ascii_uppercase() {
+            return Some(letter);
         }
     }
-    Ok(())
+    None
+}
+
+/// Drives tests may touch: the Windows system drive plus the drive holding
+/// the running binary (the code checkout's build output). Every other drive
+/// letter — and every path without one, such as UNC or volume-GUID paths —
+/// is rejected before any filesystem access.
+#[must_use]
+pub fn allowed_test_drives() -> Vec<char> {
+    let mut allowed = Vec::new();
+    if let Some(system) = std::env::var_os("SystemDrive")
+        && let Some(letter) = drive_letter(Path::new(&system))
+    {
+        allowed.push(letter);
+    }
+    if allowed.is_empty() {
+        // SystemDrive is set on every supported Windows; stay usable if a
+        // stripped environment omits it rather than allowing nothing.
+        allowed.push('C');
+    }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(letter) = drive_letter(&exe)
+        && !allowed.contains(&letter)
+    {
+        allowed.push(letter);
+    }
+    allowed
+}
+
+fn validate_drive(path: &Path) -> Result<()> {
+    let allowed = allowed_test_drives();
+    match drive_letter(path) {
+        Some(drive) if allowed.contains(&drive) => Ok(()),
+        Some(drive) => {
+            let list = allowed
+                .iter()
+                .map(|letter| format!("{letter}:"))
+                .collect::<Vec<_>>()
+                .join(" and ");
+            bail!(
+                "tests are confined to the system and code drives ({list}); {drive}: is not whitelisted"
+            );
+        }
+        None => bail!("tests require a drive-letter path on the system or code drive"),
+    }
 }
 
 fn validate_depth(path: &Path) -> Result<()> {
@@ -183,16 +235,36 @@ pub fn io_other(message: impl Into<String>) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{SandboxRoot, initialize_empty, validated_system_temp};
+    use super::{SandboxRoot, allowed_test_drives, initialize_empty, validated_system_temp};
     use std::fs;
     use std::os::windows::fs::symlink_file;
     use std::path::Path;
 
     #[test]
-    fn forbidden_external_drives_are_rejected_before_access() {
-        for drive in ["F:", "G:", "H:"] {
-            let path = format!(r"{drive}\bigcp-must-not-touch");
-            assert!(initialize_empty(Path::new(&path)).is_err());
+    fn non_whitelisted_drives_are_rejected_before_access() {
+        let allowed = allowed_test_drives();
+        assert!(!allowed.is_empty());
+        assert!(allowed.len() <= 2, "whitelist is system + code drive only");
+        // Every drive letter outside the whitelist must be rejected. The
+        // paths are inert values: rejection happens before any access.
+        for letter in ('A'..='Z').filter(|letter| !allowed.contains(letter)) {
+            let path = format!(r"{letter}:\bigcp-must-not-touch");
+            assert!(
+                initialize_empty(Path::new(&path)).is_err(),
+                "{letter}: must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn paths_without_a_drive_letter_are_rejected() {
+        // UNC and volume-GUID forms carry no whitelisted drive letter; the
+        // inert values below are rejected before any network or disk access.
+        for path in [
+            r"\\server\share\bigcp-must-not-touch",
+            r"\\?\Volume{00000000-0000-0000-0000-000000000000}\x",
+        ] {
+            assert!(initialize_empty(Path::new(path)).is_err());
         }
     }
 

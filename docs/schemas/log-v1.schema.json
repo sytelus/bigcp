@@ -3,55 +3,233 @@
   "$id": "https://github.com/shitals/bigcp/docs/schemas/log-v1.schema.json",
   "title": "bigcp JSONL audit event v1",
   "type": "object",
-  "required": ["ts", "ev"],
+  "required": [
+    "ts",
+    "ev"
+  ],
   "properties": {
-    "ts": { "type": "string", "format": "date-time" },
-    "ev": {
-      "enum": ["run_start", "profile", "directory", "file", "error", "extra", "warning", "stat", "run_end"]
+    "ts": {
+      "type": "string",
+      "format": "date-time"
     },
-    "v": { "const": 1 },
-    "run_id": { "type": "string", "minLength": 1 },
-    "action": { "type": "string" },
-    "size": { "type": "integer", "minimum": 0 },
-    "hash": { "type": "string" },
-    "exit": { "type": "integer" }
+    "ev": {
+      "enum": [
+        "run_start",
+        "profile",
+        "directory",
+        "file",
+        "error",
+        "extra",
+        "warning",
+        "stat",
+        "run_end",
+        "analysis"
+      ]
+    },
+    "v": {
+      "const": 1
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "action": {
+      "type": "string"
+    },
+    "size": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "hash": {
+      "type": "string"
+    },
+    "exit": {
+      "type": "integer"
+    },
+    "analysis": {
+      "type": "object",
+      "description": "Bounded --analyze insight: size-class aggregates plus slowest-copy samples (one event per run).",
+      "required": [
+        "size_classes",
+        "slowest_files"
+      ],
+      "properties": {
+        "size_classes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "label",
+              "files",
+              "bytes",
+              "seconds"
+            ]
+          }
+        },
+        "slowest_files": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "type": "object",
+            "required": [
+              "relative_path",
+              "bytes",
+              "seconds",
+              "mbps"
+            ]
+          }
+        }
+      }
+    }
   },
   "allOf": [
     {
-      "if": { "properties": { "ev": { "const": "run_start" } } },
-      "then": { "required": ["v", "run_id", "source", "destination", "dry_run", "verify", "replace"] }
+      "if": {
+        "properties": {
+          "ev": {
+            "const": "run_start"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "v",
+          "run_id",
+          "source",
+          "destination",
+          "dry_run",
+          "verify",
+          "replace"
+        ]
+      }
     },
     {
-      "if": { "properties": { "ev": { "const": "profile" } } },
-      "then": { "required": ["source_class", "destination_class", "qd_source", "qd_destination", "chunk_bytes", "streams", "workers"] }
+      "if": {
+        "properties": {
+          "ev": {
+            "const": "profile"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "source_class",
+          "destination_class",
+          "qd_source",
+          "qd_destination",
+          "chunk_bytes",
+          "streams",
+          "workers"
+        ]
+      }
     },
     {
-      "if": { "properties": { "ev": { "const": "directory" } } },
-      "then": { "required": ["action", "rel"] }
+      "if": {
+        "properties": {
+          "ev": {
+            "const": "directory"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "action",
+          "rel"
+        ]
+      }
     },
     {
-      "if": { "properties": { "ev": { "const": "file" } } },
-      "then": { "required": ["action", "rel", "size"] }
+      "if": {
+        "properties": {
+          "ev": {
+            "const": "file"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "action",
+          "rel",
+          "size"
+        ]
+      }
     },
     {
-      "if": { "properties": { "ev": { "const": "error" } } },
-      "then": { "required": ["error"] }
+      "if": {
+        "properties": {
+          "ev": {
+            "const": "error"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "error"
+        ]
+      }
     },
     {
-      "if": { "properties": { "ev": { "const": "extra" } } },
-      "then": { "required": ["rel"] }
+      "if": {
+        "properties": {
+          "ev": {
+            "const": "extra"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "rel"
+        ]
+      }
     },
     {
-      "if": { "properties": { "ev": { "const": "warning" } } },
-      "then": { "required": ["kind", "message"] }
+      "if": {
+        "properties": {
+          "ev": {
+            "const": "warning"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "kind",
+          "message"
+        ]
+      }
     },
     {
-      "if": { "properties": { "ev": { "const": "stat" } } },
-      "then": { "required": ["counters", "read_mbps", "write_mbps"] }
+      "if": {
+        "properties": {
+          "ev": {
+            "const": "stat"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "counters",
+          "read_mbps",
+          "write_mbps"
+        ]
+      }
     },
     {
-      "if": { "properties": { "ev": { "const": "run_end" } } },
-      "then": { "required": ["counters", "durability", "audit", "integrity", "exit"] }
+      "if": {
+        "properties": {
+          "ev": {
+            "const": "run_end"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "counters",
+          "durability",
+          "audit",
+          "integrity",
+          "exit"
+        ]
+      }
     }
   ],
   "additionalProperties": true

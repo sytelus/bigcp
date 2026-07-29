@@ -1,7 +1,10 @@
 # Error categories
 
-This table mirrors `crates/core/src/error.rs`; code changes and this generated
-reference must remain synchronized.
+This table is a hand-maintained mirror of `crates/core/src/error.rs` (no
+generator exists yet — PLAN §14.1's generated form is release work); any change
+to the code table must update this file in the same commit. The `fs_limit`
+category is currently reserved: on NTFS/ReFS-only volumes no shipped path
+produces it, and capability shortfalls surface as warnings instead.
 
 | Category | Typical condition | Resolution hint |
 |---|---|---|

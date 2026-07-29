@@ -27,3 +27,9 @@ pub(crate) fn bool_result(result: i32) -> io::Result<()> {
         Ok(())
     }
 }
+
+/// Returns a structure size as the `u32` DeviceIoControl expects.
+pub(crate) fn size_u32<T>() -> io::Result<u32> {
+    u32::try_from(size_of::<T>())
+        .map_err(|_| io::Error::other("Win32 structure size does not fit u32"))
+}

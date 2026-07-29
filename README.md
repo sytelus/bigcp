@@ -85,10 +85,13 @@ xxh3-128 digest agrees.
 | `--fresh` | Ignore prior partial checkpoints. |
 | `--profile CLASS[,CLASS]` | Force static source/destination device classes. |
 | `--tune key=value,...` | Override bounded advanced settings. |
+| `--analyze` | Collect bounded live-run insight (size-class timings, top-20 slowest copies, finer stat samples) into the log and report. |
+| `--no-unbuffered` | Reserved: pre-1.0 streaming is already buffered, so this currently changes nothing (PLAN §13.2). |
 | `--state-dir`, `--log`, `--report` | Select audit locations outside both trees. |
 | `--plain`, `--quiet`, `--no-color` | Select noninteractive output behavior. |
 
-Run `bigcp --help` for accepted classes and syntax. Advanced tune keys are
+Accepted profile classes are `auto`, `nvme`, `sata-ssd`, `usb-ssd`, `hdd`, and
+`unknown` (the conservative fallback profile). Advanced tune keys are
 `qd-src`, `qd-dst`, `chunk`, `streams`, `threads`, `mem`,
 `large-threshold`, and `checkpoint-threshold`; byte sizes accept `KiB`, `MiB`,
 or `GiB`.
@@ -121,7 +124,33 @@ See [LIMITATIONS.md](LIMITATIONS.md) and the normative
 
 Safe test instructions and exact write budgets are in
 [docs/TESTING.md](docs/TESTING.md). Never use unsafe removal as a routine test;
-it can corrupt a volume. Device-loss behavior belongs in simulation or a
-sandbox-contained disposable VHDX.
+it can corrupt a volume. Device-loss behavior belongs in fault-injection
+simulation only — forced disconnects, physical or virtual, are never performed.
+
+## Removing a drive after a copy
+
+By default a completed run guarantees *logical* completion: recently written
+data can still sit in the OS or drive cache. Either run with `--flush`
+(per-file flush after rename and metadata) or use Windows "Safely Remove
+Hardware" before unplugging an external destination. Unplugging without
+either can lose the tail of an otherwise successful copy; a rerun detects and
+repairs it, but only after the drive is reconnected.
+
+## FAQ
+
+- **Why was my file "skipped"?** Its destination twin matched on size, exact
+  last-write time, attributes, and EA size. Run `bigcp verify SRC DST` for a
+  full content comparison.
+- **Why did a rerun recopy a file I saw complete?** The run was interrupted
+  after data landed but before metadata; the mismatch makes the rerun replace
+  it with a fully finished copy. That is the crash-safety design working.
+- **What are `.bigcp-…part` files?** Opaque in-flight temps. In-process kills
+  remove them automatically; a resumable large-file partial persists on
+  purpose and is verified before reuse. Anything the journal cannot prove
+  bigcp created is reported, never auto-deleted.
+- **Why is a second run on the same destination refused?** One run per exact
+  destination root per machine, by design (run lock).
+- **Why NTFS/ReFS only, local volumes only?** See LIMITATIONS.md — the
+  restriction buys exact timestamps, stable file IDs, and atomic replaces.
 
 Licensed under either Apache-2.0 or MIT, at your option.

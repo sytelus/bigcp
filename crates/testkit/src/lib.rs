@@ -5,10 +5,12 @@
 
 #![deny(missing_docs, unsafe_code)]
 
+pub mod extents;
 pub mod generator;
 pub mod oracle;
 pub mod sandbox;
 
-pub use generator::{GenerationReport, Scenario, generate};
+pub use extents::{ExtentReport, measure_extents};
+pub use generator::{GenerationReport, HEAVY_TESTS_ENV, Scenario, generate, heavy_tests_enabled};
 pub use oracle::{CheckReport, check_trees};
-pub use sandbox::SandboxRoot;
+pub use sandbox::{SandboxRoot, allowed_test_drives};

@@ -78,7 +78,7 @@ fn copy_rerun_and_both_verification_forms_converge() -> Result<(), Box<dyn std::
     drop(alternate);
 
     let sparse_path = source.join("sparse.bin");
-    let mut sparse = DestinationTemp::create(&source, "fixture")?;
+    let mut sparse = DestinationTemp::create(&source, "fixture", false)?;
     sparse.mark_sparse()?;
     sparse.set_len(4 * 1024 * 1024)?;
     sparse.seek(SeekFrom::Start(3 * 1024 * 1024))?;
@@ -107,24 +107,20 @@ fn copy_rerun_and_both_verification_forms_converge() -> Result<(), Box<dyn std::
     options.tune.large_threshold = Some(4 * 1024 * 1024);
     options.tune.checkpoint_threshold = Some(1024 * 1024);
     let first = run_copy(&options, &SilentObserver)?;
+    // A clean run end compacts the journal to its job header (PLAN section
+    // 5.12): every checkpoint was retired by its PartDone, so nothing else
+    // survives. Checkpoint identity binding and live-checkpoint survival are
+    // pinned directly by the journal unit tests.
     let journal = fs::read_to_string(state.join("journal.jsonl"))?;
-    assert!(
-        journal
-            .lines()
-            .any(|line| line.contains("\"ev\":\"checkpoint\"")),
-        "a checkpoint-eligible file below the large-file threshold bypassed the coordinator"
+    let journal_lines: Vec<_> = journal.lines().collect();
+    assert_eq!(
+        journal_lines.len(),
+        1,
+        "clean run end must compact the journal to its job header: {journal_lines:?}"
     );
     assert!(
-        journal.lines().any(|line| {
-            serde_json::from_str::<serde_json::Value>(line)
-                .ok()
-                .is_some_and(|record| {
-                    record.get("ev").and_then(serde_json::Value::as_str) == Some("checkpoint")
-                        && record.get("temp_identity").is_some()
-                        && record.get("source_identity").is_some()
-                })
-        }),
-        "checkpoint did not bind both source and temporary identities"
+        journal_lines[0].contains("\"ev\":\"job\""),
+        "compacted journal must retain exactly the job header"
     );
     let destination_names = fs::read_dir(&destination)?
         .filter_map(Result::ok)
@@ -266,22 +262,30 @@ fn cancellation_accounts_every_directory_already_discovered()
     assert_eq!(report.counters.dirs_discovered, 1);
     assert_eq!(report.counters.dirs_failed, 1);
     assert!(report.counters.reconcile().is_ok());
+    // A clean cancel is not an error condition: the untraversed subtree is a
+    // warning with the path attached, and the error report stays empty so
+    // exit-3 runs keep meaningful error summaries (PLAN section 5.13).
+    assert!(
+        report.errors.is_empty(),
+        "clean cancellation polluted the error report: {:?}",
+        report.errors
+    );
+    assert!(report.warnings.contains_key("canceled_subtree"));
     let audit = fs::read_to_string(&report.run.log_path)?;
-    let has_complete_error = audit.lines().any(|line| {
+    let has_cancel_warning = audit.lines().any(|line| {
         serde_json::from_str::<serde_json::Value>(line)
             .ok()
             .is_some_and(|event| {
-                event.get("ev").and_then(serde_json::Value::as_str) == Some("error")
-                    && event
-                        .pointer("/error/operation")
-                        .and_then(serde_json::Value::as_str)
-                        == Some("cancel_before_enumerate")
-                    && event.pointer("/error/category").is_some()
-                    && event.pointer("/error/path").is_some()
-                    && event.pointer("/error/hint").is_some()
+                event.get("ev").and_then(serde_json::Value::as_str) == Some("warning")
+                    && event.get("kind").and_then(serde_json::Value::as_str)
+                        == Some("canceled_subtree")
+                    && event.pointer("/rel").is_some()
             })
     });
-    assert!(has_complete_error, "non-file failure was absent from JSONL");
+    assert!(
+        has_cancel_warning,
+        "canceled subtree was absent from the JSONL log"
+    );
     Ok(())
 }
 
@@ -472,4 +476,56 @@ fn relative_symbolic_links_are_recreated_as_links_when_available()
         verification.mismatches
     );
     Ok(())
+}
+
+#[test]
+fn analyze_flag_produces_bounded_insight() -> Result<(), Box<dyn std::error::Error>> {
+    let allowed_temp = validated_system_temp()?;
+    let lease = tempfile::Builder::new()
+        .prefix("bigcp-analyze-")
+        .tempdir_in(allowed_temp)?;
+    let sandbox = initialize_empty(lease.path())?;
+    let source = sandbox.child(Path::new("source"))?;
+    let destination = sandbox.child(Path::new("destination"))?;
+    let state = sandbox.child(Path::new("state"))?;
+    fs::create_dir(&source)?;
+    fs::write(source.join("tiny.txt"), b"tiny")?;
+    fs::write(source.join("bigger.bin"), vec![0x11_u8; 256 * 1024])?;
+
+    let mut options = CopyOptions::new(source, destination);
+    options.state_dir = Some(state);
+    options.analyze = true;
+    let report = run_copy(&options, &SilentObserver)?;
+    assert_eq!(report.run.exit, 0);
+    let analysis = report.analysis.as_ref();
+    assert!(analysis.is_some(), "--analyze must add a report section");
+    let Some(analysis) = analysis else {
+        return Ok(());
+    };
+    // Fixed five buckets, exactly the copied files distributed among them,
+    // and a bounded slowest table: the whole VISION contract for the flag.
+    assert_eq!(analysis.size_classes.len(), 5);
+    let bucket_files: u64 = analysis.size_classes.iter().map(|class| class.files).sum();
+    assert_eq!(bucket_files, report.counters.copied_new);
+    assert!(!analysis.slowest_files.is_empty());
+    assert!(analysis.slowest_files.len() <= 20);
+    let audit = fs::read_to_string(&report.run.log_path)?;
+    assert!(
+        audit
+            .lines()
+            .any(|line| line.contains("\"ev\":\"analysis\"")),
+        "one analysis event must land in the JSONL log"
+    );
+
+    // Without the flag the section and event must be absent (zero cost).
+    let plain = run_copy(&options_without_analyze(&options), &SilentObserver)?;
+    assert!(plain.analysis.is_none());
+    Ok(())
+}
+
+fn options_without_analyze(base: &CopyOptions) -> CopyOptions {
+    let mut options = base.clone();
+    options.analyze = false;
+    options.fresh = true;
+    options
 }

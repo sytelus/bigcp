@@ -16,5 +16,9 @@ Before proposing a change, answer in the description:
 - Are all tests inside validated new sandboxes, and are fresh writes bounded?
 - Have log/report format changes stayed additive within schema v1?
 
-Run the commands in `docs/TESTING.md`. Do not run tests on F:, G:, H:, user
-trees, real removable media, or raw physical devices.
+Run the commands in `docs/TESTING.md`. Tests may touch only the system drive
+and the drive holding the code checkout — never other drives, user trees, real
+removable media, or raw physical devices. Keep new tests in the routine
+correctness tier; performance, stress, many-file, or long-running tests are
+disabled by default and follow the opt-in and permission protocol in
+`docs/TESTING.md`.

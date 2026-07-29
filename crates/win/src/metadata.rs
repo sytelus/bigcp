@@ -61,7 +61,12 @@ pub enum ObjectKind {
 }
 
 /// Metadata collected from one opened object.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// Deliberately **not** `PartialEq`: `ea_size` is populated asymmetrically
+/// (authoritative from directory enumeration, always zero from handle
+/// queries), so whole-struct equality would misreport identical snapshots as
+/// different. Compare the specific fields a decision needs.
+#[derive(Clone, Debug)]
 pub struct ObjectMetadata {
     /// Stable object identity.
     pub identity: FileIdentity,
@@ -359,12 +364,6 @@ fn nonnegative_u64(value: i64, message: &'static str) -> io::Result<u64> {
 }
 
 /// Re-exports the last Win32 error for focused wrapper tests.
-#[doc(hidden)]
-#[must_use]
-pub fn metadata_last_error_for_test() -> io::Error {
-    last_error()
-}
-
 #[cfg(test)]
 mod tests {
     use super::{ObjectKind, enumerate_directory, metadata_at};

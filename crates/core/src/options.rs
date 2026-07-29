@@ -64,8 +64,13 @@ pub struct CopyOptions {
     pub flush: bool,
     /// Disable sparse-layout preservation.
     pub no_sparse: bool,
-    /// Disable unbuffered large-file I/O.
+    /// Reserved: accepted for grammar compatibility, but the pre-1.0 large
+    /// path is already buffered, so this currently changes nothing
+    /// (PLAN section 13.2).
     pub no_unbuffered: bool,
+    /// Collect bounded live-run insight (size-class timings, slowest files,
+    /// finer stat cadence) for later analysis — the VISION analysis flag.
+    pub analyze: bool,
     /// Permit unknown reparse buffers to be copied verbatim.
     pub raw_reparse: bool,
     /// Ignore prior journal checkpoints.
@@ -99,6 +104,7 @@ impl CopyOptions {
             flush: false,
             no_sparse: false,
             no_unbuffered: false,
+            analyze: false,
             raw_reparse: false,
             fresh: false,
             state_dir: None,

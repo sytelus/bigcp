@@ -19,7 +19,6 @@ use bigcp_win::{
     probe_volume, read_extended_attributes_checked, set_basic_at_checked,
     write_extended_attributes_checked,
 };
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -37,11 +36,16 @@ use crate::report::{
     BottleneckSummary, ErrorSummary, ExtraSummary, FolderSummary, Hint, PhaseSummary,
     ReplacementSample, ReplacementSummary, RunInfo, RunReport, top_level,
 };
-use crate::stats::StatsTracker;
+use crate::stats::{AnalysisCollector, StatsTracker};
 use crate::verify::{VerificationTarget, verify_written_targets};
 use crate::worker::{CompletedCopy, FileCopyJob, ReplacementWork, SmallFileWorkers};
 
 const REPORT_SAMPLE_LIMIT: usize = 100;
+/// Journal job signature. Checkpoints self-validate (temp identity + source
+/// size/mtime + prefix digest), so the signature pins only the resume
+/// protocol version — never user options, whose changes must not wipe
+/// another run's checkpoints.
+const RESUME_PROTOCOL_SIGNATURE: &str = "resume-protocol-v1";
 const SYSTEM_EXCLUSIONS: [&str; 6] = [
     "$RECYCLE.BIN",
     "System Volume Information",
@@ -81,7 +85,7 @@ pub fn run_copy(
         .join(format!("run-{run_id}-fallback.log.jsonl"));
     let mut audit = AuditWriter::create(preflight.log_path.clone(), fallback_log)?;
     audit.emit(&AuditEvent::RunStart {
-        v: 1,
+        v: crate::LOG_SCHEMA_VERSION,
         run_id: run_id.clone(),
         source: AuditPath::from_path(&preflight.source),
         destination: AuditPath::from_path(&preflight.destination),
@@ -100,32 +104,57 @@ pub fn run_copy(
         same_physical_disk: preflight.profile.same_physical_disk,
     })?;
 
-    let journal = match Journal::open(preflight.state_dir.join("journal.jsonl"), options.fresh) {
-        Ok(mut journal) => {
-            if let Err(error) = journal.begin_job(
-                run_id.clone(),
-                preflight.source.to_string_lossy().into_owned(),
-                preflight.destination.to_string_lossy().into_owned(),
-                value_hash(&option_summary(options))?,
-                started.clone(),
-            ) {
+    let journal = if options.dry_run {
+        // A dry-run must not disturb resume state: appending a Job record
+        // could invalidate another run's checkpoints, silently destroying a
+        // multi-hundred-GB resume the user was about to continue. The
+        // zero-destination-write promise extends to resume hints.
+        None
+    } else {
+        match Journal::open(preflight.state_dir.join("journal.jsonl"), options.fresh) {
+            Ok(mut journal) => {
+                if let Err(error) = journal.begin_job(
+                    run_id.clone(),
+                    path_key(&preflight.source),
+                    path_key(&preflight.destination),
+                    // Checkpoints self-validate (temp identity + source
+                    // size/mtime + prefix digest), so no user option can make
+                    // a stale checkpoint unsafe. The signature pins only the
+                    // resume protocol itself; hashing the full option summary
+                    // here used to wipe checkpoints whenever any flag (even
+                    // --verify) changed between runs.
+                    RESUME_PROTOCOL_SIGNATURE.to_owned(),
+                    started.clone(),
+                ) {
+                    audit.emit(&AuditEvent::Warning {
+                        kind: "checkpointing_disabled".to_owned(),
+                        rel: None,
+                        message: format!("journal job header could not be written: {error}"),
+                    })?;
+                    None
+                } else {
+                    if journal.skipped_records() > 0 {
+                        audit.emit(&AuditEvent::Warning {
+                            kind: "journal_records_skipped".to_owned(),
+                            rel: None,
+                            message: format!(
+                                "{} interior journal record(s) failed validation and were ignored \
+                                 (not truncated); affected resume hints fall back safely",
+                                journal.skipped_records()
+                            ),
+                        })?;
+                    }
+                    Some(journal)
+                }
+            }
+            Err(error) => {
                 audit.emit(&AuditEvent::Warning {
                     kind: "checkpointing_disabled".to_owned(),
                     rel: None,
-                    message: format!("journal job header could not be written: {error}"),
+                    message: format!("journal could not be opened: {error}"),
                 })?;
                 None
-            } else {
-                Some(journal)
             }
-        }
-        Err(error) => {
-            audit.emit(&AuditEvent::Warning {
-                kind: "checkpointing_disabled".to_owned(),
-                rel: None,
-                message: format!("journal could not be opened: {error}"),
-            })?;
-            None
         }
     };
 
@@ -163,6 +192,7 @@ pub fn run_copy(
         folders: BTreeMap::new(),
         verification_targets: Vec::new(),
         journal,
+        analysis: options.analyze.then(AnalysisCollector::default),
         canceled: false,
         small_workers,
         small_jobs_outstanding: 0,
@@ -187,23 +217,36 @@ pub fn run_copy(
     } else {
         None
     };
+    let analysis = runner.analysis.take().map(AnalysisCollector::finish);
+    if let Some(summary) = &analysis {
+        runner.audit.emit(&AuditEvent::Analysis {
+            analysis: summary.clone(),
+        })?;
+    }
 
-    let integrity = match runner
+    // An invariant breach must not abort before the report exists: the report
+    // and log carry `integrity: failed` so the user is told to trust the log
+    // over the summary (PLAN section 7.3), and the run still exits 6.
+    let (integrity, invariant_failure) = match runner
         .counters
         .reconcile()
         .and_then(|()| runner.reconcile_folders())
     {
-        Ok(()) => "ok".to_owned(),
+        Ok(()) => ("ok".to_owned(), None),
         Err(message) => {
             runner.audit.emit(&AuditEvent::Warning {
                 kind: "counter_invariant".to_owned(),
                 rel: None,
                 message: message.clone(),
             })?;
-            return Err(BigcpError::Invariant(message));
+            ("failed".to_owned(), Some(message))
         }
     };
-    let exit = completed_exit(runner.canceled, &runner.counters, verify.as_ref());
+    let exit = if invariant_failure.is_some() {
+        6
+    } else {
+        completed_exit(runner.canceled, &runner.counters, verify.as_ref())
+    };
     let journal_end_failed = runner.journal.as_mut().is_some_and(|journal| {
         journal
             .append(JournalEvent::End {
@@ -219,6 +262,18 @@ pub fn run_copy(
             message: "journal run-end marker could not be written".to_owned(),
         })?;
         runner.journal = None;
+    } else if let Some(journal) = runner.journal.as_mut()
+        && let Err(error) = journal.compact()
+    {
+        // Compaction is hygiene (bounded replay, section 5.12), never a
+        // correctness requirement — a failure is reported and the run stays
+        // successful.
+        runner.increment_warning("journal_compaction_failed");
+        runner.audit.emit(&AuditEvent::Warning {
+            kind: "journal_compaction_failed".to_owned(),
+            rel: None,
+            message: format!("journal could not be compacted after run end: {error}"),
+        })?;
     }
     let audit_status = if runner.audit.degraded() {
         "degraded"
@@ -290,6 +345,7 @@ pub fn run_copy(
         phases,
         bottleneck,
         hints,
+        analysis,
         verify,
         integrity,
     };
@@ -335,6 +391,9 @@ pub fn run_copy(
         exit: report.run.exit,
     })?;
     runner.audit.finish()?;
+    if let Some(message) = invariant_failure {
+        return Err(BigcpError::Invariant(message));
+    }
     Ok(report)
 }
 
@@ -360,6 +419,7 @@ struct Runner<'a> {
     folders: BTreeMap<String, FolderSummary>,
     verification_targets: Vec<VerificationTarget>,
     journal: Option<Journal>,
+    analysis: Option<AnalysisCollector>,
     canceled: bool,
     small_workers: SmallFileWorkers,
     small_jobs_outstanding: usize,
@@ -438,12 +498,17 @@ impl Runner<'_> {
                         self.counters.dirs_discovered =
                             self.counters.dirs_discovered.saturating_add(1);
                         self.counters.dirs_failed = self.counters.dirs_failed.saturating_add(1);
-                        self.record_error(OperationError::semantic(
-                            ErrorCategory::ParentDirFailed,
-                            "cancel_before_enumerate",
-                            relative,
-                            "directory was discovered but not traversed after cancellation",
-                        ))?;
+                        // A clean cancel is not an error condition: surface the
+                        // untraversed subtree as a warning so exit-3 runs keep
+                        // meaningful (empty) error summaries.
+                        self.increment_warning("canceled_subtree");
+                        self.audit.emit(&AuditEvent::Warning {
+                            kind: "canceled_subtree".to_owned(),
+                            rel: Some(AuditPath::from_path(&relative)),
+                            message:
+                                "directory was discovered but not traversed after cancellation"
+                                    .to_owned(),
+                        })?;
                     }
                 }
                 DirectoryTask::Exit {
@@ -511,6 +576,11 @@ impl Runner<'_> {
 
         for source_entry in source_entries {
             let child_relative = relative.join(&source_entry.name);
+            if source_entry.metadata.kind == ObjectKind::File {
+                // Discovery is counted here, once per seen entry, so the I6
+                // reconciliation can detect any later dropped outcome.
+                self.counters.note_file_discovered();
+            }
             let key = match ordinal_case_key(&source_entry.name) {
                 Ok(key) => key,
                 Err(error) => {
@@ -749,13 +819,28 @@ impl Runner<'_> {
                 return Ok(());
             }
         };
-        let stream_result = self.copy_directory_streams(
+        let stream_result = match self.copy_directory_streams(
             source,
             destination,
             relative,
             current_source_metadata.identity,
             expected_destination.identity,
-        );
+        ) {
+            Ok(0) => Ok(()),
+            Ok(dropped) => {
+                // Directory ADS drops get the same per-item log visibility as
+                // file-level drops — never a silent counter (section 4.2, I7).
+                self.audit.emit(&AuditEvent::Warning {
+                    kind: "streams_dropped".to_owned(),
+                    rel: Some(AuditPath::from_path(relative)),
+                    message: format!(
+                        "{dropped} directory named stream(s) dropped: destination volume lacks named-stream capability"
+                    ),
+                })?;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        };
         let auxiliary_result = if source_metadata.ea_size > 0 && !self.destination_supports_eas {
             self.increment_warning("ea_dropped");
             self.audit.emit(&AuditEvent::Warning {
@@ -858,7 +943,7 @@ impl Runner<'_> {
         relative: &Path,
         expected_source: bigcp_win::FileIdentity,
         expected_destination: bigcp_win::FileIdentity,
-    ) -> Result<(), OperationError> {
+    ) -> Result<u64, OperationError> {
         let streams = list_streams(source)
             .map_err(|error| source_access_error("list_dir_streams", relative, &error))?;
         let named: Vec<_> = streams
@@ -866,10 +951,11 @@ impl Runner<'_> {
             .filter(|stream| !stream.is_unnamed())
             .collect();
         if !self.destination_supports_streams {
-            for _ in named {
+            let dropped = named.len() as u64;
+            for _ in 0..dropped {
                 self.increment_warning("streams_dropped");
             }
-            return Ok(());
+            return Ok(dropped);
         }
         let mut buffer = vec![0_u8; self.chunk_bytes.clamp(64 * 1024, 8 * 1024 * 1024)];
         for stream in named {
@@ -937,7 +1023,7 @@ impl Runner<'_> {
                 .flush()
                 .map_err(|error| destination_access_error("flush_dir_stream", relative, &error))?;
         }
-        Ok(())
+        Ok(0)
     }
 
     fn handle_file(
@@ -950,17 +1036,8 @@ impl Runner<'_> {
             self.increment_warning("compressed_sources");
         }
         if is_cloud_placeholder(source.metadata.basic.attributes) {
-            if self.options.skip_cloud {
-                self.record_file(
-                    &relative,
-                    FileOutcome::Excluded {
-                        bytes: source.metadata.size,
-                        reason: "cloud_placeholder".to_owned(),
-                    },
-                    None,
-                )?;
-                return Ok(());
-            }
+            // `--skip-cloud` placeholders never reach this function:
+            // `exclusion_reason` already excluded them during enumeration.
             self.increment_warning("cloud_hydrated");
             self.audit.emit(&AuditEvent::Warning {
                 kind: "cloud_hydrated".to_owned(),
@@ -1037,11 +1114,21 @@ impl Runner<'_> {
                     Some((fields, destination_newer)),
                 )?;
             }
-            Classification::SkipDifferent { fields, .. } => {
+            Classification::SkipDifferent {
+                fields,
+                destination_newer,
+            } => {
+                let old = destination_snapshot
+                    .as_ref()
+                    .map(|snapshot| &snapshot.metadata);
                 self.record_file(
                     &relative,
                     FileOutcome::SkippedDifferent {
                         bytes: source.metadata.size,
+                        destination_newer,
+                        old_size: old.map_or(0, |metadata| metadata.size),
+                        old_mtime: old.map_or(0, |metadata| metadata.basic.last_write_time),
+                        old_attributes: old.map_or(0, |metadata| metadata.basic.attributes),
                     },
                     Some(fields),
                 )?;
@@ -1199,6 +1286,7 @@ impl Runner<'_> {
             destination_supports_encryption: self.destination_supports_encryption,
             known_streams: Some(&streams),
         };
+        let copy_started = Instant::now();
         let result = copy_file(&request, &mut counters, self.journal.as_mut());
         self.finish_copy(CompletedCopy {
             destination_path,
@@ -1208,6 +1296,7 @@ impl Runner<'_> {
             counters,
             result,
             logical_bytes,
+            seconds: copy_started.elapsed().as_secs_f64(),
         })
     }
 
@@ -1350,6 +1439,18 @@ impl Runner<'_> {
                 error,
             },
         };
+        if let Some(analysis) = self.analysis.as_mut()
+            && matches!(
+                outcome,
+                FileOutcome::CopiedNew { .. } | FileOutcome::CopiedReplaced { .. }
+            )
+        {
+            analysis.record(
+                &relative.to_string_lossy(),
+                completed.logical_bytes,
+                completed.seconds,
+            );
+        }
         self.record_file(relative, outcome, differences)
     }
 
@@ -1695,6 +1796,18 @@ impl Runner<'_> {
         self.counters.dirs_discovered = self.counters.dirs_discovered.saturating_add(1);
         self.counters.dirs_failed = self.counters.dirs_failed.saturating_add(1);
         self.record_error(error)?;
+        self.walk_subtree_not_attempted(source_root, relative_root)
+    }
+
+    /// Accounts every discoverable descendant of an already-failed directory
+    /// as not-attempted, without generating a per-descendant error: the one
+    /// recorded parent failure is the cause, and descendants inherit it
+    /// (PLAN section 5.13 `parent_dir_failed`).
+    fn walk_subtree_not_attempted(
+        &mut self,
+        source_root: &Path,
+        relative_root: &Path,
+    ) -> Result<(), BigcpError> {
         let mut directories = vec![(source_root.to_path_buf(), relative_root.to_path_buf())];
         while let Some((source, relative)) = directories.pop() {
             let Ok(entries) = enumerate_directory(&source) else {
@@ -1702,63 +1815,77 @@ impl Runner<'_> {
             };
             for entry in entries {
                 let child_relative = relative.join(&entry.name);
-                match entry.metadata.kind {
-                    ObjectKind::File => {
-                        self.record_file(
-                            &child_relative,
-                            FileOutcome::NotAttempted {
-                                bytes: entry.metadata.size,
-                                reason: "parent_dir_failed".to_owned(),
-                            },
-                            None,
-                        )?;
-                    }
-                    ObjectKind::Directory => {
-                        self.counters.dirs_discovered =
-                            self.counters.dirs_discovered.saturating_add(1);
-                        self.counters.dirs_failed = self.counters.dirs_failed.saturating_add(1);
-                        self.audit.emit(&AuditEvent::Directory {
-                            action: "not_attempted_parent_failed".to_owned(),
-                            rel: AuditPath::from_path(&child_relative),
-                        })?;
-                        directories.push((entry.path, child_relative));
-                    }
-                    ObjectKind::Reparse => {
-                        self.counters.links_discovered =
-                            self.counters.links_discovered.saturating_add(1);
-                        self.counters.links_not_attempted =
-                            self.counters.links_not_attempted.saturating_add(1);
-                        self.record_link_event(
-                            &child_relative,
-                            "not_attempted_link",
-                            Some("parent_dir_failed".to_owned()),
-                            None,
-                            None,
-                        )?;
-                    }
-                }
+                self.account_entry_not_attempted(&entry, child_relative, &mut directories)?;
             }
         }
         Ok(())
     }
 
+    fn account_entry_not_attempted(
+        &mut self,
+        entry: &DirectoryEntry,
+        relative: PathBuf,
+        directories: &mut Vec<(PathBuf, PathBuf)>,
+    ) -> Result<(), BigcpError> {
+        match entry.metadata.kind {
+            ObjectKind::File => {
+                self.counters.note_file_discovered();
+                self.record_file(
+                    &relative,
+                    FileOutcome::NotAttempted {
+                        bytes: entry.metadata.size,
+                        reason: "parent_dir_failed".to_owned(),
+                    },
+                    None,
+                )?;
+            }
+            ObjectKind::Directory => {
+                self.counters.dirs_discovered = self.counters.dirs_discovered.saturating_add(1);
+                self.counters.dirs_failed = self.counters.dirs_failed.saturating_add(1);
+                self.audit.emit(&AuditEvent::Directory {
+                    action: "not_attempted_parent_failed".to_owned(),
+                    rel: AuditPath::from_path(&relative),
+                })?;
+                directories.push((entry.path.clone(), relative));
+            }
+            ObjectKind::Reparse => {
+                self.counters.links_discovered = self.counters.links_discovered.saturating_add(1);
+                self.counters.links_not_attempted =
+                    self.counters.links_not_attempted.saturating_add(1);
+                self.record_link_event(
+                    &relative,
+                    "not_attempted_link",
+                    Some("parent_dir_failed".to_owned()),
+                    None,
+                    None,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Accounts the direct children of a directory whose destination join
+    /// failed. All of them are `not_attempted` (nothing was dispatched), the
+    /// same terminal category deeper descendants receive — the parent's one
+    /// recorded error is the cause for the whole subtree.
     fn account_children_not_attempted(
         &mut self,
         entries: &[DirectoryEntry],
         parent_relative: &Path,
     ) -> Result<(), BigcpError> {
+        let mut directories = Vec::new();
         for entry in entries {
             let relative = parent_relative.join(&entry.name);
-            self.record_entry_failure(
-                entry,
-                relative.clone(),
-                OperationError::semantic(
-                    ErrorCategory::ParentDirFailed,
-                    "join",
-                    relative,
-                    "destination directory could not be enumerated",
-                ),
-            )?;
+            self.account_entry_not_attempted(entry, relative, &mut directories)?;
+        }
+        while let Some((source, relative)) = directories.pop() {
+            let Ok(children) = enumerate_directory(&source) else {
+                continue;
+            };
+            for entry in children {
+                let child_relative = relative.join(&entry.name);
+                self.account_entry_not_attempted(&entry, child_relative, &mut directories)?;
+            }
         }
         Ok(())
     }
@@ -1803,7 +1930,13 @@ impl Runner<'_> {
             FileOutcome::SkippedSame { bytes } => {
                 ("skipped", *bytes, None, None, Some("same".to_owned()), None)
             }
-            FileOutcome::SkippedDifferent { bytes } => (
+            FileOutcome::SkippedDifferent {
+                bytes,
+                destination_newer,
+                old_size,
+                old_mtime,
+                old_attributes,
+            } => (
                 "skipped_diff",
                 *bytes,
                 None,
@@ -1813,7 +1946,18 @@ impl Runner<'_> {
                         .as_ref()
                         .map_or_else(|| "different".to_owned(), |values| values.join(",")),
                 ),
-                None,
+                // A withheld replacement logs the same destination detail a
+                // performed replacement would (F13/F20).
+                Some(ReplacementEvent {
+                    old_size: *old_size,
+                    old_mtime: *old_mtime,
+                    old_attributes: *old_attributes,
+                    destination_newer: *destination_newer,
+                    differences: differences
+                        .as_ref()
+                        .map(|values| values.iter().map(|value| (*value).to_owned()).collect())
+                        .unwrap_or_default(),
+                }),
             ),
             FileOutcome::MetadataFixed { bytes } => (
                 "meta_fixed",
@@ -1883,7 +2027,7 @@ impl Runner<'_> {
             error,
             reason,
         })?;
-        if let Some(point) = self.stats.maybe_roll(Duration::from_secs(30)) {
+        if let Some(point) = self.stats.maybe_roll(self.stat_interval()) {
             self.audit.emit(&AuditEvent::Stat {
                 counters: self.counters.clone(),
                 read_mbps: point.read_mbps,
@@ -1896,6 +2040,16 @@ impl Runner<'_> {
             self.last_snapshot = Instant::now();
         }
         Ok(())
+    }
+
+    /// `--analyze` samples the timeline 6x more finely; the 3600-point report
+    /// cap still bounds output (5 s x 3600 = five hours of coverage).
+    fn stat_interval(&self) -> Duration {
+        if self.options.analyze {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(30)
+        }
     }
 
     fn record_error(&mut self, error: OperationError) -> Result<(), BigcpError> {
@@ -1943,7 +2097,7 @@ impl Runner<'_> {
                 summary.skipped_same = summary.skipped_same.saturating_add(1);
                 *bytes
             }
-            FileOutcome::SkippedDifferent { bytes } => {
+            FileOutcome::SkippedDifferent { bytes, .. } => {
                 summary.skipped_diff = summary.skipped_diff.saturating_add(1);
                 *bytes
             }
@@ -2301,12 +2455,6 @@ fn path_hash_parts<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Result<Stri
         hasher.update([0_u8, 0_u8]);
     }
     Ok(hex::encode(hasher.finalize()))
-}
-
-fn value_hash(value: &Value) -> Result<String, BigcpError> {
-    let bytes = serde_json::to_vec(value)
-        .map_err(|error| BigcpError::Format(format!("serialize option hash input: {error}")))?;
-    Ok(hex::encode(Sha256::digest(bytes)))
 }
 
 fn same_path(left: &Path, right: &Path) -> Result<bool, BigcpError> {

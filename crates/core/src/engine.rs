@@ -181,12 +181,15 @@ fn copy_sparse(
     let (mut temp, mut hash_offset, mut hasher) = if let Some(state) = resumed {
         state
     } else {
-        let temp = DestinationTemp::create(parent, request.run_id)
+        // EFS + sparse are mutually exclusive on NTFS, so a sparse copy never
+        // requests encryption; an encrypted source takes the non-sparse paths.
+        let temp = DestinationTemp::create(parent, request.run_id, false)
             .map_err(|error| operation_error("create_dst_temp", request.relative_path, &error))?;
         temp.mark_sparse()
             .map_err(|error| operation_error("set_sparse", request.relative_path, &error))?;
         (temp, 0, should_hash.then(Xxh3::new))
     };
+    let efs_downgraded = efs_downgraded_for(request, &temp);
     temp.set_len(logical_size)
         .map_err(|error| operation_error("set_eof", request.relative_path, &error))?;
 
@@ -339,7 +342,6 @@ fn copy_sparse(
     )?;
     journal_degraded |= named.journal_degraded;
     let eas_dropped = copy_eas(request, &temp, extended_attributes)?;
-    let efs_downgraded = preserve_efs(request, &temp);
     post_read_validate(request, source)?;
     let dacl = precommit_validate(request)?;
     if let Some(dacl) = &dacl {
@@ -423,8 +425,9 @@ fn copy_small(
     post_read_validate(request, source)?;
 
     let parent = destination_parent(request)?;
-    let mut temp = DestinationTemp::create(parent, request.run_id)
+    let mut temp = DestinationTemp::create(parent, request.run_id, wants_encryption(request))
         .map_err(|error| operation_error("create_dst_temp", request.relative_path, &error))?;
+    let efs_downgraded = efs_downgraded_for(request, &temp);
     temp.write_all(&bytes)
         .map_err(|error| operation_error("write", request.relative_path, &error))?;
     counters.bytes_written_destination = counters
@@ -455,7 +458,6 @@ fn copy_small(
     )?;
     journal_degraded |= named.journal_degraded;
     let eas_dropped = copy_eas(request, &temp, extended_attributes)?;
-    let efs_downgraded = preserve_efs(request, &temp);
     post_read_validate(request, source)?;
     let dacl = precommit_validate(request)?;
     if let Some(dacl) = &dacl {
@@ -506,12 +508,13 @@ fn copy_streamed(
     let (mut temp, mut total, mut hasher) = if let Some(state) = resumed {
         state
     } else {
-        let temp = DestinationTemp::create(parent, request.run_id)
+        let temp = DestinationTemp::create(parent, request.run_id, wants_encryption(request))
             .map_err(|error| operation_error("create_dst_temp", request.relative_path, &error))?;
         temp.preallocate(request.source_snapshot.metadata.size)
             .map_err(|error| operation_error("preallocate", request.relative_path, &error))?;
         (temp, 0, should_hash.then(Xxh3::new))
     };
+    let efs_downgraded = efs_downgraded_for(request, &temp);
     let mut buffer = vec![0_u8; request.chunk_bytes];
     if buffer.is_empty() {
         return Err(OperationError::semantic(
@@ -606,7 +609,6 @@ fn copy_streamed(
     )?;
     journal_degraded |= named.journal_degraded;
     let eas_dropped = copy_eas(request, &temp, extended_attributes)?;
-    let efs_downgraded = preserve_efs(request, &temp);
     post_read_validate(request, source)?;
     let dacl = precommit_validate(request)?;
     if let Some(dacl) = &dacl {
@@ -889,11 +891,24 @@ fn copy_eas(
     Ok(false)
 }
 
-fn preserve_efs(request: &EngineRequest<'_>, temp: &DestinationTemp) -> bool {
+/// Requests EFS on a new temp only when the source is encrypted and the
+/// destination volume supports it. Creation is the only reliable moment to
+/// apply EFS: an armed delete disposition refuses every later path-based open.
+fn wants_encryption(request: &EngineRequest<'_>) -> bool {
+    is_encrypted(request.source_snapshot.metadata.basic.attributes)
+        && request.destination_supports_encryption
+}
+
+/// Reports whether an encrypted source is landing unencrypted.
+///
+/// Judged from the live temp handle so freshly created and resumed temps get
+/// the same answer; the create-time EFS request is best-effort (system policy
+/// can disable EFS silently), so the temp's actual attribute is the truth.
+fn efs_downgraded_for(request: &EngineRequest<'_>, temp: &DestinationTemp) -> bool {
     if !is_encrypted(request.source_snapshot.metadata.basic.attributes) {
         return false;
     }
-    !request.destination_supports_encryption || temp.encrypt().is_err()
+    !temp.basic_attributes().is_ok_and(is_encrypted)
 }
 
 struct NamedStreamResult {

@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -14,7 +14,7 @@ use crate::REPORT_SCHEMA_VERSION;
 use crate::devprofile::CopyProfile;
 use crate::error::{BigcpError, ErrorCategory, OperationError};
 use crate::model::Counters;
-use crate::stats::TimelinePoint;
+use crate::stats::{AnalysisSummary, TimelinePoint};
 
 /// Run identity and lifecycle facts.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -209,6 +209,9 @@ pub struct RunReport {
     pub bottleneck: BottleneckSummary,
     /// Actionable hints.
     pub hints: Vec<Hint>,
+    /// Bounded `--analyze` insight; absent unless the flag was set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis: Option<AnalysisSummary>,
     /// Optional verification result.
     pub verify: Option<VerificationSummary>,
     /// ok or failed counter-integrity state.
@@ -270,14 +273,6 @@ pub fn top_level(path: &Path) -> String {
         || ".".to_owned(),
         |component| component.as_os_str().to_string_lossy().into_owned(),
     )
-}
-
-/// Writes ordinary bytes durably for schema samples and tests.
-#[doc(hidden)]
-pub fn write_bytes_for_test(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut file = File::create(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()
 }
 
 #[cfg(test)]

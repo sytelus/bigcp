@@ -11,6 +11,7 @@ use time::OffsetDateTime;
 
 use crate::error::{BigcpError, OperationError};
 use crate::model::Counters;
+use crate::stats::AnalysisSummary;
 use crate::{LOG_SCHEMA_VERSION, options::CopyOptions};
 
 /// A display path plus lossless UTF-16 when lossy conversion was necessary.
@@ -140,6 +141,11 @@ pub enum AuditEvent {
         /// Destination write rate.
         write_mbps: f64,
     },
+    /// One bounded `--analyze` insight summary per run (VISION analysis flag).
+    Analysis {
+        /// Size-class aggregates plus slowest-copy samples.
+        analysis: AnalysisSummary,
+    },
     /// Run terminal record.
     RunEnd {
         /// Exact final counters.
@@ -266,7 +272,22 @@ impl AuditWriter {
         self.file = open_log(&self.fallback_path)?;
         self.current_path.clone_from(&self.fallback_path);
         self.degraded = true;
-        write_atomic_line(&mut self.file, line)
+        write_atomic_line(&mut self.file, line)?;
+        // The switch must be visible in both channels (PLAN section 5.15):
+        // note it inside the new log stream and on stderr, best-effort — a
+        // failing notice must not fail the successful failover itself.
+        let notice = format!(
+            "{{\"ev\":\"warning\",\"kind\":\"log_failover\",\"message\":\"JSONL log failed over from {} to {}\"}}\n",
+            self.primary_path.display(),
+            self.fallback_path.display()
+        );
+        let _ = write_atomic_line(&mut self.file, notice.as_bytes());
+        eprintln!(
+            "bigcp: JSONL log failed over from {} to {}",
+            self.primary_path.display(),
+            self.fallback_path.display()
+        );
+        Ok(())
     }
 }
 
@@ -287,6 +308,7 @@ pub fn option_summary(options: &CopyOptions) -> serde_json::Value {
         "source_profile": options.source_profile,
         "destination_profile": options.destination_profile,
         "tune": options.tune,
+        "analyze": options.analyze,
         "log_schema": LOG_SCHEMA_VERSION,
     })
 }

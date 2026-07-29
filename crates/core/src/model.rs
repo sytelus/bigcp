@@ -98,9 +98,20 @@ pub enum FileOutcome {
         bytes: u64,
     },
     /// Differing file withheld by replace=false.
+    ///
+    /// Carries the same destination snapshot detail as a replacement so the
+    /// withheld decision is fully analyzable later (F13/F20).
     SkippedDifferent {
         /// Logical bytes withheld.
         bytes: u64,
+        /// Whether the existing destination was newer than the source.
+        destination_newer: bool,
+        /// Existing destination logical size captured at classification.
+        old_size: u64,
+        /// Existing destination last-write time in FILETIME ticks.
+        old_mtime: i64,
+        /// Existing destination raw attributes.
+        old_attributes: u32,
     },
     /// Metadata repaired without unnamed-stream I/O.
     MetadataFixed {
@@ -217,8 +228,22 @@ pub struct Counters {
 
 impl Counters {
     /// Applies exactly one terminal file outcome.
-    pub fn apply_file(&mut self, outcome: &FileOutcome) {
+    /// Notes one file entry at *discovery* time (enumeration/subtree walks).
+    ///
+    /// Discovery and terminal outcomes are counted at different call sites on
+    /// purpose: if any code path ever drops a discovered file without an
+    /// outcome, `reconcile` now detects it. Counting both from the same call
+    /// would make the I6 equation a tautology.
+    pub fn note_file_discovered(&mut self) {
         self.files_discovered = self.files_discovered.saturating_add(1);
+    }
+
+    /// Applies one terminal file outcome to the disjoint outcome counters.
+    pub fn apply_file(&mut self, outcome: &FileOutcome) {
+        // `files_discovered` is deliberately NOT incremented here — see
+        // `note_file_discovered`. Logical byte totals stay outcome-time
+        // because the true all-streams size is only known once the file has
+        // been opened (PLAN section 5.4: totals adjust as discovery refines).
         let bytes = match outcome {
             FileOutcome::CopiedNew { bytes, .. } => {
                 self.copied_new = self.copied_new.saturating_add(1);
@@ -234,7 +259,7 @@ impl Counters {
                 self.skipped_same = self.skipped_same.saturating_add(1);
                 *bytes
             }
-            FileOutcome::SkippedDifferent { bytes } => {
+            FileOutcome::SkippedDifferent { bytes, .. } => {
                 self.skipped_diff = self.skipped_diff.saturating_add(1);
                 *bytes
             }
@@ -334,10 +359,12 @@ mod tests {
     #[test]
     fn file_outcomes_reconcile_exactly() {
         let mut counters = Counters::default();
+        counters.note_file_discovered();
         counters.apply_file(&FileOutcome::CopiedNew {
             bytes: 4,
             digest: None,
         });
+        counters.note_file_discovered();
         counters.apply_file(&FileOutcome::SkippedSame { bytes: 5 });
         assert!(counters.reconcile().is_ok());
         assert_eq!(counters.files_discovered, 2);
@@ -346,10 +373,17 @@ mod tests {
 
     #[test]
     fn dropped_outcome_is_loud() {
-        let counters = Counters {
-            files_discovered: 1,
-            ..Counters::default()
-        };
+        // Discovery without a terminal outcome must fail reconciliation —
+        // this is the direction the old outcome-time counting could not see.
+        let mut counters = Counters::default();
+        counters.note_file_discovered();
+        assert!(counters.reconcile().is_err());
+    }
+
+    #[test]
+    fn outcome_without_discovery_is_loud() {
+        let mut counters = Counters::default();
+        counters.apply_file(&FileOutcome::SkippedSame { bytes: 1 });
         assert!(counters.reconcile().is_err());
     }
 }

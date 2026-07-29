@@ -43,6 +43,13 @@ enum Command {
         /// Relative destination tree.
         destination: PathBuf,
     },
+    /// Reports physical extent counts as fragmentation evidence (read-only).
+    Extents {
+        /// Marked sandbox root.
+        sandbox: PathBuf,
+        /// Relative tree (or single file) to measure.
+        tree: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -87,6 +94,13 @@ fn run(cli: Cli) -> Result<u8> {
             serde_json::to_writer_pretty(std::io::stdout(), &report)?;
             println!();
             Ok(if report.mismatches == 0 { 0 } else { 2 })
+        }
+        Command::Extents { sandbox, tree } => {
+            let sandbox = SandboxRoot::open(&sandbox)?;
+            let report = bigcp_testkit::measure_extents(&sandbox, &tree)?;
+            serde_json::to_writer_pretty(std::io::stdout(), &report)?;
+            println!();
+            Ok(0)
         }
     }
 }

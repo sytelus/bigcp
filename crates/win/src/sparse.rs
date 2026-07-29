@@ -12,7 +12,7 @@ use windows_sys::Win32::System::Ioctl::{
     FSCTL_SET_SPARSE,
 };
 
-use crate::util::{bool_result, last_error};
+use crate::util::{bool_result, last_error, size_u32};
 
 const RANGE_BATCH: usize = 1024;
 
@@ -79,6 +79,15 @@ pub(crate) fn query_allocated_ranges(
         }
         let count = returned / record_size;
         if count == 0 {
+            if more {
+                // ERROR_MORE_DATA with zero records is a driver contract
+                // violation; silently stopping here would turn allocated data
+                // into holes at the destination.
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "filesystem reported more sparse ranges but returned none",
+                ));
+            }
             break;
         }
         for raw in &output[..count] {
@@ -135,9 +144,4 @@ pub(crate) fn mark_sparse(file: &File) -> io::Result<()> {
             std::ptr::null_mut(),
         ))
     }
-}
-
-fn size_u32<T>() -> io::Result<u32> {
-    u32::try_from(size_of::<T>())
-        .map_err(|_| io::Error::other("Win32 structure size does not fit u32"))
 }

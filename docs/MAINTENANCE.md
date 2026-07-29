@@ -4,11 +4,11 @@
 
 | Area | Responsibility |
 |---|---|
-| `crates/win/path.rs`, `metadata.rs`, `volume.rs`, `device.rs` | Lossless paths, handle identity, 256 KiB enumeration, supported-volume and query-only device facts. |
-| `crates/win/file.rs`, `streams.rs`, `ea.rs`, `sparse.rs`, `reparse.rs`, `security.rs` | Read-only source and capability-bearing destination primitives; the only unsafe boundary. |
-| `crates/core/classify.rs`, `copy.rs`, `worker.rs`, `engine.rs` | Join, terminal outcomes, bounded scheduling, streaming, sparse/ADS copy, common finalizer. |
-| `crates/core/journal.rs`, `audit.rs`, `report.rs` | Resume hints and public artifacts. |
-| `crates/core/verify.rs` | Post-copy and standalone verification. |
+| `crates/win/src/path.rs`, `metadata.rs`, `volume.rs`, `device.rs`, `lock.rs`, `util.rs` | Lossless paths, handle identity, 256 KiB enumeration, supported-volume and query-only device facts, run lock, shared error helpers. |
+| `crates/win/src/file.rs`, `streams.rs`, `ea.rs`, `sparse.rs`, `reparse.rs`, `security.rs` | Read-only source and capability-bearing destination primitives; the only unsafe boundary. |
+| `crates/core/src/model.rs`, `options.rs`, `classify.rs`, `copy.rs`, `worker.rs`, `engine.rs` | Work model, validated options, join, terminal outcomes, bounded scheduling, streaming, sparse/ADS copy, common finalizer. |
+| `crates/core/src/journal.rs`, `audit.rs`, `report.rs`, `stats.rs`, `devprofile.rs` | Resume hints, public artifacts, throughput windows, static profiles. |
+| `crates/core/src/verify.rs` | Post-copy and standalone verification. |
 | `crates/tui` | Immutable-snapshot live UI and saved report browser. |
 | `crates/cli` | Grammar, option validation, exit mapping. |
 | `crates/testkit` | Structurally confined generator and independent oracle. |
@@ -112,6 +112,14 @@ replacements, warnings, grouped failures, extras, hints, and verification.
 - **Oracle:** independent, simple full-tree comparator in `bigcp-testkit`.
 - **Breaker:** stop-dispatch policy for device loss or capacity exhaustion.
 - **FMEA:** explicit failure-mode/effect analysis behind crash invariants.
+- **Reparse point:** filesystem object carrying a tagged buffer (symlink,
+  junction, cloud placeholder); never traversed, copied by tag policy.
+- **Junction:** directory reparse point with an absolute local target; copied
+  verbatim, never followed.
+- **Stream:** one `name:$DATA` payload of an object; the unnamed stream is the
+  file's ordinary data.
+- **Ring:** the planned in-flight buffer set of the future IOCP transport
+  (PLAN §13.2); not present in the current synchronous transport.
 
 ## Release checklist
 
@@ -119,7 +127,9 @@ replacements, warnings, grouped failures, extras, hints, and verification.
    byte-identical.
 2. Run format check, clippy `-D warnings`, full tests in a validated C: sandbox,
    `cargo deny check`, and `cargo audit`.
-3. Validate emitted log/report examples against both JSON schemas.
+3. Confirm both JSON schema files parse and carry the expected `$id`/version
+   (the in-repo test); full emitted-instance-vs-schema validation tooling is
+   release work — do not claim it before it exists.
 4. Complete the release-required fault, chaos, VHDX, differential, performance,
    and hardware gates documented as pending in `PLAN_DEVIATIONS.md`.
 5. Build `--release --locked`, smoke `--help`, copy, rerun, both verification

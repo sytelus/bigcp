@@ -446,21 +446,22 @@ fn copy_named_streams(
 
 fn symlink_target(buffer: &[u8]) -> io::Result<Vec<u16>> {
     const PATH_BUFFER_OFFSET: usize = 20;
+    const SYMLINK_FLAG_RELATIVE: u32 = 0x1;
     if buffer.len() < PATH_BUFFER_OFFSET {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "symbolic-link reparse buffer is truncated",
         ));
     }
+    // The SubstituteName is what the filesystem dereferences; the PrintName is
+    // cosmetic and can be stale or deliberately different. Fidelity requires
+    // recreating from the substitute name plus the RELATIVE flag — never from
+    // the print name.
     let substitute_offset = usize::from(read_u16(buffer, 8)?);
     let substitute_length = usize::from(read_u16(buffer, 10)?);
-    let print_offset = usize::from(read_u16(buffer, 12)?);
-    let print_length = usize::from(read_u16(buffer, 14)?);
-    let (offset, length, substitute) = if print_length > 0 {
-        (print_offset, print_length, false)
-    } else {
-        (substitute_offset, substitute_length, true)
-    };
+    let flags = u32::from(read_u16(buffer, 16)?) | (u32::from(read_u16(buffer, 18)?) << 16);
+    let relative = flags & SYMLINK_FLAG_RELATIVE != 0;
+    let (offset, length, substitute) = (substitute_offset, substitute_length, !relative);
     if offset % 2 != 0 || length % 2 != 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -490,6 +491,18 @@ fn symlink_target(buffer: &[u8]) -> io::Result<Vec<u16>> {
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect::<Vec<_>>();
     if substitute {
+        // Absolute links carry an NT-namespace substitute (`\??\…`); strip it
+        // to the user-mode form CreateSymbolicLinkW expects. A volume-GUID
+        // target has no drive-letter user form — stripping would leave a path
+        // CreateSymbolicLinkW misreads as *relative*, silently corrupting the
+        // link, so it is refused instead (documented limitation).
+        let volume_prefix: Vec<u16> = r"\??\Volume{".encode_utf16().collect();
+        if target.starts_with(&volume_prefix) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "symbolic link targets a volume GUID path; recreate it manually at the destination",
+            ));
+        }
         target = user_path_from_substitute(target);
     }
     if target.is_empty() {
@@ -564,10 +577,24 @@ mod tests {
         value
     }
 
+    fn relative_buffer(substitute: &str, print: &str) -> Vec<u8> {
+        let mut value = buffer(substitute, print);
+        value[16..20].copy_from_slice(&1_u32.to_le_bytes());
+        value
+    }
+
     #[test]
-    fn parser_prefers_the_user_facing_print_name() {
-        let parsed = symlink_target(&buffer(r"\??\C:\target", r"C:\target"));
-        assert_eq!(parsed.ok(), Some(r"C:\target".encode_utf16().collect()));
+    fn parser_uses_the_authoritative_substitute_name_not_the_print_name() {
+        // A stale or hostile print name must never redirect the recreated
+        // link: the substitute name is what the filesystem dereferences.
+        let parsed = symlink_target(&buffer(r"\??\C:\real", r"C:\fake"));
+        assert_eq!(parsed.ok(), Some(r"C:\real".encode_utf16().collect()));
+    }
+
+    #[test]
+    fn parser_preserves_a_relative_target_verbatim() {
+        let parsed = symlink_target(&relative_buffer(r"sibling\file", r"sibling\file"));
+        assert_eq!(parsed.ok(), Some(r"sibling\file".encode_utf16().collect()));
     }
 
     #[test]
@@ -577,6 +604,14 @@ mod tests {
             parsed.ok(),
             Some(r"\\server\share\file".encode_utf16().collect())
         );
+    }
+
+    #[test]
+    fn parser_refuses_a_volume_guid_substitute() {
+        // Stripping `\??\` from a volume-GUID target would leave a path that
+        // CreateSymbolicLinkW misreads as relative — a corrupted link.
+        let parsed = symlink_target(&buffer(r"\??\Volume{0000-0000}\dir\file", ""));
+        assert!(parsed.is_err());
     }
 
     #[test]

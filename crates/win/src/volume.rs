@@ -15,7 +15,7 @@ use windows_sys::Win32::System::SystemServices::{
 };
 use windows_sys::Win32::System::WindowsProgramming::{DRIVE_NO_ROOT_DIR, DRIVE_REMOTE};
 
-use crate::util::{bool_result, last_error, wide_null};
+use crate::util::{bool_result, wide_null};
 
 /// Supported filesystem families.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -92,7 +92,12 @@ pub fn probe_volume(path: &Path) -> io::Result<VolumeInfo> {
         ));
     }
     if drive_type == DRIVE_NO_ROOT_DIR {
-        return Err(last_error());
+        // GetDriveTypeW does not set the thread's last error; surfacing
+        // `last_error()` here would report an unrelated stale code.
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "volume root not found",
+        ));
     }
 
     let mut serial = 0_u32;

@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE};
 use windows_sys::Win32::Storage::FileSystem::{
-    DELETE, EncryptFileW, FILE_ALLOCATION_INFO, FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_COMPRESSED,
+    DELETE, FILE_ALLOCATION_INFO, FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_COMPRESSED,
     FILE_ATTRIBUTE_ENCRYPTED, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NORMAL,
     FILE_ATTRIBUTE_NOT_CONTENT_INDEXED, FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_READONLY,
     FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN,
@@ -147,7 +147,12 @@ pub struct DestinationTemp {
 
 impl DestinationTemp {
     /// Creates a new opaque sibling and arms delete-on-close immediately.
-    pub fn create(parent: &Path, run_id: &str) -> io::Result<Self> {
+    ///
+    /// `encrypted` requests EFS at creation time — the only reliable moment:
+    /// once the temp exists with an armed delete disposition, `EncryptFileW`'s
+    /// internal path-based open is refused, so post-creation encryption can
+    /// never succeed on a live temp.
+    pub fn create(parent: &Path, run_id: &str, encrypted: bool) -> io::Result<Self> {
         for _ in 0..128 {
             let nonce = Uuid::new_v4().simple().to_string();
             let path = parent.join(format!(".bigcp-{run_id}-{}.part", &nonce[..12]));
@@ -160,6 +165,9 @@ impl DestinationTemp {
                 .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE | FILE_WRITE_ATTRIBUTES)
                 .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
                 .create_new(true);
+            if encrypted {
+                options.attributes(FILE_ATTRIBUTE_ENCRYPTED);
+            }
             match options.open(&path) {
                 Ok(file) => {
                     if let Err(error) = set_delete_on_close(&file, true) {
@@ -192,16 +200,26 @@ impl DestinationTemp {
     /// without following a reparse point and must be an ordinary file. The
     /// caller still must verify its identity and contents before writing.
     pub fn resume(parent: &Path, name: &str) -> io::Result<Self> {
+        // Enforce the exact opaque shape the creator produces. In particular
+        // a `:` must never pass: `.bigcp-x:y.part` would open the alternate
+        // stream `y.part` of a *different* file, and commit would then rename
+        // that host file over the final destination name.
+        let valid_shape = name
+            .strip_prefix(".bigcp-")
+            .and_then(|rest| rest.strip_suffix(".part"))
+            .is_some_and(|body| {
+                let mut parts = body.rsplitn(2, '-');
+                let nonce = parts.next().unwrap_or_default();
+                let run_id = parts.next().unwrap_or_default();
+                !run_id.is_empty()
+                    && run_id
+                        .chars()
+                        .all(|value| value.is_ascii_alphanumeric() || value == '-')
+                    && (1..=32).contains(&nonce.len())
+                    && nonce.chars().all(|value| value.is_ascii_hexdigit())
+            });
         let relative = Path::new(name);
-        if !name.starts_with(".bigcp-")
-            || !relative
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("part"))
-            || relative
-                .parent()
-                .is_some_and(|value| !value.as_os_str().is_empty())
-            || relative.file_name().is_none_or(|value| value != name)
-        {
+        if !valid_shape || relative.file_name().is_none_or(|value| value != name) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "journal temporary name is not a safe bigcp sibling name",
@@ -330,11 +348,9 @@ impl DestinationTemp {
         write_to_file(self.file_ref()?, attributes)
     }
 
-    /// Requests EFS encryption while this file still has its opaque temp name.
-    pub fn encrypt(&self) -> io::Result<()> {
-        let path = wide_null(self.path.as_os_str());
-        // SAFETY: path is nul-terminated and live for the synchronous call.
-        unsafe { bool_result(EncryptFileW(path.as_ptr())) }
+    /// Reports the temporary's current basic attributes (EFS state check).
+    pub fn basic_attributes(&self) -> io::Result<u32> {
+        Ok(metadata_from_file(self.file_ref()?)?.basic.attributes)
     }
 
     /// Atomically publishes the completed file, sets metadata, optionally
@@ -346,11 +362,14 @@ impl DestinationTemp {
         metadata: BasicMetadata,
         flush: bool,
     ) -> io::Result<()> {
-        let mut file = self
+        let file = self
             .file
             .take()
             .ok_or_else(|| io::Error::other("temporary handle already consumed"))?;
-        file.flush()?;
+        // No pre-rename flush: `File` I/O is unbuffered at this layer (a
+        // `flush()` here would be a misleading no-op), and durable-mode
+        // flushing deliberately happens *after* rename+metadata so the final
+        // state is what gets flushed (PLAN section 4.3 step 5).
         set_delete_on_close(&file, false)?;
         if let Err(error) = rename_by_handle(&file, final_path, replace) {
             if !self.persistent {
@@ -590,7 +609,7 @@ mod tests {
         let Some(sandbox) = sandbox.ok() else {
             return;
         };
-        let temp = DestinationTemp::create(sandbox.path(), "delete-on-close");
+        let temp = DestinationTemp::create(sandbox.path(), "delete-on-close", false);
         assert!(temp.is_ok(), "temporary creation failed: {:?}", temp.err());
         let Some(temp) = temp.ok() else {
             return;
@@ -622,7 +641,7 @@ mod tests {
         let Some(sandbox) = sandbox.ok() else {
             return;
         };
-        let temp = DestinationTemp::create(sandbox.path(), "identity-reuse");
+        let temp = DestinationTemp::create(sandbox.path(), "identity-reuse", false);
         assert!(temp.is_ok());
         let Some(mut temp) = temp.ok() else {
             return;
@@ -679,7 +698,7 @@ mod tests {
         if symlink_file(sandbox.path().join("missing-target"), &final_path).is_err() {
             return;
         }
-        let temp = DestinationTemp::create(sandbox.path(), "new-collision");
+        let temp = DestinationTemp::create(sandbox.path(), "new-collision", false);
         assert!(temp.is_ok());
         let Some(mut temp) = temp.ok() else {
             return;
@@ -712,7 +731,7 @@ mod tests {
             return;
         };
         let final_path = sandbox.path().join("final.bin");
-        let temp = DestinationTemp::create(sandbox.path(), "12345678");
+        let temp = DestinationTemp::create(sandbox.path(), "12345678", false);
         assert!(temp.is_ok(), "temporary creation failed: {:?}", temp.err());
         let Some(mut temp) = temp.ok() else {
             return;

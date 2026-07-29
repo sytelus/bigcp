@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Seek, Write};
+use std::io::{BufRead, BufReader, Read, Seek, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -130,6 +130,14 @@ pub struct Journal {
     resumable: BTreeMap<(String, String), Checkpoint>,
     torn_tail: bool,
     active_job: Option<JobSignature>,
+    /// The verbatim Job record of the current run, kept for compaction.
+    job_record: Option<JournalEvent>,
+    /// Interior records that failed CRC or parsing and were ignored (never
+    /// trusted, never truncated — truncation is reserved for the genuine
+    /// torn tail, because a mid-file mismatch is more likely an additive
+    /// newer-build field than corruption, and destroying every later valid
+    /// record over it would be the real data loss).
+    skipped_records: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -150,34 +158,48 @@ impl Journal {
         let mut torn_tail = false;
         let mut valid_length = 0_u64;
         let mut active_job: Option<JobSignature> = None;
+        let mut skipped_records = 0_u64;
         if path.exists() && !fresh {
             let mut reader = BufReader::new(
                 File::open(&path).map_err(|error| BigcpError::io("open journal", error))?,
             );
+            // Collect complete lines first so a bad record can be classified:
+            // only the *final* line may be a torn tail (append-only writes);
+            // an interior bad record is skipped without truncation.
+            let mut lines: Vec<(String, u64)> = Vec::new();
             loop {
                 let mut line = String::new();
-                let bytes = match reader.read_line(&mut line) {
+                match reader.read_line(&mut line) {
                     Ok(0) => break,
-                    Ok(bytes) => bytes,
+                    Ok(bytes) => lines.push((line, bytes as u64)),
                     Err(_) => {
                         torn_tail = true;
                         break;
                     }
-                };
-                let line = line.trim_end_matches(['\r', '\n']);
-                let Ok(stored) = serde_json::from_str::<StoredRecord>(line) else {
-                    torn_tail = true;
-                    break;
+                }
+            }
+            let count = lines.len();
+            for (index, (raw, bytes)) in lines.into_iter().enumerate() {
+                let is_last = index + 1 == count && !torn_tail;
+                let line = raw.trim_end_matches(['\r', '\n']);
+                let parsed = serde_json::from_str::<StoredRecord>(line)
+                    .ok()
+                    .filter(|stored| crc_matches(stored).unwrap_or(false));
+                let Some(stored) = parsed else {
+                    if is_last {
+                        // Genuine torn tail: truncate to the last good record.
+                        torn_tail = true;
+                        break;
+                    }
+                    skipped_records = skipped_records.saturating_add(1);
+                    valid_length = valid_length.saturating_add(bytes);
+                    continue;
                 };
                 if stored.j != 1 {
                     return Err(BigcpError::Format(format!(
                         "unsupported journal version {}; this build supports 1",
                         stored.j
                     )));
-                }
-                if !crc_matches(&stored)? {
-                    torn_tail = true;
-                    break;
                 }
                 match stored.event {
                     JournalEvent::Job {
@@ -210,7 +232,7 @@ impl Journal {
                     }
                     JournalEvent::End { .. } => {}
                 }
-                valid_length = valid_length.saturating_add(bytes as u64);
+                valid_length = valid_length.saturating_add(bytes);
             }
         }
 
@@ -234,7 +256,15 @@ impl Journal {
             resumable,
             torn_tail,
             active_job,
+            job_record: None,
+            skipped_records,
         })
+    }
+
+    /// Interior records ignored during load (never trusted, never truncated).
+    #[must_use]
+    pub const fn skipped_records(&self) -> u64 {
+        self.skipped_records
     }
 
     /// Starts or resumes one semantic job and invalidates incompatible hints.
@@ -258,38 +288,93 @@ impl Journal {
         {
             self.resumable.clear();
         }
-        self.append(JournalEvent::Job {
+        let job = JournalEvent::Job {
             run_id,
             source,
             destination,
             options_hash,
             timestamp,
-        })?;
+        };
+        self.append(job.clone())?;
         self.active_job = Some(signature);
+        self.job_record = Some(job);
+        Ok(())
+    }
+
+    /// Compacts the journal to the current job header plus live checkpoints.
+    ///
+    /// Called on clean run end (PLAN section 5.12) so the file never replays
+    /// unbounded history. Live checkpoints survive: a canceled run's partials
+    /// stay resumable. The rewrite is temp-file based; the tiny non-atomic
+    /// remove/rename window can at worst lose *hints* (I8 — the journal is
+    /// never a completion database).
+    pub fn compact(&mut self) -> Result<(), BigcpError> {
+        let Some(job) = self.job_record.clone() else {
+            return Ok(());
+        };
+        let mut contents = Vec::new();
+        contents.extend_from_slice(&encode_record(&job)?);
+        for checkpoint in self.resumable.values() {
+            contents.extend_from_slice(&encode_record(&JournalEvent::Checkpoint(
+                checkpoint.clone(),
+            ))?);
+        }
+        let temporary = self.path.with_extension("compact-tmp");
+        fs::write(&temporary, &contents)
+            .map_err(|error| BigcpError::io("write compacted journal", error))?;
+        // Windows `rename` cannot replace; remove-then-rename is acceptable
+        // for a hint store (see doc comment above).
+        if let Err(error) = fs::remove_file(&self.path)
+            .or_else(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            })
+            .and_then(|()| fs::rename(&temporary, &self.path))
+        {
+            let _ = fs::remove_file(&temporary);
+            return Err(BigcpError::io("swap compacted journal", error));
+        }
+        let mut options = OpenOptions::new();
+        options.read(true).write(true);
+        self.file = options
+            .open(&self.path)
+            .map_err(|error| BigcpError::io("reopen compacted journal", error))?;
+        self.file
+            .seek(std::io::SeekFrom::End(0))
+            .map_err(|error| BigcpError::io("seek compacted journal", error))?;
         Ok(())
     }
 
     /// Appends one CRC-tagged record and flushes it.
     pub fn append(&mut self, event: JournalEvent) -> Result<(), BigcpError> {
         let state_event = event.clone();
-        let unsigned = UnsignedRecord {
-            j: 1,
-            event: event.clone(),
-        };
-        let bytes = serde_json::to_vec(&unsigned)
-            .map_err(|error| BigcpError::Format(format!("serialize journal CRC input: {error}")))?;
-        let stored = StoredRecord {
-            j: 1,
-            event,
-            crc: format!("{:08x}", crc32c::crc32c(&bytes)),
-        };
-        let mut line = serde_json::to_vec(&stored)
-            .map_err(|error| BigcpError::Format(format!("serialize journal record: {error}")))?;
-        line.push(b'\n');
-        let before = self
+        let line = encode_record(&event)?;
+        let mut before = self
             .file
             .seek(std::io::SeekFrom::End(0))
             .map_err(|error| BigcpError::io("seek journal append", error))?;
+        // Self-heal a missing trailing newline (an interrupted append whose
+        // rollback also failed): appending onto an unterminated line would
+        // silently corrupt both records on the next load.
+        if before > 0 {
+            let mut last = [0_u8; 1];
+            self.file
+                .seek(std::io::SeekFrom::Start(before - 1))
+                .and_then(|_| self.file.read_exact(&mut last))
+                .map_err(|error| BigcpError::io("probe journal tail", error))?;
+            self.file
+                .seek(std::io::SeekFrom::End(0))
+                .map_err(|error| BigcpError::io("seek journal append", error))?;
+            if last[0] != b'\n' {
+                self.file
+                    .write_all(b"\n")
+                    .map_err(|error| BigcpError::io("heal journal tail", error))?;
+                before = before.saturating_add(1);
+            }
+        }
         if let Err(error) = self.file.write_all(&line) {
             let _ = self.file.set_len(before);
             let _ = self.file.seek(std::io::SeekFrom::Start(before));
@@ -337,6 +422,25 @@ impl Journal {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// Serializes one CRC-framed journal line (shared by append and compaction).
+fn encode_record(event: &JournalEvent) -> Result<Vec<u8>, BigcpError> {
+    let unsigned = UnsignedRecord {
+        j: 1,
+        event: event.clone(),
+    };
+    let bytes = serde_json::to_vec(&unsigned)
+        .map_err(|error| BigcpError::Format(format!("serialize journal CRC input: {error}")))?;
+    let stored = StoredRecord {
+        j: 1,
+        event: event.clone(),
+        crc: format!("{:08x}", crc32c::crc32c(&bytes)),
+    };
+    let mut line = serde_json::to_vec(&stored)
+        .map_err(|error| BigcpError::Format(format!("serialize journal record: {error}")))?;
+    line.push(b'\n');
+    Ok(line)
 }
 
 fn crc_matches(stored: &StoredRecord) -> Result<bool, BigcpError> {
@@ -515,5 +619,133 @@ mod tests {
             let mut file = fs::OpenOptions::new().append(true).open(path)?;
             file.write_all(bytes)
         }
+    }
+
+    fn sample_checkpoint(relative_path: &str) -> Checkpoint {
+        Checkpoint {
+            relative_path: relative_path.to_owned(),
+            stream: String::new(),
+            temp_name: ".bigcp-test-000000000000.part".to_owned(),
+            temp_identity: Some(CheckpointFileIdentity::from_file(FileIdentity {
+                volume_serial: 1,
+                file_id: [1; 16],
+            })),
+            source_identity: Some(CheckpointFileIdentity::from_file(FileIdentity {
+                volume_serial: 1,
+                file_id: [2; 16],
+            })),
+            source_size: 64,
+            source_mtime: 7,
+            watermark: 32,
+            prefix_digest: "xxh3:00000000000000000000000000000000".to_owned(),
+        }
+    }
+
+    fn open_job_journal(path: &std::path::Path) -> Option<Journal> {
+        let journal = Journal::open(path.to_path_buf(), false);
+        assert!(journal.is_ok());
+        let mut journal = journal.ok()?;
+        let begun = journal.begin_job(
+            "run".to_owned(),
+            "u16:source".to_owned(),
+            "u16:destination".to_owned(),
+            "resume-protocol-v1".to_owned(),
+            "2026-07-29T00:00:00Z".to_owned(),
+        );
+        assert!(begun.is_ok());
+        Some(journal)
+    }
+
+    #[test]
+    fn clean_end_compaction_keeps_job_header_and_live_checkpoints() {
+        let directory = tempfile::tempdir();
+        assert!(directory.is_ok());
+        let Some(directory) = directory.ok() else {
+            return;
+        };
+        let path = directory.path().join("journal.jsonl");
+        let Some(mut journal) = open_job_journal(&path) else {
+            return;
+        };
+        let live = sample_checkpoint("u16:live");
+        let retired = sample_checkpoint("u16:retired");
+        assert!(journal.append(JournalEvent::Checkpoint(live)).is_ok());
+        assert!(journal.append(JournalEvent::Checkpoint(retired)).is_ok());
+        assert!(
+            journal
+                .append(JournalEvent::PartDone {
+                    relative_path: "u16:retired".to_owned(),
+                })
+                .is_ok()
+        );
+        assert!(
+            journal
+                .append(JournalEvent::End {
+                    run_id: "run".to_owned(),
+                })
+                .is_ok()
+        );
+        assert!(journal.compact().is_ok());
+        drop(journal);
+        let contents = fs::read_to_string(&path).unwrap_or_default();
+        let lines: Vec<_> = contents.lines().collect();
+        // Job header plus exactly the still-live checkpoint survive; the
+        // retired checkpoint, its PartDone, and the End record are gone.
+        assert_eq!(lines.len(), 2, "compacted journal: {lines:?}");
+        assert!(lines[0].contains("\"ev\":\"job\""));
+        assert!(lines[1].contains("u16:live"));
+        let reloaded = Journal::open(path, false);
+        assert!(reloaded.is_ok());
+        assert!(
+            reloaded
+                .ok()
+                .is_some_and(|journal| journal.checkpoint("u16:live", "").is_some())
+        );
+    }
+
+    #[test]
+    fn interior_bad_record_is_skipped_without_truncating_later_records() {
+        let directory = tempfile::tempdir();
+        assert!(directory.is_ok());
+        let Some(directory) = directory.ok() else {
+            return;
+        };
+        let path = directory.path().join("journal.jsonl");
+        let Some(mut journal) = open_job_journal(&path) else {
+            return;
+        };
+        assert!(
+            journal
+                .append(JournalEvent::Checkpoint(sample_checkpoint("u16:kept")))
+                .is_ok()
+        );
+        drop(journal);
+        // Simulate an additive newer-build record (or corruption) BETWEEN two
+        // valid records: it must be ignored, never used as a truncation point
+        // that would destroy the later valid checkpoint.
+        let original = fs::read_to_string(&path).unwrap_or_default();
+        let mut lines: Vec<String> = original.lines().map(str::to_owned).collect();
+        assert_eq!(lines.len(), 2);
+        lines.insert(
+            1,
+            "{\"j\":1,\"ev\":\"job\",\"crc\":\"deadbeef\"}".to_owned(),
+        );
+        let rewritten = lines.join(
+            "
+",
+        ) + "
+";
+        assert!(fs::write(&path, &rewritten).is_ok());
+        let reloaded = Journal::open(path.clone(), false);
+        assert!(reloaded.is_ok());
+        let Some(reloaded) = reloaded.ok() else {
+            return;
+        };
+        assert_eq!(reloaded.skipped_records(), 1);
+        assert!(!reloaded.had_torn_tail());
+        assert!(reloaded.checkpoint("u16:kept", "").is_some());
+        drop(reloaded);
+        let after = fs::read_to_string(&path).unwrap_or_default();
+        assert_eq!(after, rewritten, "interior skip must not rewrite the file");
     }
 }

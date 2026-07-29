@@ -49,6 +49,7 @@ Every limitation below is **deliberate** — a scope decision from `VISION.md` o
 - **In-use files fail immediately.** No retries, no waiting: a locked file is reported with the locking process's name (Restart Manager) and addressed by re-running after closing it (§5.13).
 - **One run per exact destination root per machine.** A second run on the same root is refused (machine-wide lock). Nested or overlapping destination roots are *not* detected — that situation falls under the exclusivity assumption (§5.12, F26/E33).
 - **Abort-and-rerun is the only recovery model.** On device disconnect or fatal conditions the run stops resumably; there is no in-run reconnect flow. Resume is cheap by design (skip heuristic + verified checkpoints), which is what makes this acceptable (§5.13, F31).
+- **Graceful cancel takes effect between files.** A very large in-flight file finishes before a `q`/Ctrl+C cancel is honored (pre-1.0 coordinator granularity, PLAN §13.2). Killing the process outright is always safe — the in-flight temp self-deletes or resumes from its last verified checkpoint — so impatience costs nothing but a rerun.
 
 ## Performance boundaries
 
@@ -59,12 +60,24 @@ Every limitation below is **deliberate** — a scope decision from `VISION.md` o
 - **Bottleneck verdicts are confidence-rated hypotheses.** They derive from application-side I/O occupancy, which approximates but does not equal physical device utilization (§5.14).
 - **Some hardware behavior is invisible.** DM-SMR drives cannot be reliably detected in software (their write-collapse is inferred from throughput signatures); USB bridges frequently fail or misreport capability IOCTLs (profiles fall back conservatively); removal-policy readings are inferences (§3.4, §5.5).
 - **Free-space forecasting is approximate.** The early warning uses a conservative range (cluster rounding, replacement double-occupancy); the authoritative stop is the actual disk-full breaker (§5.5, E15).
-- **Same-spindle HDD copies are inherently slow.** Alternating-burst mode amortizes seeks but cannot eliminate the physics of one head serving reads and writes (§8.3).
+- **Same-spindle HDD copies are inherently slow.** Alternating-burst mode amortizes seeks but cannot eliminate the physics of one head serving reads and writes (§8.3). The burst engine itself is pre-1.0 release work (§13.2): until it lands, a same-spindle copy runs under the generic HDD profile — queue depth capped at 2, a single large stream, 16 MiB chunks — which bounds seek storms but does not yet optimize them.
 
 ## Filesystem-capability degradation (NTFS ↔ ReFS deltas)
 
 - **ReFS versions vary in capability.** Where a destination volume reports no support for named streams or EAs (capability flags, not FS names), those items are dropped with per-file warnings and counted — never silently; the file still counts as copied-with-warnings (§4.4). EFS files land decrypted on ReFS (`efs_downgrade` warning) since ReFS has no EFS.
 - All FAT-family limitations (4 GiB cap, timestamp granularity, DST shifts, missing file IDs, no journal) are gone from this list because those filesystems are **rejected outright** rather than degraded — see the scope section above.
+
+## Pre-1.0 implementation status (temporary, tracked in PLAN §13.2)
+
+- **The performance architecture is not yet claimed.** The current large-file path is bounded, buffered, synchronous streaming behind the transport port; the IOCP unbuffered ring, active QD/stream controls, parallel enumeration, and the deferred-close pool are release work gated on their own benchmarks and simulations. `--no-unbuffered` is accepted but currently inert. No throughput numbers are certified (BENCHMARKS.md).
+- **Verification read-back is currently buffered.** A post-copy `--verify` of freshly written data may be partially served from the OS cache; it still catches logic and digest mismatches. The strong form today is a standalone `bigcp verify` run later (cold cache); unbuffered read-back arrives with the transport work.
+- **Post-copy `--verify` covers files only** (all streams, EAs, masked attributes, timestamps); directories and reparse objects are verified by the standalone form.
+- **One crash micro-window can strand a single opaque temp:** opening a new named stream requires briefly clearing the temp's pending-delete disposition; a kill inside that syscall window leaves one reported `.part` artifact (never a partial final name, never damaged old data).
+- **Deferred conveniences:** Restart Manager lock-owner naming, device/space circuit breakers, free-space forecasting, orphan-scan/retention cleanup, the full dashboard TUI, and a persisted standalone-verify report kind are release work; failures today are per-object and fully audited.
+
+## Verification limits (what testing can never prove here)
+
+- **Million-scale and endurance behavior is simulation-verified, not empirically reproduced.** VISION prohibits tests that create ~100 k+ files, run very long, reduce drive lifespan, or impact machine stability — with no exceptions. Consequently: million-entry directory handling is validated by synthetic enumeration simulation plus bounded (tens-of-thousands) real-file tests of the same code paths; TB-class copy behavior is extrapolated from bounded workloads; and real surprise-removal behavior (cable pulls, forced detach) is validated only through fault injection — the tool's breaker/resume design is exercised, but no test has ever yanked a real (or virtual) device mid-write. These residual gaps are permanent and documented rather than quietly assumed away (PLAN §12.0, §12.5).
 
 ## Reporting and audit
 

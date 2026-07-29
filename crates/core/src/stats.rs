@@ -62,7 +62,12 @@ impl StatsTracker {
         let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
         let read_rate = self.window_read as f64 / seconds;
         let write_rate = self.window_written as f64 / seconds;
-        self.best_write_bytes_per_second = self.best_write_bytes_per_second.max(write_rate);
+        // "Best observed sustained throughput" (F10) requires a *sustained*
+        // window: a sub-5-second tail whose writes landed in cache would
+        // otherwise inflate the peak and corrupt the efficiency figure.
+        if elapsed >= Duration::from_secs(5) {
+            self.best_write_bytes_per_second = self.best_write_bytes_per_second.max(write_rate);
+        }
         let hypothesis = if self.window_read == 0 && self.window_written == 0 {
             "discovery-bound"
         } else if write_rate + f64::EPSILON < read_rate * 0.75 {
@@ -125,5 +130,114 @@ impl StatsTracker {
 impl Default for StatsTracker {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// One `--analyze` size-class aggregate.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SizeClassSummary {
+    /// Human-stable bucket label.
+    pub label: String,
+    /// Completed copies in this bucket.
+    pub files: u64,
+    /// Logical bytes copied in this bucket.
+    pub bytes: u64,
+    /// Total wall-clock execution seconds spent in this bucket.
+    pub seconds: f64,
+}
+
+/// One `--analyze` slowest-copy sample.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SlowFileSample {
+    /// Relative display path.
+    pub relative_path: String,
+    /// Logical bytes copied.
+    pub bytes: u64,
+    /// Wall-clock execution seconds (queue wait excluded).
+    pub seconds: f64,
+    /// Effective throughput for this file.
+    pub mbps: f64,
+}
+
+/// Bounded live-run insight summary produced by `--analyze` (VISION).
+///
+/// Deliberately minimal-but-high-signal: five fixed size-class buckets plus a
+/// top-N slowest table answer "where did the time go" without per-file log
+/// growth. Collection is one comparison and an occasional 20-entry insertion
+/// per completed file; the output is one JSONL event and one report section.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct AnalysisSummary {
+    /// Aggregates by logical size class.
+    pub size_classes: Vec<SizeClassSummary>,
+    /// Slowest completed copies, worst first, capped at 20.
+    pub slowest_files: Vec<SlowFileSample>,
+}
+
+const SLOWEST_LIMIT: usize = 20;
+const SIZE_CLASS_BOUNDS: [(u64, &str); 5] = [
+    (64 * 1024, "<=64KiB"),
+    (1024 * 1024, "<=1MiB"),
+    (16 * 1024 * 1024, "<=16MiB"),
+    (256 * 1024 * 1024, "<=256MiB"),
+    (u64::MAX, ">256MiB"),
+];
+
+/// Accumulates `--analyze` insight with fixed memory.
+#[derive(Debug, Default)]
+pub struct AnalysisCollector {
+    classes: [(u64, u64, f64); 5],
+    slowest: Vec<SlowFileSample>,
+}
+
+impl AnalysisCollector {
+    /// Records one successfully copied file.
+    pub fn record(&mut self, relative_path: &str, bytes: u64, seconds: f64) {
+        let index = SIZE_CLASS_BOUNDS
+            .iter()
+            .position(|(bound, _)| bytes <= *bound)
+            .unwrap_or(SIZE_CLASS_BOUNDS.len() - 1);
+        let class = &mut self.classes[index];
+        class.0 = class.0.saturating_add(1);
+        class.1 = class.1.saturating_add(bytes);
+        class.2 += seconds;
+        let qualifies = self.slowest.len() < SLOWEST_LIMIT
+            || self
+                .slowest
+                .last()
+                .is_some_and(|slowest| seconds > slowest.seconds);
+        if qualifies {
+            let effective_seconds = seconds.max(f64::EPSILON);
+            self.slowest.push(SlowFileSample {
+                relative_path: relative_path.to_owned(),
+                bytes,
+                seconds,
+                mbps: bytes as f64 / effective_seconds / 1_000_000.0,
+            });
+            self.slowest.sort_by(|left, right| {
+                right
+                    .seconds
+                    .partial_cmp(&left.seconds)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            self.slowest.truncate(SLOWEST_LIMIT);
+        }
+    }
+
+    /// Produces the report/log summary.
+    #[must_use]
+    pub fn finish(self) -> AnalysisSummary {
+        AnalysisSummary {
+            size_classes: SIZE_CLASS_BOUNDS
+                .iter()
+                .zip(self.classes)
+                .map(|((_, label), (files, bytes, seconds))| SizeClassSummary {
+                    label: (*label).to_owned(),
+                    files,
+                    bytes,
+                    seconds,
+                })
+                .collect(),
+            slowest_files: self.slowest,
+        }
     }
 }

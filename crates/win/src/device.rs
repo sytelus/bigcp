@@ -11,6 +11,7 @@ use std::mem::size_of;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
+use std::path::Path;
 
 use windows_sys::Win32::Storage::FileSystem::{
     BusTypeNvme, BusTypeSata, BusTypeUsb, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
@@ -107,22 +108,43 @@ pub fn profile_device(volume: &VolumeInfo) -> DeviceInfo {
     }
 }
 
-fn open_volume_device(volume: &VolumeInfo) -> io::Result<File> {
-    let units: Vec<u16> = volume.root.as_os_str().encode_wide().collect();
-    if units.len() < 2 || units[1] != u16::from(b':') {
+/// Builds the `\\.\X:` query-only device path for a drive-letter volume root.
+///
+/// Production roots arrive in extended-length form (`\\?\C:\`) because every
+/// path is canonicalized before probing, so a `\\?\` or `\\.\` prefix is
+/// skipped before the drive-letter check. Without that skip, profiling
+/// silently degraded to the low-confidence fallback on every real run.
+fn device_path_for_root(root: &Path) -> io::Result<OsString> {
+    let units: Vec<u16> = root.as_os_str().encode_wide().collect();
+    let body = match units.as_slice() {
+        [b1, b2, q, b3, rest @ ..]
+            if *b1 == u16::from(b'\\')
+                && *b2 == u16::from(b'\\')
+                && (*q == u16::from(b'?') || *q == u16::from(b'.'))
+                && *b3 == u16::from(b'\\') =>
+        {
+            rest
+        }
+        rest => rest,
+    };
+    if body.len() < 2 || body[1] != u16::from(b':') {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "volume mount is not a drive-letter root",
         ));
     }
-    let device = OsString::from_wide(&[
+    Ok(OsString::from_wide(&[
         u16::from(b'\\'),
         u16::from(b'\\'),
         u16::from(b'.'),
         u16::from(b'\\'),
-        units[0],
-        units[1],
-    ]);
+        body[0],
+        body[1],
+    ]))
+}
+
+fn open_volume_device(volume: &VolumeInfo) -> io::Result<File> {
+    let device = device_path_for_root(&volume.root)?;
     let mut options = OpenOptions::new();
     options
         .access_mode(0)
@@ -202,4 +224,31 @@ fn query_disk_numbers(handle: &File) -> Option<Vec<u32>> {
         }
     }
     Some(disks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::device_path_for_root;
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    #[test]
+    fn extended_length_root_yields_drive_device_path() {
+        // Regression: production roots are always extended-length; the old
+        // check rejected them and silently disabled all device profiling.
+        let device = device_path_for_root(Path::new(r"\\?\C:\"));
+        assert_eq!(device.ok(), Some(OsString::from(r"\\.\C:")));
+    }
+
+    #[test]
+    fn bare_drive_root_yields_drive_device_path() {
+        let device = device_path_for_root(Path::new(r"C:\"));
+        assert_eq!(device.ok(), Some(OsString::from(r"\\.\C:")));
+    }
+
+    #[test]
+    fn non_letter_roots_are_rejected() {
+        assert!(device_path_for_root(Path::new(r"\\?\Volume{0000}\a")).is_err());
+        assert!(device_path_for_root(Path::new(r"relative")).is_err());
+    }
 }

@@ -224,3 +224,51 @@ dismounted, benchmarked, or issued raw writes to any drive, and no existing
 user file or external/removable drive was used. The unrun destructive,
 long-running, VHDX/ReFS, chaos, differential, million-entry, and endurance
 gates remain explicitly release-blocking in `PLAN_DEVIATIONS.md`.
+
+## 2026-07-29 deviation-disposition and hardening review
+
+This review dispositioned all 21 `PLAN_DEVIATIONS.md` entries, aligned PLAN.md
+with the owner's hardened VISION test guidance (which was not modified),
+implemented the `--analyze` live-run insight flag, and fixed the review's
+confirmed findings — most notably creation-time EFS preservation, the
+extended-prefix device-profiling defect, dry-run/flag-change checkpoint
+destruction, interior-journal-record tolerance with clean-end compaction,
+de-tautologized I6 discovery accounting, SubstituteName-authoritative symlink
+fidelity, worker-panic containment, and the exit-code contract for usage
+errors. Details and rationale are in `docs/REVIEW_2026-07-29.md` and
+`CHANGELOG.md`.
+
+The final serial workspace run used the newly created root:
+
+`C:\Users\shitals\AppData\Local\Temp\bigcp-tests-75a8bec1a4a045aa9992ff68ecf167c7`
+
+It passed 63 tests with zero failures: 3 CLI, 22 core unit, 10 core
+end-to-end, 3 testkit safety, 1 TUI, and 24 Windows-boundary tests. New or
+strengthened cases cover: extended-prefix and drive-letter device-path
+resolution; symlink SubstituteName-over-PrintName selection, relative-flag
+round-trip, and volume-GUID refusal; interior-bad-journal-record skip without
+truncating later records; clean-end journal compaction keeping the job header
+and live checkpoints; outcome-without-discovery loudness; opaque temp-name
+shape enforcement on resume (including the ADS-colon rejection); and the
+`--analyze` contract (five fixed buckets summing to copied files, a bounded
+slowest table, exactly one `analysis` log event, and full absence without the
+flag).
+
+The following gates also passed after all changes: `cargo fmt --all -- --check`,
+warning-denied Clippy across all workspace targets, the locked serial workspace
+suite above, `cargo build --workspace --release --locked`, the rewritten
+`scripts/check-test-safety.ps1` (substring scan for destructive storage
+commands across crates, scripts, and CI plus anchored guard assertions), and
+`scripts/check-frozen-inputs.ps1` re-pinned to the post-review PLAN.md,
+owner-updated VISION.md, and LIMITATIONS.md hashes recorded in that script.
+
+Safety posture of this pass: the testkit generator now structurally caps any
+scenario at 10,000 entries and depth 32, so the VISION prohibition on
+large-scale trees is enforced by code, not convention. Every new test writes
+only inside GUID-named children of the validated C: system temporary
+directory; the historical `.bigcp.*.tmp` pattern mentioned in earlier sections
+predates the current single opaque `.bigcp-….part` scheme. No test in this
+pass — added, changed, or retained — mounts, formats, fills, dismounts,
+benchmarks, forces disconnects, or issues raw operations against any drive,
+and scale/device-loss behavior remains validated by simulation and fault
+injection only.

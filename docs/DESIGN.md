@@ -42,6 +42,9 @@ the raw reparse control path. All are built under owned opaque sibling names.
 ## Persistence and audit
 
 The CRC32C-framed JSONL journal is a resume hint, never a completion database.
+(One non-content use of a second hash exists: run-lock and job identity derive
+from SHA-256 of the resolved root paths — identity naming, not data integrity,
+so VISION's single-content-hash rule is unaffected.)
 Loading retains only the valid prefix and discards a torn tail. Job signatures
 bind checkpoints to semantic source, destination, and option identity. A temp
 prefix is reread and hashed before resume. Each resumable record also binds the
@@ -88,9 +91,24 @@ both chunk size and the number of threshold-sized small-file workers.
 Same-disk extent overlap is reported.
 
 The directory join avoids a destination `stat` per source file. Stream and EA
-work is deferred until required. Dense large files are preallocated without
-`SetFileValidData`; sparse files never are. Statistics report application-side
-rates and label bottleneck conclusions as hypotheses.
+work is deferred until required. Statistics report application-side rates and
+label bottleneck conclusions as hypotheses.
+
+**Fragmentation stance.** Parallel writers normally interleave allocation and
+shred concurrently growing files into many extents — a real read-performance
+cost on seek-penalty media. bigcp counters this structurally, exploiting the
+one thing a copier always knows that ordinary writers do not: the final size
+before the first byte. Dense large files are preallocated to their full source
+size at temp creation (`FileAllocationInfo`, never `SetFileValidData`), so the
+allocator reserves the whole run in one decision and concurrent streams cannot
+interleave each other's extents. Small files are read whole and written in a
+single shot — one allocation event, one extent (or MFT-resident storage).
+Sparse files are deliberately exempt: dense preallocation would destroy the
+holes being preserved, so their layout mirrors the source's own. This stance
+is evidence-backed, not assumed: `bigcp-testkit extents` measures physical
+extent counts (`FSCTL_GET_RETRIEVAL_POINTERS`, read-only) and benchmark
+entries record that evidence per `BENCHMARKS.md`, which will catch any future
+regression that quietly drops preallocation.
 
 ## Constraints worth preserving
 

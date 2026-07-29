@@ -13,6 +13,7 @@ mod util;
 
 pub mod device;
 pub mod ea;
+pub mod extents;
 pub mod file;
 pub mod lock;
 pub mod metadata;
@@ -29,6 +30,7 @@ pub use ea::{
     read_extended_attributes, read_extended_attributes_checked, write_extended_attributes,
     write_extended_attributes_checked,
 };
+pub use extents::extent_count;
 pub use file::{
     COPYABLE_ATTRIBUTES, DestinationTemp, SourceFile, create_directory, is_cloud_placeholder,
     is_compressed, is_encrypted, is_sparse, publish_audit_temporary, set_basic_at,

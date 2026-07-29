@@ -44,6 +44,7 @@ pub(crate) struct FileCopyJob {
 
 impl FileCopyJob {
     fn execute(self) -> CompletedCopy {
+        let started = std::time::Instant::now();
         let mut counters = Counters::default();
         let request = EngineRequest {
             source_path: &self.source_path,
@@ -63,7 +64,21 @@ impl FileCopyJob {
             destination_supports_encryption: self.destination_supports_encryption,
             known_streams: Some(&self.streams),
         };
-        let result = copy_file(&request, &mut counters, None);
+        // A panicking engine call must still produce a completion: the
+        // coordinator's blocking `receive` would otherwise deadlock forever
+        // behind the other workers' live sender clones. Engine code is
+        // panic-free by lint policy; this is cheap insurance for the bug case.
+        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            copy_file(&request, &mut counters, None)
+        })) {
+            Ok(result) => result,
+            Err(_) => Err(OperationError::semantic(
+                crate::error::ErrorCategory::Internal,
+                "worker_panic",
+                self.source_snapshot.relative_path.clone(),
+                "worker thread panicked during copy; this is a bigcp bug — please file the log",
+            )),
+        };
         CompletedCopy {
             destination_path: self.destination_path,
             source_snapshot: self.source_snapshot,
@@ -72,6 +87,7 @@ impl FileCopyJob {
             counters,
             result,
             logical_bytes: self.logical_bytes,
+            seconds: started.elapsed().as_secs_f64(),
         }
     }
 }
@@ -86,6 +102,8 @@ pub(crate) struct CompletedCopy {
     pub result: Result<EngineResult, OperationError>,
     /// Logical bytes represented even when transfer fails partway.
     pub logical_bytes: u64,
+    /// Wall-clock execution time (queue wait excluded) for `--analyze`.
+    pub seconds: f64,
 }
 
 /// Fixed-size worker set with bounded work and result channels.

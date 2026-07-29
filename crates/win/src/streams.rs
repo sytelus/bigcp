@@ -18,7 +18,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use crate::metadata::{FileIdentity, metadata_from_file};
-use crate::util::{bool_result, last_error, wide_null};
+use crate::util::{last_error, wide_null};
 
 /// One data stream reported by Windows.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -315,12 +315,6 @@ impl Drop for FindGuard {
             let _ = FindClose(self.0);
         }
     }
-}
-
-/// Converts one FindNext BOOL for focused wrapper tests.
-#[doc(hidden)]
-pub fn stream_bool_result_for_test(value: i32) -> io::Result<()> {
-    bool_result(value)
 }
 
 #[cfg(test)]
