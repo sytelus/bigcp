@@ -214,6 +214,11 @@ pub struct Counters {
     pub links_skipped: u64,
     /// Reparse writes modeled by a dry-run.
     pub links_planned: u64,
+    /// Unnamed-stream bytes seen at enumeration time; the basis for live
+    /// remaining-work estimates (named-stream bytes join the logical totals
+    /// only once a file is opened, so this can trail the logical figures).
+    #[serde(default)]
+    pub bytes_enumerated: u64,
     /// Source logical bytes discovered.
     pub bytes_logical_discovered: u64,
     /// Logical bytes represented by copied outcomes.
@@ -234,8 +239,9 @@ impl Counters {
     /// purpose: if any code path ever drops a discovered file without an
     /// outcome, `reconcile` now detects it. Counting both from the same call
     /// would make the I6 equation a tautology.
-    pub fn note_file_discovered(&mut self) {
+    pub fn note_file_discovered(&mut self, enumerated_bytes: u64) {
         self.files_discovered = self.files_discovered.saturating_add(1);
+        self.bytes_enumerated = self.bytes_enumerated.saturating_add(enumerated_bytes);
     }
 
     /// Applies one terminal file outcome to the disjoint outcome counters.
@@ -359,15 +365,16 @@ mod tests {
     #[test]
     fn file_outcomes_reconcile_exactly() {
         let mut counters = Counters::default();
-        counters.note_file_discovered();
+        counters.note_file_discovered(4);
         counters.apply_file(&FileOutcome::CopiedNew {
             bytes: 4,
             digest: None,
         });
-        counters.note_file_discovered();
+        counters.note_file_discovered(5);
         counters.apply_file(&FileOutcome::SkippedSame { bytes: 5 });
         assert!(counters.reconcile().is_ok());
         assert_eq!(counters.files_discovered, 2);
+        assert_eq!(counters.bytes_enumerated, 9);
         assert_eq!(counters.bytes_logical_discovered, 9);
     }
 
@@ -376,7 +383,7 @@ mod tests {
         // Discovery without a terminal outcome must fail reconciliation —
         // this is the direction the old outcome-time counting could not see.
         let mut counters = Counters::default();
-        counters.note_file_discovered();
+        counters.note_file_discovered(1);
         assert!(counters.reconcile().is_err());
     }
 

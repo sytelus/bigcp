@@ -248,24 +248,38 @@ pub fn run_standalone_verify(options: &VerifyOptions) -> Result<VerificationSumm
             }
             match source_entry.metadata.kind {
                 ObjectKind::Directory => {
-                    let aux_equal = directory_aux_equal(
+                    // A read failure is reported as unverifiable, never as a
+                    // difference: "differ" is a statement about content and
+                    // must not be fabricated from an inaccessible object.
+                    match directory_aux_equal(
                         &source_entry.path,
                         &destination_entry.path,
                         &mut counters,
                         true,
-                    )
-                    .unwrap_or(false);
-                    if !metadata_equal || !aux_equal {
-                        summary.failed = summary.failed.saturating_add(1);
-                        push_mismatch(
-                            &mut summary,
-                            format!(
-                                "{}: directory metadata, named streams, or EAs differ",
-                                relative.display()
-                            ),
-                        );
-                    } else {
-                        summary.passed = summary.passed.saturating_add(1);
+                    ) {
+                        Ok(aux_equal) if metadata_equal && aux_equal => {
+                            summary.passed = summary.passed.saturating_add(1);
+                        }
+                        Ok(_) => {
+                            summary.failed = summary.failed.saturating_add(1);
+                            push_mismatch(
+                                &mut summary,
+                                format!(
+                                    "{}: directory metadata, named streams, or EAs differ",
+                                    relative.display()
+                                ),
+                            );
+                        }
+                        Err(error) => {
+                            summary.failed = summary.failed.saturating_add(1);
+                            push_mismatch(
+                                &mut summary,
+                                format!(
+                                    "{}: could not be verified (read failed: {error})",
+                                    relative.display()
+                                ),
+                            );
+                        }
                     }
                     tasks.push((source_entry.path, destination_entry.path, relative));
                 }
@@ -290,30 +304,44 @@ pub fn run_standalone_verify(options: &VerifyOptions) -> Result<VerificationSumm
                     }
                 }
                 ObjectKind::Reparse => {
-                    let reparse_equal = read_reparse_data(&source_entry.path)
-                        .and_then(|source_data| {
+                    // As above: unreadable is reported as unverifiable, not
+                    // as a fabricated difference.
+                    let reparse_state =
+                        read_reparse_data(&source_entry.path).and_then(|source_data| {
                             read_reparse_data(&destination_entry.path)
                                 .map(|destination_data| source_data == destination_data)
-                        })
-                        .unwrap_or(false);
-                    let auxiliary_equal = directory_aux_equal(
+                        });
+                    let auxiliary_state = directory_aux_equal(
                         &source_entry.path,
                         &destination_entry.path,
                         &mut counters,
                         true,
-                    )
-                    .unwrap_or(false);
-                    if reparse_equal && metadata_equal && auxiliary_equal {
-                        summary.passed = summary.passed.saturating_add(1);
-                    } else {
-                        summary.failed = summary.failed.saturating_add(1);
-                        push_mismatch(
-                            &mut summary,
-                            format!(
-                                "{}: reparse payload, named streams, EAs, or metadata differ",
-                                relative.display()
-                            ),
-                        );
+                    );
+                    match (reparse_state, auxiliary_state) {
+                        (Ok(reparse_equal), Ok(auxiliary_equal)) => {
+                            if reparse_equal && metadata_equal && auxiliary_equal {
+                                summary.passed = summary.passed.saturating_add(1);
+                            } else {
+                                summary.failed = summary.failed.saturating_add(1);
+                                push_mismatch(
+                                    &mut summary,
+                                    format!(
+                                        "{}: reparse payload, named streams, EAs, or metadata differ",
+                                        relative.display()
+                                    ),
+                                );
+                            }
+                        }
+                        (Err(error), _) | (_, Err(error)) => {
+                            summary.failed = summary.failed.saturating_add(1);
+                            push_mismatch(
+                                &mut summary,
+                                format!(
+                                    "{}: could not be verified (read failed: {error})",
+                                    relative.display()
+                                ),
+                            );
+                        }
                     }
                 }
             }
@@ -346,9 +374,11 @@ fn verify_file_pair(
         return Err("copied metadata differs".to_owned());
     }
     let (_, source_digest, source_streams, source_eas) =
-        digest_file_streams_and_eas(source, counters).map_err(|error| error.to_string())?;
+        digest_file_streams_and_eas(source, counters)
+            .map_err(|error| format!("could not be verified (read failed: {error})"))?;
     let (_, destination_digest, destination_streams, destination_eas) =
-        digest_file_streams_and_eas(destination, counters).map_err(|error| error.to_string())?;
+        digest_file_streams_and_eas(destination, counters)
+            .map_err(|error| format!("could not be verified (read failed: {error})"))?;
     if source_digest != destination_digest
         || source_streams != destination_streams
         || source_eas != destination_eas

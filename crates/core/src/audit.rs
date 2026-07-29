@@ -71,10 +71,6 @@ pub enum AuditEvent {
         source_class: String,
         /// Destination class.
         destination_class: String,
-        /// Source queue depth.
-        qd_source: usize,
-        /// Destination queue depth.
-        qd_destination: usize,
         /// Composed chunk bytes.
         chunk_bytes: usize,
         /// Concurrent stream cap.
@@ -302,7 +298,6 @@ pub fn option_summary(options: &CopyOptions) -> serde_json::Value {
         "replace": options.replace,
         "flush": options.flush,
         "no_sparse": options.no_sparse,
-        "no_unbuffered": options.no_unbuffered,
         "raw_reparse": options.raw_reparse,
         "fresh": options.fresh,
         "source_profile": options.source_profile,

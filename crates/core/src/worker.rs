@@ -63,6 +63,9 @@ impl FileCopyJob {
             checkpoint_threshold: self.checkpoint_threshold,
             destination_supports_encryption: self.destination_supports_encryption,
             known_streams: Some(&self.streams),
+            // Small files finish in bounded time; between-file cancellation
+            // at the coordinator is responsive enough for this path.
+            cancel: &|| false,
         };
         // A panicking engine call must still produce a completion: the
         // coordinator's blocking `receive` would otherwise deadlock forever

@@ -95,6 +95,68 @@ versioning once its 1.0 release gates are complete.
   under the generic HDD profile (queue depth 2, one stream, 16 MiB chunks) —
   bounded, not yet optimized.
 
+### 2026-07-29 deviation-registry cleanup
+
+- Verified every PLAN_DEVIATIONS.md disposition against the tree: all nine
+  normative entries are present in PLAN.md, and all release-work items are
+  registered in PLAN §13.2. Removed the resolved normative entries (history
+  preserved in `docs/REVIEW_2026-07-29.md` and git) and rewrote the file as an
+  open-items registry — 14 items, each with its required verification — plus a
+  proposed five-phase execution order (verification net first, then cheap
+  self-contained wins, transport, benchmark-gated orchestration, and elevated
+  matrices last). Two review findings were promoted to tracked open items:
+  mid-file cancellation granularity and the standalone-verify
+  error-vs-divergence distinction.
+
+### 2026-07-29 complexity-control pass (ADR 0027)
+
+#### Added
+
+- Device/disk-full circuit breaker: five consecutive device-gone or
+  disk-full failures stop the run early and resumably with exit code 4 and
+  clear reconnect/free-space guidance, instead of grinding through every
+  remaining object. New Win32 codes 21 and 55 classify as device-gone.
+- Mid-file graceful cancellation: `q`/Ctrl+C now takes effect between chunks
+  inside a large file (the partial temp self-deletes or resumes from its
+  checkpoint); a clean cancel stays a warning, never an error.
+- ETA display (VISION `/ETA`): remaining-known-work estimate in the TUI
+  dashboard and plain output, suppressed while writes are idle; backed by a
+  new additive `bytes_enumerated` counter.
+- Standalone verify now reports unreadable objects as "could not be
+  verified (read failed)" instead of claiming they differ.
+
+#### Removed (complexity control — declared limitations instead)
+
+- The IOCP overlapped-ring engine design: the 1.0 large-file design is now a
+  sequential unbuffered reader/writer pipeline (PLAN §5.9) — same robocopy
+  `/J` semantics, a fraction of the complexity and test burden.
+- `qd-src`/`qd-dst` tune keys, profile queue-depth fields, and the log
+  profile event's queue-depth fields (pre-1.0 schema change): the sequential
+  pipeline has no queue depth to tune.
+- The bounded runtime governor, free-space forecast, Restart Manager
+  lock-owner naming, profiler vendor/hotplug/cache extras, handle-based ADS
+  discovery, deferred-close finalizer pool, per-device scheduler, decorative
+  TUI widgets, `VerifyOptions.report_path`, modeled audit-drain state,
+  orphan-scan cleanup, and differential-copier release gates — each deletion
+  recorded inline in PLAN.md with its user-facing consequence in
+  LIMITATIONS.md.
+
+### 2026-07-29 buffered engine finalized (ADR 0028)
+
+- The owner clarified that robocopy `/J` (unbuffered I/O) was never an
+  intentional VISION mandate and removed it from the expressed defaults.
+  Consequently the planned unbuffered large-file pipeline was deleted: the
+  shipped buffered sequential chunk loop — with the OS cache manager's
+  read-ahead and write-behind providing the overlap — is the final 1.0
+  engine. Unbuffered I/O moves to post-v1 backlog, reopenable only by
+  benchmark evidence of a material buffered shortfall.
+- Removed the now-meaningless `--no-unbuffered` flag and
+  `CopyOptions.no_unbuffered` (and its log-options entry). Same-run
+  `--verify` read-back is buffered by design; standalone `bigcp verify` is
+  the cold-cache authoritative form (LIMITATIONS.md).
+- Remaining 1.0 work is verification and evidence only: the test matrices,
+  the elevated ReFS cells, and the operator hardware checklist.
+
 ### Known pre-1.0 work
 
 - IOCP/no-buffering engine and its sans-I/O model, comprehensive fault/chaos

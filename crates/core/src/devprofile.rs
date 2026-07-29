@@ -7,18 +7,16 @@ use crate::error::BigcpError;
 use crate::options::{DeviceClass, TuneOptions};
 
 /// One side's initial static settings.
+///
+/// There is no queue-depth field: the shipped engine issues synchronous
+/// sequential I/O (queue depth 1 by construction), so a queue-depth knob
+/// would be a claim the implementation cannot honor.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SideProfile {
     /// Selected class.
     pub class: DeviceClass,
     /// high or low query confidence.
     pub confidence: String,
-    /// Queue depth for this side.
-    pub queue_depth: usize,
-    /// Profile-declared minimum queue depth.
-    pub minimum_queue_depth: usize,
-    /// Profile-declared maximum queue depth.
-    pub maximum_queue_depth: usize,
     /// Preferred chunk bytes.
     pub chunk_bytes: usize,
     /// Preferred concurrent streams.
@@ -58,14 +56,6 @@ pub fn select_copy_profile(
     let cores = std::thread::available_parallelism().map_or(4, usize::from);
     let mut source = side_profile(source_info, source_override, cores, true);
     let mut destination = side_profile(destination_info, destination_override, cores, false);
-    if let Some(value) = tune.qd_src {
-        source.queue_depth = value;
-    }
-    if let Some(value) = tune.qd_dst {
-        destination.queue_depth = value;
-    }
-    validate_queue_depth(&source)?;
-    validate_queue_depth(&destination)?;
     if let Some(workers) = tune.threads {
         source.workers = workers;
         destination.workers = workers;
@@ -189,36 +179,29 @@ fn side_profile(
         "low"
     }
     .to_owned();
-    let (queue_depth, min_qd, max_qd, chunk_bytes, streams, workers, enumeration_threads) =
-        match class {
-            DeviceClass::Nvme => (
-                8,
-                2,
-                16,
-                8 * 1024 * 1024,
-                if cores >= 8 { 4 } else { 2 },
-                (4 * cores).min(64),
-                cores.min(16),
-            ),
-            DeviceClass::SataSsd => (4, 1, 8, 8 * 1024 * 1024, 2, 32, 8),
-            DeviceClass::UsbSsd => (4, 1, 8, 4 * 1024 * 1024, 2, 16, 8),
-            DeviceClass::Hdd => (
-                2,
-                1,
-                2,
-                16 * 1024 * 1024,
-                1,
-                if source { 4 } else { 8 },
-                if source { 2 } else { 4 },
-            ),
-            DeviceClass::Auto | DeviceClass::Unknown => (2, 1, 4, 4 * 1024 * 1024, 1, 4, 4),
-        };
+    let (chunk_bytes, streams, workers, enumeration_threads) = match class {
+        DeviceClass::Nvme => (
+            8 * 1024 * 1024,
+            if cores >= 8 { 4 } else { 2 },
+            (4 * cores).min(64),
+            cores.min(16),
+        ),
+        DeviceClass::SataSsd => (8 * 1024 * 1024, 2, 32, 8),
+        DeviceClass::UsbSsd => (4 * 1024 * 1024, 2, 16, 8),
+        // Seek-penalty media get large sequential chunks, a single large
+        // stream, and reduced concurrency: parallelism that helps SSDs is
+        // head-thrash on a spindle.
+        DeviceClass::Hdd => (
+            16 * 1024 * 1024,
+            1,
+            if source { 4 } else { 8 },
+            if source { 2 } else { 4 },
+        ),
+        DeviceClass::Auto | DeviceClass::Unknown => (4 * 1024 * 1024, 1, 4, 4),
+    };
     SideProfile {
         class,
         confidence,
-        queue_depth,
-        minimum_queue_depth: min_qd,
-        maximum_queue_depth: max_qd,
         chunk_bytes,
         streams,
         workers,
@@ -236,21 +219,6 @@ fn detected_class(info: &DeviceInfo) -> DeviceClass {
         Some(DeviceBus::Usb) => DeviceClass::UsbSsd,
         Some(DeviceBus::Other) | None => DeviceClass::Unknown,
     }
-}
-
-fn validate_queue_depth(profile: &SideProfile) -> Result<(), BigcpError> {
-    if profile.queue_depth < profile.minimum_queue_depth
-        || profile.queue_depth > profile.maximum_queue_depth
-    {
-        return Err(BigcpError::Invalid(format!(
-            "{:?} queue depth {} is outside the safe profile range {}..={}",
-            profile.class,
-            profile.queue_depth,
-            profile.minimum_queue_depth,
-            profile.maximum_queue_depth
-        )));
-    }
-    Ok(())
 }
 
 #[cfg(test)]

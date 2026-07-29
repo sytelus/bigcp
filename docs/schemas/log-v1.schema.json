@@ -115,8 +115,6 @@
         "required": [
           "source_class",
           "destination_class",
-          "qd_source",
-          "qd_destination",
           "chunk_bytes",
           "streams",
           "workers"

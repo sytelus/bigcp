@@ -98,13 +98,15 @@ replacements, warnings, grouped failures, extras, hints, and verification.
   listing without per-source-item destination stats.
 - **Engine:** a bounded file transfer strategy; both paths share one finalizer.
 - **Watermark:** contiguous temp prefix eligible for a checkpoint.
-- **QD:** maximum intended in-flight I/O count for one device side.
+- **QD:** queue depth — in-flight I/O count per device side; always 1 per
+  stream in the shipped sequential engine (aggregate parallelism comes from
+  streams and workers).
 - **MTL:** adapter-reported maximum transfer length used to clamp chunks.
 - **VDL:** valid data length; bigcp never uses `SetFileValidData`.
 - **UASP/BOT:** USB storage transports; BOT-like uncertainty selects a
   conservative profile.
-- **4Kn/512e:** physical sector presentation modes relevant to future
-  unbuffered alignment.
+- **4Kn/512e:** physical sector presentation modes (informational only —
+  buffered I/O has no alignment rules, ADR 0028).
 - **SLC cache:** SSD write cache whose exhaustion can cause sustained slowdown.
 - **SMR/CMR:** magnetic recording layouts; SMR can collapse on long writes.
 - **Tunneling:** NTFS name reuse behavior; final metadata is applied after
@@ -118,8 +120,10 @@ replacements, warnings, grouped failures, extras, hints, and verification.
   verbatim, never followed.
 - **Stream:** one `name:$DATA` payload of an object; the unnamed stream is the
   file's ordinary data.
-- **Ring:** the planned in-flight buffer set of the future IOCP transport
-  (PLAN §13.2); not present in the current synchronous transport.
+- **Ring:** a historical term from two deleted streaming designs (the IOCP
+  overlapped ring, ADR 0027, and the unbuffered reader/writer pair, ADR
+  0028). No ring exists: the shipped engine is a sequential buffered chunk
+  loop (PLAN §5.9).
 
 ## Release checklist
 

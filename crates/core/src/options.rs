@@ -25,10 +25,6 @@ pub enum DeviceClass {
 /// Advanced performance overrides exposed through the single tune hatch.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TuneOptions {
-    /// Source-side streaming queue depth.
-    pub qd_src: Option<usize>,
-    /// Destination-side streaming queue depth.
-    pub qd_dst: Option<usize>,
     /// Streaming chunk bytes.
     pub chunk_bytes: Option<usize>,
     /// Concurrent large-file streams.
@@ -64,10 +60,6 @@ pub struct CopyOptions {
     pub flush: bool,
     /// Disable sparse-layout preservation.
     pub no_sparse: bool,
-    /// Reserved: accepted for grammar compatibility, but the pre-1.0 large
-    /// path is already buffered, so this currently changes nothing
-    /// (PLAN section 13.2).
-    pub no_unbuffered: bool,
     /// Collect bounded live-run insight (size-class timings, slowest files,
     /// finer stat cadence) for later analysis — the VISION analysis flag.
     pub analyze: bool,
@@ -103,7 +95,6 @@ impl CopyOptions {
             replace: true,
             flush: false,
             no_sparse: false,
-            no_unbuffered: false,
             analyze: false,
             raw_reparse: false,
             fresh: false,
@@ -132,12 +123,14 @@ impl CopyOptions {
 }
 
 /// Standalone full-tree verification configuration.
+///
+/// There is deliberately no persisted-report option: standalone verification
+/// prints its complete machine-readable summary to stdout and sets the exit
+/// code, which covers scripting without a second report format to maintain.
 #[derive(Clone, Debug)]
 pub struct VerifyOptions {
     /// Source tree root.
     pub source: PathBuf,
     /// Destination tree root.
     pub destination: PathBuf,
-    /// Optional JSON report path.
-    pub report_path: Option<PathBuf>,
 }

@@ -58,7 +58,7 @@ impl RunObserver for PlainObserver {
             return;
         }
         println!(
-            "state={:?} discovered={} copied={} replaced={} skipped={} failed={} read={} written={}",
+            "state={:?} discovered={} copied={} replaced={} skipped={} failed={} read={} written={} {}",
             snapshot.state,
             snapshot.counters.files_discovered,
             snapshot.counters.copied_new,
@@ -66,7 +66,8 @@ impl RunObserver for PlainObserver {
             snapshot.counters.skipped_same,
             snapshot.counters.failed,
             snapshot.counters.bytes_read_source,
-            snapshot.counters.bytes_written_destination
+            snapshot.counters.bytes_written_destination,
+            eta_line(snapshot)
         );
     }
 
@@ -237,6 +238,47 @@ fn dashboard_loop(
     }
 }
 
+/// Formats the live remaining-time estimate (VISION's `/ETA` default).
+///
+/// Discovery streams alongside copying, so the estimate covers the work
+/// found *so far* and grows as enumeration continues. It is suppressed while
+/// writes are idle — a skip-heavy rerun settles files without writing, and
+/// dividing by a near-zero write rate would display a meaningless figure.
+fn eta_line(snapshot: &RunSnapshot) -> String {
+    let remaining = snapshot
+        .counters
+        .bytes_enumerated
+        .saturating_sub(snapshot.counters.bytes_logical_discovered);
+    if remaining == 0 || snapshot.write_bytes_per_second < 64.0 * 1024.0 {
+        return "ETA: —".to_owned();
+    }
+    let seconds = remaining as f64 / snapshot.write_bytes_per_second;
+    format!(
+        "ETA: {} for the {:.1} MiB discovered so far",
+        format_eta(seconds),
+        remaining as f64 / (1024.0 * 1024.0)
+    )
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "clamped to [0, 99h] immediately before the cast"
+)]
+fn format_eta(seconds: f64) -> String {
+    let total = seconds.clamp(0.0, 99.0 * 3600.0) as u64;
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    let secs = total % 60;
+    if hours > 0 {
+        format!("{hours}h {minutes:02}m")
+    } else if minutes > 0 {
+        format!("{minutes}m {secs:02}s")
+    } else {
+        format!("{secs}s")
+    }
+}
+
 fn draw_live(frame: &mut ratatui::Frame<'_>, state: &Arc<Mutex<LiveState>>, tab: usize) {
     let state = state.lock().unwrap_or_else(PoisonError::into_inner);
     let chunks = Layout::default()
@@ -306,6 +348,7 @@ fn draw_live(frame: &mut ratatui::Frame<'_>, state: &Arc<Mutex<LiveState>>, tab:
                         snapshot.counters.bytes_read_source,
                         snapshot.counters.bytes_written_destination
                     )),
+                    Line::from(eta_line(snapshot)),
                     Line::from(state.message.clone()),
                 ])
                 .block(Block::default().borders(Borders::ALL).title("Dashboard")),
@@ -315,7 +358,7 @@ fn draw_live(frame: &mut ratatui::Frame<'_>, state: &Arc<Mutex<LiveState>>, tab:
         1 => draw_live_errors(frame, chunks[1], snapshot),
         2 => frame.render_widget(
             Paragraph::new(format!(
-                "Current application read: {:.1} MiB/s\nCurrent application write: {:.1} MiB/s\n\nStatic device classes, queue depths, chunk size, and confidence are persisted in the final report.",
+                "Current application read: {:.1} MiB/s\nCurrent application write: {:.1} MiB/s\n\nStatic device classes, chunk size, stream and worker counts, and confidence are persisted in the final report.",
                 snapshot.read_bytes_per_second / (1024.0 * 1024.0),
                 snapshot.write_bytes_per_second / (1024.0 * 1024.0)
             ))
@@ -570,5 +613,30 @@ mod tests {
                 "tab {tab} did not render {expected}"
             );
         }
+    }
+
+    #[test]
+    fn eta_estimates_known_work_and_suppresses_idle_writes() {
+        let mut snapshot = RunSnapshot {
+            state: RunState::Copying,
+            counters: Counters::default(),
+            read_bytes_per_second: 0.0,
+            write_bytes_per_second: 0.0,
+            failures_by_category: BTreeMap::new(),
+            active_paths: Vec::new(),
+        };
+        // No write rate (skip-heavy phase): the figure is suppressed.
+        snapshot.counters.bytes_enumerated = 100 * 1024 * 1024;
+        assert_eq!(super::eta_line(&snapshot), "ETA: —");
+        // 90 MiB outstanding at 1 MiB/s: a 90-second estimate.
+        snapshot.counters.bytes_logical_discovered = 10 * 1024 * 1024;
+        snapshot.write_bytes_per_second = 1024.0 * 1024.0;
+        assert_eq!(
+            super::eta_line(&snapshot),
+            "ETA: 1m 30s for the 90.0 MiB discovered so far"
+        );
+        // Nothing outstanding: suppressed again.
+        snapshot.counters.bytes_logical_discovered = snapshot.counters.bytes_enumerated;
+        assert_eq!(super::eta_line(&snapshot), "ETA: —");
     }
 }

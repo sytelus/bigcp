@@ -86,15 +86,15 @@ xxh3-128 digest agrees.
 | `--profile CLASS[,CLASS]` | Force static source/destination device classes. |
 | `--tune key=value,...` | Override bounded advanced settings. |
 | `--analyze` | Collect bounded live-run insight (size-class timings, top-20 slowest copies, finer stat samples) into the log and report. |
-| `--no-unbuffered` | Reserved: pre-1.0 streaming is already buffered, so this currently changes nothing (PLAN §13.2). |
 | `--state-dir`, `--log`, `--report` | Select audit locations outside both trees. |
 | `--plain`, `--quiet`, `--no-color` | Select noninteractive output behavior. |
 
 Accepted profile classes are `auto`, `nvme`, `sata-ssd`, `usb-ssd`, `hdd`, and
 `unknown` (the conservative fallback profile). Advanced tune keys are
-`qd-src`, `qd-dst`, `chunk`, `streams`, `threads`, `mem`,
-`large-threshold`, and `checkpoint-threshold`; byte sizes accept `KiB`, `MiB`,
-or `GiB`.
+`chunk`, `streams`, `threads`, `mem`, `large-threshold`, and
+`checkpoint-threshold`; byte sizes accept `KiB`, `MiB`, or `GiB`. There are
+no queue-depth keys: large files stream through a strictly sequential
+pipeline, so there is no queue depth to tune.
 Manual bounds are enforced in the core library as well as the CLI: workers are
 `1..=256`, concurrent streams `1..=16`, chunks `64 KiB..=64 MiB`, and thresholds
 must be positive. A `mem` budget must hold at least one large-threshold buffer
@@ -106,8 +106,8 @@ and caps both chunk size and threshold-sized workers.
 |---:|---|
 | 0 | Run completed and all attempted objects succeeded. |
 | 2 | One or more objects failed or verification found mismatches. |
-| 3 | Graceful user cancellation; rerun to continue. |
-| 4 | Device/capacity breaker (reserved by the report contract). |
+| 3 | Graceful user cancellation; rerun to continue. Cancel takes effect between chunks, so even a huge in-flight file stops promptly and safely. |
+| 4 | Stopped early by the circuit breaker: repeated device-disconnect or disk-full failures. Reconnect the drive or free space, then rerun to resume. |
 | 5 | Preflight, configuration, root-lock, or fatal I/O failure. |
 | 6 | Audit, format, or internal invariant failure. |
 

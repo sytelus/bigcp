@@ -72,6 +72,10 @@ pub struct EngineRequest<'a> {
     pub checkpoint_threshold: u64,
     /// Whether the destination advertises EFS support.
     pub destination_supports_encryption: bool,
+    /// Graceful-cancel probe checked between chunks so very large files do
+    /// not delay a requested stop until they finish (the in-flight temp
+    /// self-deletes or resumes from its last verified checkpoint).
+    pub cancel: &'a dyn Fn() -> bool,
     /// Streams already discovered by the scheduler, avoiding a duplicate call.
     pub known_streams: Option<&'a [StreamInfo]>,
 }
@@ -208,6 +212,7 @@ fn copy_sparse(
         checkpoint_eligible.then(|| next_checkpoint_after(hash_offset, interval, logical_size));
     let mut journal_degraded = false;
     for range in ranges {
+        check_cancel(request)?;
         let range_end = range.offset.checked_add(range.length).ok_or_else(|| {
             OperationError::semantic(
                 ErrorCategory::Internal,
@@ -255,6 +260,7 @@ fn copy_sparse(
             .map_err(|error| operation_error("seek_dst", request.relative_path, &error))?;
         let mut remaining = range_end - range_start;
         while remaining > 0 {
+            check_cancel(request)?;
             let until_checkpoint =
                 next_checkpoint.map_or(remaining, |boundary| boundary - hash_offset);
             let requested = usize::try_from(
@@ -531,6 +537,7 @@ fn copy_streamed(
         .then(|| next_checkpoint_after(total, interval, request.source_snapshot.metadata.size));
     let mut journal_degraded = false;
     while total < request.source_snapshot.metadata.size {
+        check_cancel(request)?;
         let remaining = request.source_snapshot.metadata.size - total;
         let until_checkpoint = next_checkpoint.map_or(remaining, |boundary| boundary - total);
         let requested = usize::try_from(remaining.min(until_checkpoint).min(buffer.len() as u64))
@@ -986,6 +993,7 @@ fn copy_named_streams(
         let mut next_checkpoint =
             checkpoint_eligible.then(|| next_checkpoint_after(copied, interval, stream.size));
         while copied < stream.size {
+            check_cancel(request)?;
             let remaining = stream.size - copied;
             let until_checkpoint = next_checkpoint.map_or(remaining, |boundary| boundary - copied);
             let requested = usize::try_from(
@@ -1260,6 +1268,24 @@ fn operation_error(
     error: &std::io::Error,
 ) -> OperationError {
     OperationError::from_io(operation, PathBuf::from(relative_path), error)
+}
+
+/// Operation name marking a graceful mid-file cancellation. The coordinator
+/// converts errors carrying it into a not-attempted outcome instead of a
+/// failure: a clean cancel is not an error condition.
+pub(crate) const CANCELED_MID_FILE: &str = "canceled_mid_file";
+
+fn check_cancel(request: &EngineRequest<'_>) -> Result<(), OperationError> {
+    if (request.cancel)() {
+        Err(OperationError::semantic(
+            ErrorCategory::Internal,
+            CANCELED_MID_FILE,
+            request.relative_path.to_path_buf(),
+            "graceful cancellation stopped this copy between chunks",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn source_open_error(

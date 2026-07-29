@@ -155,7 +155,6 @@ fn copy_rerun_and_both_verification_forms_converge() -> Result<(), Box<dyn std::
     let full = bigcp_core::run_standalone_verify(&VerifyOptions {
         source: source.clone(),
         destination: destination.clone(),
-        report_path: None,
     })?;
     assert_eq!(full.failed, 0, "verify mismatches: {:?}", full.mismatches);
 
@@ -371,7 +370,6 @@ fn standalone_verify_rejects_file_roots_without_modifying_them()
     let result = bigcp_core::run_standalone_verify(&VerifyOptions {
         source: source.clone(),
         destination: destination.clone(),
-        report_path: None,
     });
     assert!(result.is_err());
     assert_eq!(fs::read(source)?, b"source sentinel");
@@ -468,7 +466,6 @@ fn relative_symbolic_links_are_recreated_as_links_when_available()
     let verification = bigcp_core::run_standalone_verify(&VerifyOptions {
         source: sandbox.child(Path::new("source"))?,
         destination,
-        report_path: None,
     })?;
     assert_eq!(
         verification.failed, 0,
@@ -528,4 +525,72 @@ fn options_without_analyze(base: &CopyOptions) -> CopyOptions {
     options.analyze = false;
     options.fresh = true;
     options
+}
+
+/// Requests cancellation only after the run is already inside the large-file
+/// engine, proving a graceful stop takes effect between chunks instead of
+/// waiting for the whole file (PLAN section 5.13).
+struct CancelAfterFirstPoll {
+    polls: std::sync::atomic::AtomicUsize,
+}
+
+impl RunObserver for CancelAfterFirstPoll {
+    fn on_snapshot(&self, _snapshot: &RunSnapshot) {}
+
+    fn on_message(&self, _message: &str) {}
+
+    fn cancellation_requested(&self) -> bool {
+        let seen = self
+            .polls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        seen >= 1
+    }
+}
+
+#[test]
+fn graceful_cancel_stops_inside_a_large_file() -> Result<(), Box<dyn std::error::Error>> {
+    let allowed_temp = validated_system_temp()?;
+    let lease = tempfile::Builder::new()
+        .prefix("bigcp-midfile-cancel-")
+        .tempdir_in(allowed_temp)?;
+    let sandbox = initialize_empty(lease.path())?;
+    let source = sandbox.child(Path::new("source"))?;
+    let destination = sandbox.child(Path::new("destination"))?;
+    fs::create_dir(&source)?;
+    fs::write(source.join("large.bin"), vec![0x7e_u8; 512 * 1024])?;
+
+    let mut options = CopyOptions::new(source, destination.clone());
+    options.state_dir = Some(sandbox.child(Path::new("state"))?);
+    // Route the file through the inline large-file path in small chunks so
+    // several cancel polls happen inside one file.
+    options.tune.large_threshold = Some(64 * 1024);
+    options.tune.chunk_bytes = Some(64 * 1024);
+    let report = run_copy(
+        &options,
+        &CancelAfterFirstPoll {
+            polls: std::sync::atomic::AtomicUsize::new(0),
+        },
+    )?;
+
+    assert_eq!(report.run.exit, 3);
+    assert_eq!(report.counters.not_attempted, 1);
+    assert!(report.counters.reconcile().is_ok());
+    assert!(
+        report.errors.is_empty(),
+        "mid-file cancellation polluted the error report: {:?}",
+        report.errors
+    );
+    assert!(report.warnings.contains_key("canceled_mid_file"));
+    // Nothing may remain at the final name and the opaque temp must have
+    // self-deleted (it never reached a checkpoint).
+    assert!(!destination.join("large.bin").exists());
+    let leftovers: Vec<_> = fs::read_dir(&destination)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "destination should hold no partial artifacts: {leftovers:?}"
+    );
+    Ok(())
 }

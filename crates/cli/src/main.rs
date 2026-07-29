@@ -93,10 +93,6 @@ struct CopyFlags {
     #[arg(long)]
     no_sparse: bool,
 
-    /// Reserved: pre-1.0 streaming is currently buffered.
-    #[arg(long)]
-    no_unbuffered: bool,
-
     /// Collect bounded live-run insight (size-class timings, slowest files,
     /// finer stat samples) into the log and report.
     #[arg(long)]
@@ -114,8 +110,8 @@ struct CopyFlags {
     #[arg(long, value_parser = parse_profiles, value_name = "CLASS[,CLASS]")]
     profile: Option<(DeviceClass, DeviceClass)>,
 
-    /// Comma-separated overrides: qd-src, qd-dst, chunk, streams, threads,
-    /// mem, large-threshold, checkpoint-threshold (sizes accept KiB/MiB/GiB).
+    /// Comma-separated overrides: chunk, streams, threads, mem,
+    /// large-threshold, checkpoint-threshold (sizes accept KiB/MiB/GiB).
     #[arg(long, value_parser = parse_tune, value_name = "KEY=VALUE,...")]
     tune: Option<TuneOptions>,
 
@@ -183,7 +179,6 @@ fn execute(cli: Cli) -> Result<u8, (u8, String)> {
             let summary = run_standalone_verify(&VerifyOptions {
                 source,
                 destination,
-                report_path: None,
             })
             .map_err(|error| (5, error.to_string()))?;
             serde_json::to_writer_pretty(std::io::stdout(), &summary)
@@ -216,7 +211,6 @@ fn execute(cli: Cli) -> Result<u8, (u8, String)> {
             options.replace = cli.flags.replace.unwrap_or(true);
             options.flush = cli.flags.flush;
             options.no_sparse = cli.flags.no_sparse;
-            options.no_unbuffered = cli.flags.no_unbuffered;
             options.analyze = cli.flags.analyze;
             options.raw_reparse = cli.flags.raw_reparse;
             options.fresh = cli.flags.fresh;
@@ -253,7 +247,6 @@ fn reject_copy_only_flags(flags: &CopyFlags) -> Result<(), (u8, String)> {
         || flags.replace.is_some()
         || flags.flush
         || flags.no_sparse
-        || flags.no_unbuffered
         || flags.analyze
         || flags.raw_reparse
         || flags.fresh
@@ -309,8 +302,6 @@ fn parse_tune(value: &str) -> Result<TuneOptions, String> {
             .split_once('=')
             .ok_or_else(|| format!("tune item lacks '=': {item}"))?;
         match key {
-            "qd-src" => tune.qd_src = Some(parse_positive(raw, key)?),
-            "qd-dst" => tune.qd_dst = Some(parse_positive(raw, key)?),
             "chunk" => tune.chunk_bytes = Some(parse_size_usize(raw)?),
             "streams" => tune.streams = Some(parse_positive(raw, key)?),
             "threads" => tune.threads = Some(parse_positive(raw, key)?),

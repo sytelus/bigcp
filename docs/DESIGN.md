@@ -85,7 +85,7 @@ and metadata guarantees.
 
 Device discovery uses official query-only IOCTLs: physical extents, bus type,
 seek penalty, sector sizes, and maximum transfer length. Static profiles choose
-asymmetric source/destination queue-depth metadata, chunk size, stream cap, and
+per-side chunk size, stream cap, and
 small-file workers. Manual values are range checked; the memory override caps
 both chunk size and the number of threshold-sized small-file workers.
 Same-disk extent overlap is reported.

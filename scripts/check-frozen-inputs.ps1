@@ -1,13 +1,12 @@
 # Verifies that the implementation task's three frozen inputs remain byte-identical.
-# Re-pinned 2026-07-29 after the owner's VISION.md update (test prohibitions +
-# live-run analysis), the corresponding review pass over PLAN.md and
-# LIMITATIONS.md, and the owner-requested test-policy update (drive whitelist,
-# two-tier tests). Re-pin only as the final step of an owner-approved doc change.
+# Re-pinned 2026-07-29 after the owner removed /J from VISION.md's expressed
+# defaults and the plan adopted buffered streaming as the final engine
+# (ADR 0028). Re-pin only as the final step of an owner-approved doc change.
 $ErrorActionPreference = 'Stop'
 $Expected = @{
-    'PLAN.md' = 'B56D924644546000C4A104B352DAA4B2BF7B2078D1E443B8304479431A7D3D07'
-    'VISION.md' = '9D8EA73339F5358582457C1A3726817D1D138398E32740D72D00D7CCA422C2E1'
-    'LIMITATIONS.md' = '28DD6E7C305F33FC109ABBA13C2E97E5DC27C1668094E78669D7548802E78A28'
+    'PLAN.md' = 'CB58D0FF840C1F11934628FD6DF6209A9AF8B45776414E136C732E6500B1BDB1'
+    'VISION.md' = 'B54F1B7A6465599D3AD63B2897BCD411E9E2AAB223FAE7BFB3EF77BAA31F5393'
+    'LIMITATIONS.md' = '6419240A16837F14B3D5B2B8A015D3A8B8FD9816423E0085A6EBB35660D598E0'
 }
 
 foreach ($entry in $Expected.GetEnumerator()) {

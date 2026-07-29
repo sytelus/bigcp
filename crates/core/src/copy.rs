@@ -41,6 +41,11 @@ use crate::verify::{VerificationTarget, verify_written_targets};
 use crate::worker::{CompletedCopy, FileCopyJob, ReplacementWork, SmallFileWorkers};
 
 const REPORT_SAMPLE_LIMIT: usize = 100;
+/// Consecutive device-gone/disk-full failures (with no success in between)
+/// that trip the early-stop breaker. Low enough to stop a disconnected-drive
+/// failure storm quickly, high enough that a few isolated bad objects on a
+/// healthy device never end the run.
+const BREAKER_THRESHOLD: u32 = 5;
 /// Journal job signature. Checkpoints self-validate (temp identity + source
 /// size/mtime + prefix digest), so the signature pins only the resume
 /// protocol version — never user options, whose changes must not wipe
@@ -96,8 +101,6 @@ pub fn run_copy(
     audit.emit(&AuditEvent::Profile {
         source_class: format!("{:?}", preflight.profile.source.class),
         destination_class: format!("{:?}", preflight.profile.destination.class),
-        qd_source: preflight.profile.source.queue_depth,
-        qd_destination: preflight.profile.destination.queue_depth,
         chunk_bytes: preflight.profile.chunk_bytes,
         streams: preflight.profile.streams,
         workers: preflight.profile.workers,
@@ -194,6 +197,9 @@ pub fn run_copy(
         journal,
         analysis: options.analyze.then(AnalysisCollector::default),
         canceled: false,
+        breaker: None,
+        breaker_streak: 0,
+        breaker_announced: false,
         small_workers,
         small_jobs_outstanding: 0,
         last_snapshot: Instant::now(),
@@ -245,7 +251,12 @@ pub fn run_copy(
     let exit = if invariant_failure.is_some() {
         6
     } else {
-        completed_exit(runner.canceled, &runner.counters, verify.as_ref())
+        completed_exit(
+            runner.canceled,
+            runner.breaker.is_some(),
+            &runner.counters,
+            verify.as_ref(),
+        )
     };
     let journal_end_failed = runner.journal.as_mut().is_some_and(|journal| {
         journal
@@ -421,6 +432,12 @@ struct Runner<'a> {
     journal: Option<Journal>,
     analysis: Option<AnalysisCollector>,
     canceled: bool,
+    /// Tripped circuit breaker: repeated device-gone or disk-full failures
+    /// stop the run early and resumably instead of grinding through every
+    /// remaining object (exit 4, PLAN §5.5).
+    breaker: Option<ErrorCategory>,
+    breaker_streak: u32,
+    breaker_announced: bool,
     small_workers: SmallFileWorkers,
     small_jobs_outstanding: usize,
     last_snapshot: Instant,
@@ -475,6 +492,24 @@ impl Runner<'_> {
                     message: "user requested a graceful stop".to_owned(),
                 })?;
             }
+            if let Some(category) = self.breaker
+                && !self.breaker_announced
+            {
+                self.breaker_announced = true;
+                self.observer.on_message(
+                    "stopping early: repeated device or disk-space failures tripped the breaker; \
+                     resolve the cause and re-run to resume",
+                );
+                self.publish(RunState::Canceling);
+                self.audit.emit(&AuditEvent::Warning {
+                    kind: "breaker".to_owned(),
+                    rel: None,
+                    message: format!(
+                        "{BREAKER_THRESHOLD} consecutive {category:?}-class failures; \
+                         no further objects will be attempted (exit 4, rerun resumes)"
+                    ),
+                })?;
+            }
             match task {
                 DirectoryTask::Enter {
                     source,
@@ -484,7 +519,7 @@ impl Runner<'_> {
                     destination_exists,
                     destination_metadata,
                 } => {
-                    if !self.canceled {
+                    if !self.canceled && self.breaker.is_none() {
                         self.enter_directory(
                             source,
                             destination,
@@ -498,16 +533,26 @@ impl Runner<'_> {
                         self.counters.dirs_discovered =
                             self.counters.dirs_discovered.saturating_add(1);
                         self.counters.dirs_failed = self.counters.dirs_failed.saturating_add(1);
-                        // A clean cancel is not an error condition: surface the
-                        // untraversed subtree as a warning so exit-3 runs keep
-                        // meaningful (empty) error summaries.
-                        self.increment_warning("canceled_subtree");
+                        // A clean stop is not an error condition: surface the
+                        // untraversed subtree as a warning so exit-3/exit-4
+                        // runs keep meaningful error summaries (the breaker's
+                        // cause is already recorded by the tripping failures).
+                        let (kind, message) = if self.breaker.is_some() {
+                            (
+                                "breaker_subtree",
+                                "directory was discovered but not traversed after the breaker tripped",
+                            )
+                        } else {
+                            (
+                                "canceled_subtree",
+                                "directory was discovered but not traversed after cancellation",
+                            )
+                        };
+                        self.increment_warning(kind);
                         self.audit.emit(&AuditEvent::Warning {
-                            kind: "canceled_subtree".to_owned(),
+                            kind: kind.to_owned(),
                             rel: Some(AuditPath::from_path(&relative)),
-                            message:
-                                "directory was discovered but not traversed after cancellation"
-                                    .to_owned(),
+                            message: message.to_owned(),
                         })?;
                     }
                 }
@@ -579,7 +624,50 @@ impl Runner<'_> {
             if source_entry.metadata.kind == ObjectKind::File {
                 // Discovery is counted here, once per seen entry, so the I6
                 // reconciliation can detect any later dropped outcome.
-                self.counters.note_file_discovered();
+                self.counters
+                    .note_file_discovered(source_entry.metadata.size);
+            }
+            if self.breaker.is_some() {
+                // A tripped breaker stops mid-directory too: a failure storm
+                // inside one huge directory must not keep dispatching doomed
+                // work until the directory is exhausted.
+                match source_entry.metadata.kind {
+                    ObjectKind::File => {
+                        self.record_file(
+                            &child_relative,
+                            FileOutcome::NotAttempted {
+                                bytes: source_entry.metadata.size,
+                                reason: "breaker".to_owned(),
+                            },
+                            None,
+                        )?;
+                    }
+                    ObjectKind::Directory => {
+                        self.counters.dirs_discovered =
+                            self.counters.dirs_discovered.saturating_add(1);
+                        self.counters.dirs_failed = self.counters.dirs_failed.saturating_add(1);
+                        self.increment_warning("breaker_subtree");
+                        self.audit.emit(&AuditEvent::Warning {
+                            kind: "breaker_subtree".to_owned(),
+                            rel: Some(AuditPath::from_path(&child_relative)),
+                            message: "directory was discovered but not traversed after the breaker tripped".to_owned(),
+                        })?;
+                    }
+                    ObjectKind::Reparse => {
+                        self.counters.links_discovered =
+                            self.counters.links_discovered.saturating_add(1);
+                        self.counters.links_not_attempted =
+                            self.counters.links_not_attempted.saturating_add(1);
+                        self.record_link_event(
+                            &child_relative,
+                            "not_attempted_link",
+                            Some("breaker".to_owned()),
+                            None,
+                            None,
+                        )?;
+                    }
+                }
+                continue;
             }
             let key = match ordinal_case_key(&source_entry.name) {
                 Ok(key) => key,
@@ -1268,6 +1356,12 @@ impl Runner<'_> {
         }
 
         let mut counters = Counters::default();
+        // Large files copy inline on this thread, so the front end's cancel
+        // flag is polled from inside the chunk loops — a graceful stop no
+        // longer waits for a 40 GiB file to finish (the partial temp
+        // self-deletes or resumes from its last verified checkpoint).
+        let observer = self.observer;
+        let cancel_probe = move || observer.cancellation_requested();
         let request = EngineRequest {
             source_path: &source.path,
             destination_path: &destination_path,
@@ -1285,6 +1379,7 @@ impl Runner<'_> {
             checkpoint_threshold: self.options.checkpoint_threshold(),
             destination_supports_encryption: self.destination_supports_encryption,
             known_streams: Some(&streams),
+            cancel: &cancel_probe,
         };
         let copy_started = Instant::now();
         let result = copy_file(&request, &mut counters, self.journal.as_mut());
@@ -1432,6 +1527,22 @@ impl Runner<'_> {
                         bytes: result.bytes,
                         digest: result.digest,
                     }
+                }
+            }
+            Err(error) if error.operation == crate::engine::CANCELED_MID_FILE => {
+                // A clean cancel is not an error condition (exit 3 keeps an
+                // empty error summary); the interrupted temp self-deletes or
+                // stays behind as a verified-checkpoint resume asset.
+                self.canceled = true;
+                self.increment_warning("canceled_mid_file");
+                self.audit.emit(&AuditEvent::Warning {
+                    kind: "canceled_mid_file".to_owned(),
+                    rel: Some(AuditPath::from_path(relative)),
+                    message: "copy stopped between chunks by graceful cancellation; rerun to finish this file".to_owned(),
+                })?;
+                FileOutcome::NotAttempted {
+                    bytes: completed.logical_bytes,
+                    reason: "canceled".to_owned(),
                 }
             }
             Err(error) => FileOutcome::Failed {
@@ -1829,7 +1940,7 @@ impl Runner<'_> {
     ) -> Result<(), BigcpError> {
         match entry.metadata.kind {
             ObjectKind::File => {
-                self.counters.note_file_discovered();
+                self.counters.note_file_discovered(entry.metadata.size);
                 self.record_file(
                     &relative,
                     FileOutcome::NotAttempted {
@@ -1896,6 +2007,16 @@ impl Runner<'_> {
         outcome: FileOutcome,
         differences: Option<Vec<&'static str>>,
     ) -> Result<(), BigcpError> {
+        if matches!(
+            outcome,
+            FileOutcome::CopiedNew { .. }
+                | FileOutcome::CopiedReplaced { .. }
+                | FileOutcome::SkippedSame { .. }
+                | FileOutcome::SkippedDifferent { .. }
+                | FileOutcome::MetadataFixed { .. }
+        ) {
+            self.breaker_streak = 0;
+        }
         let (action, size, hash, error, reason, replacement_event) = match &outcome {
             FileOutcome::CopiedNew { bytes, digest } => {
                 ("copied", *bytes, digest.clone(), None, None, None)
@@ -2163,6 +2284,19 @@ impl Runner<'_> {
     }
 
     fn aggregate_error(&mut self, error: OperationError) {
+        // Breaker accounting: device-gone and disk-full failures extend the
+        // streak; other categories neither extend nor reset it (a failure
+        // storm from a removed device surfaces mixed categories), and only a
+        // genuine success (record_file) resets it.
+        if matches!(
+            error.category,
+            ErrorCategory::DeviceGone | ErrorCategory::Space
+        ) {
+            self.breaker_streak = self.breaker_streak.saturating_add(1);
+            if self.breaker_streak >= BREAKER_THRESHOLD && self.breaker.is_none() {
+                self.breaker = Some(error.category);
+            }
+        }
         let folder = top_level(&error.path);
         let summary = self
             .errors
@@ -2519,10 +2653,15 @@ fn summarize_phases(points: &[crate::stats::TimelinePoint]) -> PhaseSummary {
 
 fn completed_exit(
     canceled: bool,
+    breaker_tripped: bool,
     counters: &Counters,
     verification: Option<&crate::report::VerificationSummary>,
 ) -> i32 {
-    if canceled {
+    // The breaker outranks cancellation: exit 4 names the actionable cause
+    // (reconnect the device or free space, then rerun to resume).
+    if breaker_tripped {
+        4
+    } else if canceled {
         3
     } else if counters.failed > 0
         || counters.dirs_failed > 0
@@ -2709,7 +2848,23 @@ mod tests {
 
     #[test]
     fn every_completed_failure_universe_controls_the_exit_code() {
-        assert_eq!(completed_exit(true, &Counters::default(), None), 3);
+        assert_eq!(completed_exit(true, false, &Counters::default(), None), 3);
+        // The breaker outranks cancellation and per-object failures: exit 4
+        // names the actionable cause.
+        assert_eq!(completed_exit(false, true, &Counters::default(), None), 4);
+        assert_eq!(completed_exit(true, true, &Counters::default(), None), 4);
+        assert_eq!(
+            completed_exit(
+                false,
+                true,
+                &Counters {
+                    failed: 1,
+                    ..Counters::default()
+                },
+                None
+            ),
+            4
+        );
 
         for counters in [
             Counters {
@@ -2729,7 +2884,7 @@ mod tests {
                 ..Counters::default()
             },
         ] {
-            assert_eq!(completed_exit(false, &counters, None), 2);
+            assert_eq!(completed_exit(false, false, &counters, None), 2);
         }
 
         let verification = VerificationSummary {
@@ -2737,10 +2892,10 @@ mod tests {
             ..VerificationSummary::default()
         };
         assert_eq!(
-            completed_exit(false, &Counters::default(), Some(&verification)),
+            completed_exit(false, false, &Counters::default(), Some(&verification)),
             2
         );
-        assert_eq!(completed_exit(false, &Counters::default(), None), 0);
+        assert_eq!(completed_exit(false, false, &Counters::default(), None), 0);
     }
 
     #[test]

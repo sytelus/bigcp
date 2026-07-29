@@ -148,7 +148,10 @@ fn category_for(code: Option<i32>, kind: io::ErrorKind) -> ErrorCategory {
         Some(32 | 33) => ErrorCategory::Locked,
         Some(39 | 112) => ErrorCategory::Space,
         Some(23 | 1117) => ErrorCategory::Media,
-        Some(433 | 1167) => ErrorCategory::DeviceGone,
+        // 21 ERROR_NOT_READY and 55 ERROR_DEV_NOT_EXIST are what removals
+        // surface through many paths; they must trip the same breaker as the
+        // explicit device-gone codes 433/1167.
+        Some(21 | 55 | 433 | 1167) => ErrorCategory::DeviceGone,
         Some(80 | 183) => ErrorCategory::DestinationChanged,
         Some(206) => ErrorCategory::Path,
         Some(code) if code == i32::from(0x16A_u16) => ErrorCategory::Cloud,
