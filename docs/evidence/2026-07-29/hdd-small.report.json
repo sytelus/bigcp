@@ -1,0 +1,606 @@
+{
+  "v": 1,
+  "run": {
+    "id": "3c30874992744216907ed14102a8878d",
+    "started": "2026-07-29T11:29:41.935771Z",
+    "ended": "2026-07-29T11:30:13.4244905Z",
+    "duration_seconds": 31.4860336,
+    "exit": 0,
+    "dry_run": false,
+    "durability": "logical",
+    "audit": "ok",
+    "source": "D:\\bigcp-bench\\2026-07-29\\src-r5-0cc96f25\\w1-small",
+    "destination": "H:\\bigcp-hw-evidence-v020\\small",
+    "log_path": "\\\\?\\H:\\bigcp-hw-evidence-v020\\reports\\small.log.jsonl",
+    "report_path": "\\\\?\\H:\\bigcp-hw-evidence-v020\\reports\\small.report.json"
+  },
+  "config": {
+    "analyze": true,
+    "destination_profile": "auto",
+    "dry_run": false,
+    "flush": false,
+    "fresh": false,
+    "include_system": false,
+    "log_schema": 1,
+    "no_sparse": false,
+    "raw_reparse": false,
+    "replace": true,
+    "skip_cloud": false,
+    "source_profile": "auto",
+    "tune": {
+      "checkpoint_threshold": null,
+      "chunk_bytes": null,
+      "large_threshold": null,
+      "memory_bytes": null,
+      "streams": null,
+      "threads": null
+    },
+    "verify": false
+  },
+  "devices": {
+    "source": {
+      "class": "unknown",
+      "confidence": "high",
+      "chunk_bytes": 4194304,
+      "streams": 1,
+      "workers": 4,
+      "enumeration_threads": 4
+    },
+    "destination": {
+      "class": "hdd",
+      "confidence": "high",
+      "chunk_bytes": 16777216,
+      "streams": 1,
+      "workers": 8,
+      "enumeration_threads": 4
+    },
+    "chunk_bytes": 524288,
+    "streams": 1,
+    "workers": 4,
+    "same_physical_disk": false
+  },
+  "counters": {
+    "files_discovered": 20000,
+    "copied_new": 20000,
+    "copied_replaced": 0,
+    "skipped_same": 0,
+    "skipped_diff": 0,
+    "meta_fixed": 0,
+    "failed": 0,
+    "excluded": 0,
+    "not_attempted": 0,
+    "would_copy_new": 0,
+    "would_copy_replaced": 0,
+    "would_meta_fix": 0,
+    "extra": 0,
+    "dirs_discovered": 21,
+    "dir_done": 21,
+    "dirs_meta_failed": 0,
+    "dirs_failed": 0,
+    "dirs_excluded": 0,
+    "dirs_planned": 0,
+    "links_discovered": 0,
+    "links_copied": 0,
+    "links_failed": 0,
+    "links_excluded": 0,
+    "links_not_attempted": 0,
+    "links_skipped": 0,
+    "links_planned": 0,
+    "bytes_enumerated": 81920000,
+    "bytes_logical_discovered": 81920000,
+    "bytes_logical_copied": 81920000,
+    "bytes_read_source": 81920000,
+    "bytes_written_destination": 81920000,
+    "bytes_verified": 0
+  },
+  "replacements": {
+    "count": 0,
+    "bytes": 0,
+    "destination_newer": 0,
+    "by_folder": {},
+    "samples": []
+  },
+  "errors": [],
+  "warnings": {},
+  "extras": {
+    "count": 0,
+    "samples": []
+  },
+  "folders": {
+    "dir00": {
+      "files_discovered": 1000,
+      "copied_new": 1000,
+      "copied_replaced": 0,
+      "skipped_same": 0,
+      "skipped_diff": 0,
+      "meta_fixed": 0,
+      "failed": 0,
+      "excluded": 0,
+      "not_attempted": 0,
+      "logical_bytes_discovered": 4096000,
+      "logical_bytes_copied": 4096000
+    },
+    "dir01": {
+      "files_discovered": 1000,
+      "copied_new": 1000,
+      "copied_replaced": 0,
+      "skipped_same": 0,
+      "skipped_diff": 0,
+      "meta_fixed": 0,
+      "failed": 0,
+      "excluded": 0,
+      "not_attempted": 0,
+      "logical_bytes_discovered": 4096000,
+      "logical_bytes_copied": 4096000
+    },
+    "dir02": {
+      "files_discovered": 1000,
+      "copied_new": 1000,
+      "copied_replaced": 0,
+      "skipped_same": 0,
+      "skipped_diff": 0,
+      "meta_fixed": 0,
+      "failed": 0,
+      "excluded": 0,
+      "not_attempted": 0,
+      "logical_bytes_discovered": 4096000,
+      "logical_bytes_copied": 4096000
+    },
+    "dir03": {
+      "files_discovered": 1000,
+      "copied_new": 1000,
+      "copied_replaced": 0,
+      "skipped_same": 0,
+      "skipped_diff": 0,
+      "meta_fixed": 0,
+      "failed": 0,
+      "excluded": 0,
+      "not_attempted": 0,
+      "logical_bytes_discovered": 4096000,
+      "logical_bytes_copied": 4096000
+    },
+    "dir04": {
+      "files_discovered": 1000,
+      "copied_new": 1000,
+      "copied_replaced": 0,
+      "skipped_same": 0,
+      "skipped_diff": 0,
+      "meta_fixed": 0,
+      "failed": 0,
+      "excluded": 0,
+      "not_attempted": 0,
+      "logical_bytes_discovered": 4096000,
+      "logical_bytes_copied": 4096000
+    },
+    "dir05": {
+      "files_discovered": 1000,
+      "copied_new": 1000,
+      "copied_replaced": 0,
+      "skipped_same": 0,
+      "skipped_diff": 0,
+      "meta_fixed": 0,
+      "failed": 0,
+      "excluded": 0,
+      "not_attempted": 0,
+      "logical_bytes_discovered": 4096000,
+      "logical_bytes_copied": 4096000
+    },
+    "dir06": {
+      "files_discovered": 1000,
+      "copied_new": 1000,
+      "copied_replaced": 0,
+      "skipped_same": 0,
+      "skipped_diff": 0,
+      "meta_fixed": 0,
+      "failed": 0,
+      "excluded": 0,
+      "not_attempted": 0,
+      "logical_bytes_discovered": 4096000,
+      "logical_bytes_copied": 4096000
+    },
+    "dir07": {
+      "files_discovered": 1000,
+      "copied_new": 1000,
+      "copied_replaced": 0,
+      "skipped_same": 0,
+      "skipped_diff": 0,
+      "meta_fixed": 0,
+      "failed": 0,
+      "excluded": 0,
+      "not_attempted": 0,
+      "logical_bytes_discovered": 4096000,
+      "logical_bytes_copied": 4096000
+    },
+    "dir08": {
+      "files_discovered": 1000,
+      "copied_new": 1000,
+      "copied_replaced": 0,
+      "skipped_same": 0,
+      "skipped_diff": 0,
+      "meta_fixed": 0,
+      "failed": 0,
+      "excluded": 0,
+      "not_attempted": 0,
+      "logical_bytes_discovered": 4096000,
+      "logical_bytes_copied": 4096000
+    },
+    "dir09": {
+      "files_discovered": 1000,
+      "copied_new": 1000,
+      "copied_replaced": 0,
+      "skipped_same": 0,
+      "skipped_diff": 0,
+      "meta_fixed": 0,
+      "failed": 0,
+      "excluded": 0,
+      "not_attempted": 0,
+      "logical_bytes_discovered": 4096000,
+      "logical_bytes_copied": 4096000
+    },
+    "dir10": {
+      "files_discovered": 1000,
+      "copied_new": 1000,
+      "copied_replaced": 0,
+      "skipped_same": 0,
+      "skipped_diff": 0,
+      "meta_fixed": 0,
+      "failed": 0,
+      "excluded": 0,
+      "not_attempted": 0,
+      "logical_bytes_discovered": 4096000,
+      "logical_bytes_copied": 4096000
+    },
+    "dir11": {
+      "files_discovered": 1000,
+      "copied_new": 1000,
+      "copied_replaced": 0,
+      "skipped_same": 0,
+      "skipped_diff": 0,
+      "meta_fixed": 0,
+      "failed": 0,
+      "excluded": 0,
+      "not_attempted": 0,
+      "logical_bytes_discovered": 4096000,
+      "logical_bytes_copied": 4096000
+    },
+    "dir12": {
+      "files_discovered": 1000,
+      "copied_new": 1000,
+      "copied_replaced": 0,
+      "skipped_same": 0,
+      "skipped_diff": 0,
+      "meta_fixed": 0,
+      "failed": 0,
+      "excluded": 0,
+      "not_attempted": 0,
+      "logical_bytes_discovered": 4096000,
+      "logical_bytes_copied": 4096000
+    },
+    "dir13": {
+      "files_discovered": 1000,
+      "copied_new": 1000,
+      "copied_replaced": 0,
+      "skipped_same": 0,
+      "skipped_diff": 0,
+      "meta_fixed": 0,
+      "failed": 0,
+      "excluded": 0,
+      "not_attempted": 0,
+      "logical_bytes_discovered": 4096000,
+      "logical_bytes_copied": 4096000
+    },
+    "dir14": {
+      "files_discovered": 1000,
+      "copied_new": 1000,
+      "copied_replaced": 0,
+      "skipped_same": 0,
+      "skipped_diff": 0,
+      "meta_fixed": 0,
+      "failed": 0,
+      "excluded": 0,
+      "not_attempted": 0,
+      "logical_bytes_discovered": 4096000,
+      "logical_bytes_copied": 4096000
+    },
+    "dir15": {
+      "files_discovered": 1000,
+      "copied_new": 1000,
+      "copied_replaced": 0,
+      "skipped_same": 0,
+      "skipped_diff": 0,
+      "meta_fixed": 0,
+      "failed": 0,
+      "excluded": 0,
+      "not_attempted": 0,
+      "logical_bytes_discovered": 4096000,
+      "logical_bytes_copied": 4096000
+    },
+    "dir16": {
+      "files_discovered": 1000,
+      "copied_new": 1000,
+      "copied_replaced": 0,
+      "skipped_same": 0,
+      "skipped_diff": 0,
+      "meta_fixed": 0,
+      "failed": 0,
+      "excluded": 0,
+      "not_attempted": 0,
+      "logical_bytes_discovered": 4096000,
+      "logical_bytes_copied": 4096000
+    },
+    "dir17": {
+      "files_discovered": 1000,
+      "copied_new": 1000,
+      "copied_replaced": 0,
+      "skipped_same": 0,
+      "skipped_diff": 0,
+      "meta_fixed": 0,
+      "failed": 0,
+      "excluded": 0,
+      "not_attempted": 0,
+      "logical_bytes_discovered": 4096000,
+      "logical_bytes_copied": 4096000
+    },
+    "dir18": {
+      "files_discovered": 1000,
+      "copied_new": 1000,
+      "copied_replaced": 0,
+      "skipped_same": 0,
+      "skipped_diff": 0,
+      "meta_fixed": 0,
+      "failed": 0,
+      "excluded": 0,
+      "not_attempted": 0,
+      "logical_bytes_discovered": 4096000,
+      "logical_bytes_copied": 4096000
+    },
+    "dir19": {
+      "files_discovered": 1000,
+      "copied_new": 1000,
+      "copied_replaced": 0,
+      "skipped_same": 0,
+      "skipped_diff": 0,
+      "meta_fixed": 0,
+      "failed": 0,
+      "excluded": 0,
+      "not_attempted": 0,
+      "logical_bytes_discovered": 4096000,
+      "logical_bytes_copied": 4096000
+    }
+  },
+  "timeline": [
+    {
+      "seconds": 5.0001423,
+      "read_mbps": 2.1044650331930574,
+      "write_mbps": 2.1044650331930574,
+      "files_per_second": 513.7854084943988,
+      "hypothesis": "balanced"
+    },
+    {
+      "seconds": 10.0037769,
+      "read_mbps": 2.7521706535620667,
+      "write_mbps": 2.7521706535620667,
+      "files_per_second": 671.9166634673014,
+      "hypothesis": "balanced"
+    },
+    {
+      "seconds": 15.0064415,
+      "read_mbps": 2.927080744087625,
+      "write_mbps": 2.927080744087625,
+      "files_per_second": 714.6193222870178,
+      "hypothesis": "balanced"
+    },
+    {
+      "seconds": 20.0070891,
+      "read_mbps": 2.4015836831030803,
+      "write_mbps": 2.4015836831030803,
+      "files_per_second": 586.324141382588,
+      "hypothesis": "balanced"
+    },
+    {
+      "seconds": 25.0091446,
+      "read_mbps": 2.3673347462329426,
+      "write_mbps": 2.3673347462329426,
+      "files_per_second": 577.962584529527,
+      "hypothesis": "balanced"
+    },
+    {
+      "seconds": 30.0099671,
+      "read_mbps": 3.0395530780415703,
+      "write_mbps": 3.0395530780415703,
+      "files_per_second": 742.0783881937427,
+      "hypothesis": "balanced"
+    },
+    {
+      "seconds": 31.4812244,
+      "read_mbps": 2.6726541107785002,
+      "write_mbps": 2.6726541107785002,
+      "files_per_second": 652.5034450142823,
+      "hypothesis": "balanced"
+    }
+  ],
+  "phases": {
+    "fastest": {
+      "seconds": 30.0099671,
+      "read_mbps": 3.0395530780415703,
+      "write_mbps": 3.0395530780415703,
+      "files_per_second": 742.0783881937427,
+      "hypothesis": "balanced"
+    },
+    "slowest": {
+      "seconds": 5.0001423,
+      "read_mbps": 2.1044650331930574,
+      "write_mbps": 2.1044650331930574,
+      "files_per_second": 513.7854084943988,
+      "hypothesis": "balanced"
+    }
+  },
+  "bottleneck": {
+    "hypothesis": "balanced",
+    "confidence": "low",
+    "evidence": "application-side read/write completion rates; not physical device utilization",
+    "observed_peak_mbps": 3.0395530780415703,
+    "average_mbps": 2.6017884958364528,
+    "efficiency_vs_observed_peak": 0.8559773193738153,
+    "provenance": "best sustained window observed during this run; no probe I/O"
+  },
+  "hints": [],
+  "analysis": {
+    "size_classes": [
+      {
+        "label": "<=64KiB",
+        "files": 20000,
+        "bytes": 81920000,
+        "seconds": 78.11417290000004
+      },
+      {
+        "label": "<=1MiB",
+        "files": 0,
+        "bytes": 0,
+        "seconds": 0.0
+      },
+      {
+        "label": "<=16MiB",
+        "files": 0,
+        "bytes": 0,
+        "seconds": 0.0
+      },
+      {
+        "label": "<=256MiB",
+        "files": 0,
+        "bytes": 0,
+        "seconds": 0.0
+      },
+      {
+        "label": ">256MiB",
+        "files": 0,
+        "bytes": 0,
+        "seconds": 0.0
+      }
+    ],
+    "slowest_files": [
+      {
+        "relative_path": "dir08\\f0289.bin",
+        "bytes": 4096,
+        "seconds": 0.6549374,
+        "mbps": 0.006254032828175639
+      },
+      {
+        "relative_path": "dir06\\f0264.bin",
+        "bytes": 4096,
+        "seconds": 0.6546669,
+        "mbps": 0.006256616914647739
+      },
+      {
+        "relative_path": "dir07\\f0289.bin",
+        "bytes": 4096,
+        "seconds": 0.6545578,
+        "mbps": 0.0062576597513619115
+      },
+      {
+        "relative_path": "dir05\\f0286.bin",
+        "bytes": 4096,
+        "seconds": 0.6542146,
+        "mbps": 0.006260942510301666
+      },
+      {
+        "relative_path": "dir11\\f0844.bin",
+        "bytes": 4096,
+        "seconds": 0.2246252,
+        "mbps": 0.01823481960171877
+      },
+      {
+        "relative_path": "dir09\\f0812.bin",
+        "bytes": 4096,
+        "seconds": 0.2242467,
+        "mbps": 0.0182655976654283
+      },
+      {
+        "relative_path": "dir10\\f0805.bin",
+        "bytes": 4096,
+        "seconds": 0.2188208,
+        "mbps": 0.018718513048119736
+      },
+      {
+        "relative_path": "dir11\\f0811.bin",
+        "bytes": 4096,
+        "seconds": 0.1753792,
+        "mbps": 0.023355107105061487
+      },
+      {
+        "relative_path": "dir10\\f0772.bin",
+        "bytes": 4096,
+        "seconds": 0.1725862,
+        "mbps": 0.023733067881441274
+      },
+      {
+        "relative_path": "dir02\\f0974.bin",
+        "bytes": 4096,
+        "seconds": 0.1148683,
+        "mbps": 0.03565822772688374
+      },
+      {
+        "relative_path": "dir09\\f0780.bin",
+        "bytes": 4096,
+        "seconds": 0.1111937,
+        "mbps": 0.03683661934084395
+      },
+      {
+        "relative_path": "dir10\\f0589.bin",
+        "bytes": 4096,
+        "seconds": 0.0981073,
+        "mbps": 0.04175020615183579
+      },
+      {
+        "relative_path": "dir09\\f0594.bin",
+        "bytes": 4096,
+        "seconds": 0.0970462,
+        "mbps": 0.04220670155039558
+      },
+      {
+        "relative_path": "dir11\\f0624.bin",
+        "bytes": 4096,
+        "seconds": 0.0964936,
+        "mbps": 0.042448411086331114
+      },
+      {
+        "relative_path": "dir02\\f0032.bin",
+        "bytes": 4096,
+        "seconds": 0.0894418,
+        "mbps": 0.045795142763227034
+      },
+      {
+        "relative_path": "dir01\\f0288.bin",
+        "bytes": 4096,
+        "seconds": 0.0815061,
+        "mbps": 0.050253907376257734
+      },
+      {
+        "relative_path": "dir00\\f0287.bin",
+        "bytes": 4096,
+        "seconds": 0.0801692,
+        "mbps": 0.05109194054574575
+      },
+      {
+        "relative_path": "dir08\\f0354.bin",
+        "bytes": 4096,
+        "seconds": 0.0694225,
+        "mbps": 0.05900104433000829
+      },
+      {
+        "relative_path": "dir05\\f0349.bin",
+        "bytes": 4096,
+        "seconds": 0.0694015,
+        "mbps": 0.05901889728608171
+      },
+      {
+        "relative_path": "dir06\\f0328.bin",
+        "bytes": 4096,
+        "seconds": 0.0675833,
+        "mbps": 0.06060668833868722
+      }
+    ]
+  },
+  "verify": null,
+  "integrity": "ok"
+}

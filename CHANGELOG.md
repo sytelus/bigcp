@@ -240,6 +240,16 @@ versioning once its 1.0 release gates are complete.
   median-of-5 protocol still pending. Negative intermediate results are
   preserved in BENCHMARKS.md as the regression map.
 
+### 2026-07-29 external-drive evidence (H: repaired)
+
+- R2 executed on the repaired 18 TB USB HDD: large files at 224.8 MB/s
+  average with verify 2/2 passed (device-ceiling parity with robocopy /J
+  within ~7 %); small files at 0.84× robocopy with the bottleneck
+  isolated by phase timing to per-file metadata stamps costing 2.0–2.7 ms
+  under the Quick-removal write-through policy (device-bound at every
+  concurrency). Evidence and levers recorded in BENCHMARKS.md; all H:
+  fixtures were confined to one new GUID directory and deleted afterward.
+
 ### Known pre-1.0 work
 
 - IOCP/no-buffering engine and its sans-I/O model, comprehensive fault/chaos

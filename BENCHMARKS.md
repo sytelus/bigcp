@@ -148,6 +148,36 @@ Negative results are retained above deliberately — they are the regression
 map. Certified numbers still require the median-of-≥5 quiet-machine
 protocol.
 
+## 2026-07-29 external-drive evidence (H: repaired — Oyen Novus 18 TB USB HDD)
+
+The owner repaired H: (previous CRC failures gone: directory create and
+write probes clean). Bounded runs, D: NVMe source → H: destination, new
+GUID directory only, all fixtures deleted after; raw reports in
+`docs/evidence/2026-07-29/hdd-*.report.json`:
+
+| Workload | bigcp (defaults unless noted) | robocopy |
+|---|---|---|
+| 2 × 8 GiB, `--verify` | **224.8 MB/s avg, 255.7 MB/s peak**, exit 0, verify 2/2 passed | `/J`, 1 × 8 GiB: 241 MB/s |
+| 20,000 × 4 KiB | 31.5 s (8 workers) / **28.4 s** (threads=4) / 33.2 s (threads=2) | `/MT:32`: 23.8 s |
+
+**Large files (the primary scenario): parity within ~7 %** — both tools sit
+at the device ceiling (~250 MB/s class), confirming ADR 0028's expectation
+that buffered streaming is not the limiter on external drives.
+
+**Small files to USB HDD: 0.84× robocopy at best**, and the phase table
+names the bottleneck precisely: `set_meta` (the final timestamp stamp) costs
+**2.0–2.7 ms per file at every concurrency level** — a synchronous device
+round-trip under the Quick-removal (write-cache-off) USB policy, ~40–53
+worker-seconds of pure metadata I/O. Worker-count sweep was flat-to-inverse,
+so this is device-bound, not contention; the NVMe directory-affinity design
+neither helps nor hurts here. Registered levers: (a) investigate what
+robocopy's ~1.2 ms/file total does differently on this stack (likely fewer
+filter/metadata round-trips — needs ProcMon-level tracing, post-v1);
+(b) users copying many small files to Quick-removal drives can switch the
+drive to "Better performance" policy (documented trade-off in README's
+removal section). Timestamp fidelity is contract — skipping the stamp is
+not a lever.
+
 ## Outstanding
 
 The elevated ReFS matrix and the repeated-run certified benchmark protocol
