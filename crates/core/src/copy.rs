@@ -4,9 +4,11 @@
 //! volumes, validates audit-path containment, and acquires the exact-root
 //! machine-wide lock before enumeration begins.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::File;
+use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -200,6 +202,7 @@ pub fn run_copy(
         breaker: None,
         breaker_streak: 0,
         breaker_announced: false,
+        dir_outstanding: HashMap::new(),
         small_workers,
         small_jobs_outstanding: 0,
         last_snapshot: Instant::now(),
@@ -446,6 +449,9 @@ struct Runner<'a> {
     breaker: Option<ErrorCategory>,
     breaker_streak: u32,
     breaker_announced: bool,
+    /// Outstanding worker jobs per parent directory, so a directory's exit
+    /// waits only for its own files while sibling directories keep copying.
+    dir_outstanding: HashMap<PathBuf, usize>,
     small_workers: SmallFileWorkers,
     small_jobs_outstanding: usize,
     last_snapshot: Instant,
@@ -480,15 +486,16 @@ impl Runner<'_> {
             .then(|| metadata_at(self.destination_root))
             .transpose()
             .map_err(|error| BigcpError::io("read destination root metadata", error))?;
-        let mut tasks = vec![DirectoryTask::Enter {
+        let mut tasks = std::collections::VecDeque::new();
+        tasks.push_back(DirectoryTask::Enter {
             source: self.source_root.to_path_buf(),
             destination: self.destination_root.to_path_buf(),
             relative: PathBuf::new(),
             source_metadata: root_metadata,
             destination_exists,
             destination_metadata,
-        }];
-        while let Some(task) = tasks.pop() {
+        });
+        while let Some(task) = tasks.pop_back() {
             if !self.canceled && self.observer.cancellation_requested() {
                 self.canceled = true;
                 self.observer
@@ -571,16 +578,37 @@ impl Runner<'_> {
                     source_metadata,
                     destination_exists,
                     destination_metadata,
-                } => self.exit_directory(
-                    &source,
-                    &destination,
-                    &relative,
-                    &source_metadata,
-                    destination_exists,
-                    destination_metadata.as_ref(),
-                )?,
+                } => {
+                    // A still-busy directory yields: drain one completion
+                    // (guaranteed progress) and revisit this exit after the
+                    // remaining tasks, so sibling directories keep feeding
+                    // their affine workers instead of serializing dir-by-dir.
+                    if self.dir_outstanding.contains_key(&relative) && !tasks.is_empty() {
+                        self.receive_small_job()?;
+                        tasks.push_front(DirectoryTask::Exit {
+                            source,
+                            destination,
+                            relative,
+                            source_metadata,
+                            destination_exists,
+                            destination_metadata,
+                        });
+                    } else {
+                        self.exit_directory(
+                            &source,
+                            &destination,
+                            &relative,
+                            &source_metadata,
+                            destination_exists,
+                            destination_metadata.as_ref(),
+                        )?;
+                    }
+                }
             }
         }
+        // Safety net: every directory exit drained its own jobs; this
+        // catches anything a stopped (canceled/breaker) walk left in flight.
+        self.drain_small_workers()?;
         Ok(())
     }
 
@@ -592,9 +620,10 @@ impl Runner<'_> {
         source_metadata: ObjectMetadata,
         destination_exists: bool,
         destination_metadata: Option<ObjectMetadata>,
-        tasks: &mut Vec<DirectoryTask>,
+        tasks: &mut std::collections::VecDeque<DirectoryTask>,
     ) -> Result<(), BigcpError> {
         self.counters.dirs_discovered = self.counters.dirs_discovered.saturating_add(1);
+        let phase_timer = Instant::now();
         let source_entries = match enumerate_directory(&source) {
             Ok(entries) => entries,
             Err(error) => {
@@ -624,10 +653,12 @@ impl Runner<'_> {
         } else {
             HashMap::new()
         };
+        crate::phase::record(6, phase_timer.elapsed());
         let mut seen_source = HashSet::new();
         let mut child_directories = Vec::new();
 
         for source_entry in source_entries {
+            let phase_timer = Instant::now();
             let child_relative = relative.join(&source_entry.name);
             if source_entry.metadata.kind == ObjectKind::File {
                 // Discovery is counted here, once per seen entry, so the I6
@@ -726,6 +757,9 @@ impl Runner<'_> {
                     self.handle_reparse(source_entry, destination_entry, child_relative)?;
                 }
             }
+            // Includes any completions drained under backpressure — the
+            // coordinator's whole per-entry serial cost is the number to beat.
+            crate::phase::record(7, phase_timer.elapsed());
         }
         // No drain here: keeping worker jobs in flight across sibling
         // directories is where cross-directory pipelining comes from (the
@@ -743,7 +777,7 @@ impl Runner<'_> {
             })?;
         }
 
-        tasks.push(DirectoryTask::Exit {
+        tasks.push_back(DirectoryTask::Exit {
             source: source.clone(),
             destination: destination.clone(),
             relative: relative.clone(),
@@ -826,7 +860,7 @@ impl Runner<'_> {
                     continue;
                 }
             };
-            tasks.push(DirectoryTask::Enter {
+            tasks.push_back(DirectoryTask::Enter {
                 source: source_entry.path,
                 destination: child_destination,
                 relative: child_relative,
@@ -847,11 +881,13 @@ impl Runner<'_> {
         destination_exists: bool,
         destination_metadata: Option<&ObjectMetadata>,
     ) -> Result<(), BigcpError> {
-        // A directory's timestamps may only be stamped after its files have
-        // stopped mutating it, and post-order guarantees every descendant's
-        // exit ran first — so draining here is both necessary and the only
-        // barrier the pipeline has.
-        self.drain_small_workers()?;
+        // A directory's timestamps may only be stamped after its own files
+        // stop mutating it; waiting only for *this* directory's jobs keeps
+        // sibling directories copying in parallel (a global drain here
+        // measurably serialized the whole run directory-by-directory).
+        while self.dir_outstanding.contains_key(relative) {
+            self.receive_small_job()?;
+        }
         if self.options.dry_run || !destination_exists {
             if self.options.dry_run {
                 self.counters.dirs_planned = self.counters.dirs_planned.saturating_add(1);
@@ -1438,15 +1474,54 @@ impl Runner<'_> {
         if self.small_jobs_outstanding >= self.small_workers.capacity() {
             self.receive_small_job()?;
         }
-        self.small_workers.submit(job)?;
+        // Directory-affine shard (see SmallFileWorkers): same-directory
+        // creates serialize on one worker, distinct directories in parallel.
+        let parent = job
+            .source_snapshot
+            .relative_path
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .to_path_buf();
+        let mut hasher = DefaultHasher::new();
+        parent.hash(&mut hasher);
+        let shard = usize::try_from(hasher.finish()).unwrap_or(usize::MAX);
+        let mut job = job;
+        loop {
+            match self.small_workers.try_submit(job, shard)? {
+                None => break,
+                Some(returned) => {
+                    // The shard's queue is full: drain one completion (which
+                    // may be anyone's) and retry — never block with results
+                    // unconsumed.
+                    self.receive_small_job()?;
+                    job = returned;
+                }
+            }
+        }
         self.small_jobs_outstanding = self.small_jobs_outstanding.saturating_add(1);
+        *self.dir_outstanding.entry(parent).or_insert(0) += 1;
         Ok(())
     }
 
     fn receive_small_job(&mut self) -> Result<(), BigcpError> {
         let completed = self.small_workers.receive()?;
         self.small_jobs_outstanding = self.small_jobs_outstanding.saturating_sub(1);
-        self.finish_copy(completed)
+        let parent = completed
+            .source_snapshot
+            .relative_path
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .to_path_buf();
+        if let Some(count) = self.dir_outstanding.get_mut(&parent) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.dir_outstanding.remove(&parent);
+            }
+        }
+        let phase_timer = Instant::now();
+        let outcome = self.finish_copy(completed);
+        crate::phase::record(8, phase_timer.elapsed());
+        outcome
     }
 
     fn drain_small_workers(&mut self) -> Result<(), BigcpError> {

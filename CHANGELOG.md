@@ -225,6 +225,21 @@ versioning once its 1.0 release gates are complete.
   — least access). Analysis, environmental-noise caveat, and ranked
   remaining levers (binary signing first) recorded in BENCHMARKS.md.
 
+### 2026-07-29 small-file goal met — directory-affine scheduling (v0.2.0)
+
+- Root-caused the residual robocopy gap with the new phase instrumentation:
+  after the Defender exclusion, destination creates were convoying on the
+  NTFS directory index (~2 ms interleaved vs ~0.5 ms serialized).
+- Shipped the four-part scheduling design (PLAN §5.8 — each part measured,
+  removing any one restored a bottleneck): directory-affine worker sharding,
+  deep (1024) per-worker metadata queues, a probe-free 4 µs coordinator
+  entry path, and per-directory drains with yielding directory exits.
+- Result with default settings: **10.2–12.0 s vs robocopy /MT:32
+  15.1–16.0 s (1.3–1.5× faster)** on the bounded 20k×4 KiB workload —
+  VISION's meet-or-exceed goal satisfied on this cell; certified
+  median-of-5 protocol still pending. Negative intermediate results are
+  preserved in BENCHMARKS.md as the regression map.
+
 ### Known pre-1.0 work
 
 - IOCP/no-buffering engine and its sans-I/O model, comprehensive fault/chaos

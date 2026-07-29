@@ -8,32 +8,24 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-/// Instrumented engine phases, in reporting order.
-pub const PHASE_NAMES: [&str; 6] = [
+/// Instrumented phases, in reporting order: worker-side engine phases first,
+/// then the coordinator's serial stages (which bound the wall clock — the
+/// coordinator is single-threaded, so its totals compare directly to run
+/// duration, while worker totals divide by the worker count).
+pub const PHASE_NAMES: [&str; 9] = [
     "open_src",
     "list_streams",
     "read",
     "create_dst",
     "write",
     "set_meta",
+    "coord_enum_join",
+    "coord_entry",
+    "coord_finish",
 ];
 
-static NANOS: [AtomicU64; 6] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-];
-static CALLS: [AtomicU64; 6] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-];
+static NANOS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+static CALLS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 
 /// Adds one timed call to a phase accumulator.
 pub fn record(index: usize, elapsed: Duration) {

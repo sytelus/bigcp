@@ -124,6 +124,30 @@ Hints tab (Dev Drive / temporary Defender exclusion — bigcp never changes
 AV settings itself). Filter-visible operations per file are already at the
 direct-copy minimum (one create, one close, no rename).
 
+## 2026-07-29 goal met: directory-affine scheduling (final small-file result)
+
+With the owner-approved Defender process exclusion active (the installer
+mechanism) and default settings, after four measured, layered changes —
+phase instrumentation → direct final-name writes → probe-free coordinator →
+directory-affine sharding + deep queues + yielding directory exits:
+
+| Run | bigcp (defaults) | robocopy `/MT:32` |
+|---|---|---|
+| 1 | **10.24 s** | 15.11 s |
+| 2 | **11.98 s** | 16.04 s |
+
+**bigcp 1.3–1.5× faster than robocopy** on the 20,000 × 4 KiB NVMe→NVMe
+workload — the meet-or-exceed gate satisfied on this cell in this session.
+The causal chain, each step confirmed by the phase table: destination
+creation was 72 % of worker time; the residue after the exclusion was NTFS
+directory-index convoying (2 ms interleaved vs ~0.5 ms serialized); affinity
+alone stalled the coordinator (4-deep queues, 25 s); deep queues alone still
+ran one directory at a time (the DFS stack places each leaf's exit atop its
+enter, 23 s); yielding exits unlocked cross-directory parallelism (10–12 s).
+Negative results are retained above deliberately — they are the regression
+map. Certified numbers still require the median-of-≥5 quiet-machine
+protocol.
+
 ## Outstanding
 
 The elevated ReFS matrix and the repeated-run certified benchmark protocol
