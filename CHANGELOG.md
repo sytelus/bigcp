@@ -285,6 +285,18 @@ versioning once its 1.0 release gates are complete.
   Initial code review of those paths found no critical defects.
   PLAN_DEVIATIONS.md is now clear.
 
+### 2026-07-29 49×-gap first-principles study (measurement-only, no code)
+
+- Analyzed the small-vs-large throughput gap from first principles against
+  the owner's tar thought-experiment: the gap is three synchronous USB
+  metadata round-trips per file on a ~3-op-deep bridge under the
+  Quick-removal mount policy. Enumerated and measured/excluded every
+  app-level lever, including a `FILE_ATTRIBUTE_TEMPORARY` lazy-write
+  experiment (3–10 %, inside noise; reverted). Conclusion recorded in
+  BENCHMARKS.md: the collapse lever is the user-side "Better performance"
+  volume policy, whose factor awaits one owner-approved measurement; a
+  behavior-based report hint is registered as a candidate.
+
 ### Known pre-1.0 work
 
 - IOCP/no-buffering engine and its sans-I/O model, comprehensive fault/chaos

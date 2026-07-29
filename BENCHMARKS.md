@@ -249,6 +249,52 @@ From the H: evidence already gathered (no new runs):
   close-finalizer stage stays retired; revisit only if worker counts ever
   drop materially.
 
+## 2026-07-29 first-principles study of the 49× small-vs-large gap
+
+The owner's tar thought-experiment ("tar the tree and it copies 49× faster
+with metadata intact") probes exactly the right spot, and the analysis plus
+two new measurements pin down where the gap lives and what can move it:
+
+**Why tar is 49× — and why that bound doesn't transfer.** Tar wins because
+the container *stays one file*; materializing 20,000 real files on the
+destination pays the identical per-file tax (an untar onto this drive would
+crawl exactly like a copy). The tool-reachable bound is therefore the
+per-file device floor, which the traces decompose precisely: ~0.885 ms/file
+wall ≈ **three synchronous USB round-trips per file** (create transaction,
+data write, close/cleanup flush) at ~0.3 ms bridge latency, with the Oyen
+bridge sustaining only ~3 effective concurrent operations — which is why
+extra software overlap (R7) bought nothing.
+
+**Every app-level lever has now been enumerated and measured or excluded:**
+
+- *More overlap* — R7, measured: no gain (bridge concurrency is the cap).
+- *Fewer ops per file* — excluded by the platform: Windows has no
+  create-with-data call, and MFT residency only absorbs files ≤ ~700 bytes
+  (our 4 KiB fixture and most real small files exceed it).
+- *Lazy data via `FILE_ATTRIBUTE_TEMPORARY`* — measured (A/B ×2 on H:,
+  create-with-TEMPORARY then final stamp clearing it; semantics verified
+  exact): 23.9→23.2 s and 18.8→17.0 s — **3–10 %, inside session noise**.
+  Consistent with the decomposition: data writes were already cheap
+  (~170 µs); the cost is metadata transactions, which the hint doesn't
+  touch. Not shipped.
+- *Metadata on a background thread* (the owner's suggestion) — this is
+  R7/close-offload and the stamp coalescing already shipped (ADR 0031);
+  what remains per file is transaction work the filesystem itself commits
+  synchronously on this mount policy.
+
+**The one lever that actually collapses the gap is the volume's
+write-caching policy.** "Quick removal" (the Windows default for external
+drives) makes NTFS commit each file's metadata transactions through to the
+device; "Better performance" lets the NTFS log batch thousands of creates
+per flush — that batching is what tar's single-stream speed is made of.
+This is user-side by design (bigcp never changes system settings) and needs
+one owner-approved measurement with the policy flipped to quantify the
+collapse factor honestly; until then the README's removal section carries
+the qualitative guidance. A report hint ("this destination looks
+metadata-bound; consider the Better-performance policy + Safely Remove")
+is registered as a candidate — it needs behavior-based detection, since
+policy inference via IOCTL was deliberately deleted (ADR 0027).
+
 ## Outstanding
 
 The elevated ReFS matrix and the repeated-run certified benchmark protocol
