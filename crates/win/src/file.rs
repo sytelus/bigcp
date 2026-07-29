@@ -453,7 +453,25 @@ impl DestinationFinal {
     /// is truncated in place (which preserves its security descriptor);
     /// without it an existing name fails with `AlreadyExists`. A reparse
     /// point at the name is never opened through nor written.
-    pub fn create(path: &Path, replace: bool, encrypted: bool) -> io::Result<Self> {
+    ///
+    /// When `stamp` is provided, source timestamps and attributes are set
+    /// **immediately at create** — inside the same hot MFT window as the
+    /// create itself, which on write-through (Quick-removal) USB volumes
+    /// eliminates the separate ~2 ms metadata round-trip that dominated the
+    /// small-file benchmark. Windows documents that an explicit last-write
+    /// set stops automatic updates on this handle, so subsequent data
+    /// writes leave the stamped times intact; crash repair is carried by
+    /// the size check (files are truncated at create, so any interrupted
+    /// partial is shorter than its source and reclassifies on rerun).
+    /// Callers pass `None` (and stamp via [`DestinationFinal::finish`])
+    /// when early attributes would break them — e.g. a read-only source
+    /// whose named streams or EAs still need write sub-opens.
+    pub fn create(
+        path: &Path,
+        replace: bool,
+        encrypted: bool,
+        stamp: Option<BasicMetadata>,
+    ) -> io::Result<Self> {
         let mut options = OpenOptions::new();
         options
             .write(true)
@@ -480,6 +498,9 @@ impl DestinationFinal {
                 "destination name is not a plain file",
             ));
         }
+        if let Some(stamp) = stamp {
+            set_basic_by_handle(&file, stamp)?;
+        }
         Ok(Self {
             file,
             path: path.to_path_buf(),
@@ -501,11 +522,12 @@ impl DestinationFinal {
         Ok(metadata_from_file(&self.file)?.basic.attributes)
     }
 
-    /// Stamps the source metadata — the completion marker for this path —
-    /// optionally flushes, and closes. Must be the last operation after
-    /// every data byte of every stream.
-    pub fn finish(self, metadata: BasicMetadata, flush: bool) -> io::Result<()> {
-        set_basic_by_handle(&self.file, metadata)?;
+    /// Completes the file: stamps metadata now when it was not stamped at
+    /// create (the read-only-with-aux fallback), optionally flushes, closes.
+    pub fn finish(self, late_stamp: Option<BasicMetadata>, flush: bool) -> io::Result<()> {
+        if let Some(metadata) = late_stamp {
+            set_basic_by_handle(&self.file, metadata)?;
+        }
         if flush {
             self.file.sync_all()?;
         }
@@ -868,5 +890,50 @@ mod tests {
         assert!(source.read_to_end(&mut bytes).is_ok());
         assert_eq!(bytes, b"source");
         assert_eq!(source.opened_metadata().size, 6);
+    }
+}
+
+#[cfg(test)]
+mod destination_final_tests {
+    use super::{BasicMetadata, DestinationFinal};
+    use crate::metadata::metadata_at;
+    use std::io::Write;
+
+    /// Pins the create-time stamp coalescing contract (BENCHMARKS.md
+    /// 2026-07-29): an explicit timestamp set right after create must
+    /// survive subsequent data writes on the same handle — Windows stops
+    /// auto-updating the last-write time once it is explicitly set. If this
+    /// ever fails, the small-file engine must return to finish-time
+    /// stamping before shipping.
+    #[test]
+    fn create_time_stamp_survives_writes_in_sandbox() {
+        let sandbox = tempfile::tempdir();
+        assert!(sandbox.is_ok());
+        let Some(sandbox) = sandbox.ok() else {
+            return;
+        };
+        let path = sandbox.path().join("stamped.bin");
+        let stamp = BasicMetadata {
+            creation_time: 131_000_000_000_000_000,
+            last_access_time: 131_000_000_000_000_001,
+            last_write_time: 131_000_000_000_000_002,
+            attributes: 0x20,
+        };
+        let file = DestinationFinal::create(&path, false, false, Some(stamp));
+        assert!(file.is_ok());
+        let Some(mut file) = file.ok() else {
+            return;
+        };
+        assert!(file.write_all(&[0xAB_u8; 8192]).is_ok());
+        assert!(file.finish(None, false).is_ok());
+        let observed = metadata_at(&path);
+        assert!(observed.is_ok());
+        assert!(
+            observed
+                .ok()
+                .is_some_and(|value| value.basic.last_write_time == stamp.last_write_time
+                    && value.basic.creation_time == stamp.creation_time),
+            "explicit stamp did not survive data writes"
+        );
     }
 }

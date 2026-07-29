@@ -109,7 +109,18 @@ pub fn select_copy_profile(
             .disk_numbers
             .iter()
             .any(|disk| destination_info.disk_numbers.contains(disk));
-    let workers = source.workers.min(destination.workers);
+    // Small-file cost is destination-bound (creates, writes, closes all land
+    // on the destination), so worker count follows the destination's row —
+    // measured 2026-07-29: a min() composition let one low-confidence side
+    // drag a 32-worker HDD destination down to 4 workers and forfeit the
+    // close-overlap win (BENCHMARKS.md). The one exception is a seek-penalty
+    // source, whose row stays authoritative: its random reads are the
+    // scarcer resource.
+    let workers = if source.class == DeviceClass::Hdd {
+        source.workers.min(destination.workers)
+    } else {
+        destination.workers
+    };
     Ok(CopyProfile {
         source,
         destination,
@@ -188,13 +199,18 @@ fn side_profile(
         ),
         DeviceClass::SataSsd => (8 * 1024 * 1024, 2, 32, 8),
         DeviceClass::UsbSsd => (4 * 1024 * 1024, 2, 16, 8),
-        // Seek-penalty media get large sequential chunks, a single large
-        // stream, and reduced concurrency: parallelism that helps SSDs is
-        // head-thrash on a spindle.
+        // Seek-penalty media get large sequential chunks and a single large
+        // stream. Small-file workers stay HIGH on an HDD destination
+        // (measured 2026-07-29, BENCHMARKS.md): small-file cost there is
+        // metadata-bound — per-file CloseHandle is a ~2.3 ms write-through
+        // round-trip on Quick-removal USB — and 32 outstanding closes
+        // overlap in the device queue (19.1 s vs 31.5 s with 8 workers on
+        // the 20k-file workload, beating robocopy). Reading from an HDD
+        // source stays conservative (seek-bound, unmeasured).
         DeviceClass::Hdd => (
             16 * 1024 * 1024,
             1,
-            if source { 4 } else { 8 },
+            if source { 4 } else { 32 },
             if source { 2 } else { 4 },
         ),
         DeviceClass::Auto | DeviceClass::Unknown => (4 * 1024 * 1024, 1, 4, 4),

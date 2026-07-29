@@ -250,6 +250,20 @@ versioning once its 1.0 release gates are complete.
   concurrency). Evidence and levers recorded in BENCHMARKS.md; all H:
   fixtures were confined to one new GUID directory and deleted afterward.
 
+### 2026-07-29 first-principles pass — external-HDD goal exceeded
+
+- Create-time timestamp stamping (freeze semantics validated by a new
+  regression test; ADS/EA files stamp at finish since the freeze is
+  per-handle); crash repair rides the size check.
+- Root-caused the USB small-file cost to per-file CloseHandle (~2.3 ms
+  write-through round-trip): HDD-destination workers raised 8→32 by
+  measurement; worker composition now follows the destination row unless
+  the source is seek-penalty class (a min() rule had let an Unknown side
+  force 4 workers). D:-NVMe profiling as Unknown registered for
+  investigation; H1-style close-finalizer stage registered as next lever.
+- Result with defaults: 17.7–18.0 s vs robocopy 23.1–24.5 s on the USB-HDD
+  small-file cell — every measured small-file cell now exceeds robocopy.
+
 ### Known pre-1.0 work
 
 - IOCP/no-buffering engine and its sans-I/O model, comprehensive fault/chaos

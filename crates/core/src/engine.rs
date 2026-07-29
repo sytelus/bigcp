@@ -463,8 +463,21 @@ fn copy_small(
     // it. Routing guarantees every stream here is below the large and
     // checkpoint thresholds, so no journal interplay exists on this path.
     let replace = request.replacement_snapshot.is_some();
+    // Stamp timestamps+attributes at create (coalesced into the create's
+    // MFT window — the measured 2 ms metadata round-trip on write-through
+    // USB volumes disappears; the explicit set freezes mtime against writes
+    // *on this handle*, and crash repair rides on the size check since the
+    // file is truncated at create). The freeze is per-handle, so any file
+    // with named streams or EAs — written through sub-opened handles that
+    // would re-bump the stamped time (and be blocked outright by an early
+    // read-only attribute) — stamps at finish instead. That aux case is
+    // rare by design (F21: ADS/EAs are usually absent).
+    let has_aux =
+        extended_attributes.is_some() || streams.iter().any(|stream| !stream.is_unnamed());
+    let stamp_early = !has_aux;
+    let basic = request.source_snapshot.metadata.basic;
     let timer = std::time::Instant::now();
-    let destination = create_final(request, replace)?;
+    let destination = create_final(request, replace, stamp_early.then_some(basic))?;
     crate::phase::record(3, timer.elapsed());
     let efs_downgraded =
         wants_encryption(request) && !destination.basic_attributes().is_ok_and(is_encrypted);
@@ -482,7 +495,7 @@ fn copy_small(
     post_read_validate(request, source)?;
     let timer = std::time::Instant::now();
     destination
-        .finish(request.source_snapshot.metadata.basic, request.flush)
+        .finish((!stamp_early).then_some(basic), request.flush)
         .map_err(|error| operation_error("set_meta", request.relative_path, &error))?;
     crate::phase::record(5, timer.elapsed());
     Ok(EngineResult {
@@ -504,9 +517,10 @@ fn copy_small(
 fn create_final(
     request: &EngineRequest<'_>,
     replace: bool,
+    stamp: Option<bigcp_win::BasicMetadata>,
 ) -> Result<DestinationFinal, OperationError> {
     let encrypted = wants_encryption(request);
-    match DestinationFinal::create(request.destination_path, replace, encrypted) {
+    match DestinationFinal::create(request.destination_path, replace, encrypted, stamp) {
         Ok(value) => Ok(value),
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied && replace => {
             let Some(snapshot) = request
@@ -520,7 +534,7 @@ fn create_final(
             set_basic_at(request.destination_path, cleared).map_err(|error| {
                 operation_error("clear_readonly", request.relative_path, &error)
             })?;
-            DestinationFinal::create(request.destination_path, replace, encrypted)
+            DestinationFinal::create(request.destination_path, replace, encrypted, stamp)
                 .map_err(|error| operation_error("create_dst", request.relative_path, &error))
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {

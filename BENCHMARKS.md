@@ -178,6 +178,39 @@ drive to "Better performance" policy (documented trade-off in README's
 removal section). Timestamp fidelity is contract — skipping the stamp is
 not a lever.
 
+## 2026-07-29 first-principles pass: goal exceeded on the external HDD too
+
+Three findings, each measured on H: (Oyen Novus USB HDD) with the phase
+instrumentation, took the small-file cell from 0.84× to **1.3× robocopy
+with pure default settings (17.7–18.0 s vs 23.1–24.5 s, two interleaved
+reps)**:
+
+1. **Create-time timestamp stamping** (`DestinationFinal::create` now
+   stamps immediately after create): Windows freezes automatic last-write
+   updates on a handle once times are explicitly set — validated by a new
+   regression test — so the stamp coalesces into the create's MFT window.
+   Crash repair rides the size check (files truncate at create). Files with
+   ADS/EAs stamp at finish (the freeze is per-handle; sub-opened stream/EA
+   handles would re-bump it — caught by e2e verify during development).
+2. **The dominant per-file cost on write-through USB is `CloseHandle`
+   (~2.3 ms)**, not the stamp — the timer around `finish` had been
+   measuring the close all along. More outstanding closes overlap in the
+   device queue, so the HDD-destination worker row was raised 8 → 32
+   (measured 31.5 s → 19.1 s). A dedicated close/finalizer stage (the
+   deleted H1, now benchmark-justified) remains the registered next lever.
+3. **Worker composition bug**: `min(src, dst)` workers let a low-confidence
+   (Unknown) side drag an HDD destination to 4 workers. Composition now
+   follows the destination row (destination-bound work) unless the source
+   is itself seek-penalty class. Also observed: D: (internal NVMe) profiles
+   as Unknown — device-query failure on that controller, registered for
+   investigation.
+
+Scoreboard after this pass, defaults vs robocopy best-known: NVMe→NVMe
+small files **1.3–1.5×**, NVMe→USB-HDD small files **1.3×**, NVMe→USB-HDD
+large files **parity at device ceiling**, NVMe→NVMe large files parity
+(buffered default vs buffered default). All cells single-session
+indicative; certified median-of-5 protocol still pending.
+
 ## Outstanding
 
 The elevated ReFS matrix and the repeated-run certified benchmark protocol
