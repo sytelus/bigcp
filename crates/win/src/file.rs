@@ -1,8 +1,10 @@
 //! Source-read and destination-write choke points.
 //!
-//! Source handles are constructed read-only. Destination files are always
-//! opaque sibling temporaries that self-delete on close until commit. The only
-//! replacing write primitive in the workspace consumes DestinationTemp.
+//! Source handles are constructed read-only. Destination writes flow through
+//! exactly two sanctioned primitives: `DestinationTemp` (opaque self-deleting
+//! temporary published by atomic rename — large files, whose partials are
+//! resume assets) and `DestinationFinal` (direct final-name writer — small
+//! files, whose crash contract is rerun-repair, ADR 0030).
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, Write};
@@ -61,6 +63,18 @@ pub const fn is_sparse(attributes: u32) -> bool {
 #[must_use]
 pub const fn is_encrypted(attributes: u32) -> bool {
     attributes & FILE_ATTRIBUTE_ENCRYPTED != 0
+}
+
+/// Returns whether attributes carry the read-only flag.
+#[must_use]
+pub const fn is_readonly(attributes: u32) -> bool {
+    attributes & FILE_ATTRIBUTE_READONLY != 0
+}
+
+/// Returns the attributes with the read-only flag cleared.
+#[must_use]
+pub const fn without_readonly(attributes: u32) -> u32 {
+    attributes & !FILE_ATTRIBUTE_READONLY
 }
 
 /// Returns whether attributes describe data that may hydrate on access.
@@ -418,6 +432,90 @@ impl Write for DestinationTemp {
 impl Read for DestinationTemp {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         self.file_mut()?.read(buffer)
+    }
+}
+
+/// Direct final-name destination writer for the small-file path (ADR 0030).
+///
+/// This deliberately publishes bytes under the real name while writing —
+/// the crash contract for small files is rerun-repair, not atomic
+/// publication: an interrupted write may leave a partial file at the final
+/// name, and the engine calls [`DestinationFinal::finish`] (which stamps the
+/// source timestamps) only after the last data byte, so a partial can never
+/// satisfy the exact size+mtime skip heuristic — the next run replaces it.
+pub struct DestinationFinal {
+    file: File,
+    path: PathBuf,
+}
+
+impl DestinationFinal {
+    /// Opens the final name directly. With `replace` an existing destination
+    /// is truncated in place (which preserves its security descriptor);
+    /// without it an existing name fails with `AlreadyExists`. A reparse
+    /// point at the name is never opened through nor written.
+    pub fn create(path: &Path, replace: bool, encrypted: bool) -> io::Result<Self> {
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        if replace {
+            options.create(true).truncate(true);
+        } else {
+            options.create_new(true);
+        }
+        if encrypted {
+            options.attributes(FILE_ATTRIBUTE_ENCRYPTED);
+        }
+        let file = options.open(path)?;
+        let metadata = metadata_from_file(&file)?;
+        if metadata.kind != ObjectKind::File {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "destination name is not a plain file",
+            ));
+        }
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// Creates one named stream on the final file.
+    pub fn create_stream(&self, stream: &StreamInfo) -> io::Result<DestinationStream> {
+        DestinationStream::create(&self.path, stream, true)
+    }
+
+    /// Writes the opaque EA blob onto the final file.
+    pub fn write_extended_attributes(&self, attributes: &ExtendedAttributes) -> io::Result<()> {
+        write_to_file(&self.file, attributes)
+    }
+
+    /// Reports current basic attributes (EFS state check).
+    pub fn basic_attributes(&self) -> io::Result<u32> {
+        Ok(metadata_from_file(&self.file)?.basic.attributes)
+    }
+
+    /// Stamps the source metadata — the completion marker for this path —
+    /// optionally flushes, and closes. Must be the last operation after
+    /// every data byte of every stream.
+    pub fn finish(self, metadata: BasicMetadata, flush: bool) -> io::Result<()> {
+        set_basic_by_handle(&self.file, metadata)?;
+        if flush {
+            self.file.sync_all()?;
+        }
+        Ok(())
+    }
+}
+
+impl Write for DestinationFinal {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.file.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
     }
 }
 

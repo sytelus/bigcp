@@ -272,3 +272,30 @@ pass — added, changed, or retained — mounts, formats, fills, dismounts,
 benchmarks, forces disconnects, or issues raw operations against any drive,
 and scale/device-loss behavior remains validated by simulation and fault
 injection only.
+
+## 2026-07-29 owner-approved one-time evidence run
+
+The owner granted one-time permission for the heavy-tier benchmarks, the
+elevated ReFS matrix, and a real-hardware run confined to a new directory on
+H:. Outcomes:
+
+- **Heavy benchmarks (executed):** fresh GUID sandboxes on D: (source) and
+  the C: user temp (destination); 20,000×4 KiB and 2×8 GiB workloads with
+  one robocopy reference point each; results and honest findings recorded in
+  `BENCHMARKS.md`, raw reports in `docs/evidence/2026-07-29/`. Total writes
+  ≈ 40 GiB across the two internal NVMe volumes; every fixture was deleted
+  after evidence capture (only the session's own GUID-named directories were
+  removed; an empty `D:\bigcp-bench` shell folder remains).
+- **H: hardware run (aborted, zero writes):** the first directory-creation
+  on H: returned Win32 error 23 (CRC data error). Nothing was created,
+  nothing was written, no existing file was touched, and all H: activity
+  stopped immediately per the owner's no-harm instruction. The drive needs
+  owner investigation (cable/bridge/media) before any future attempt.
+- **Elevated ReFS matrix (not executable in this session):** the session is
+  unelevated and the Hyper-V PowerShell module is absent. A one-time
+  operator script (VHDX-file-confined, graceful dismount only) was prepared
+  and handed to the owner; no VHD command ran and none was committed to the
+  repository.
+
+F: and G: were never touched — the whitelist rejects them and the owner's
+permission covered only H:.

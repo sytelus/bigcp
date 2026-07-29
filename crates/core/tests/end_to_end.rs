@@ -594,3 +594,46 @@ fn graceful_cancel_stops_inside_a_large_file() -> Result<(), Box<dyn std::error:
     );
     Ok(())
 }
+
+#[test]
+fn hidden_large_stream_is_promoted_from_worker_to_inline_streaming()
+-> Result<(), Box<dyn std::error::Error>> {
+    let allowed_temp = validated_system_temp()?;
+    let lease = tempfile::Builder::new()
+        .prefix("bigcp-promote-")
+        .tempdir_in(allowed_temp)?;
+    let sandbox = initialize_empty(lease.path())?;
+    let source = sandbox.child(Path::new("source"))?;
+    let destination = sandbox.child(Path::new("destination"))?;
+    fs::create_dir(&source)?;
+    // Tiny unnamed stream routes the file to a worker; the 256 KiB ADS is
+    // above the tuned large-threshold, so the worker must hand the file
+    // back and the coordinator must stream it inline — with the ADS intact.
+    let host = source.join("tiny-with-big-ads.txt");
+    fs::write(&host, b"tiny")?;
+    let stream = StreamInfo {
+        name: OsString::from(":huge:$DATA"),
+        size: 256 * 1024,
+    };
+    let mut alternate = DestinationStream::create(&host, &stream, true)?;
+    alternate.write_all(&vec![0xC3_u8; 256 * 1024])?;
+    alternate.flush()?;
+    drop(alternate);
+
+    let mut options = CopyOptions::new(source.clone(), destination.clone());
+    options.state_dir = Some(sandbox.child(Path::new("state"))?);
+    options.verify = true;
+    options.tune.large_threshold = Some(64 * 1024);
+    let report = run_copy(&options, &SilentObserver)?;
+    assert_eq!(report.run.exit, 0, "errors: {:?}", report.errors);
+    assert_eq!(report.counters.copied_new, 1);
+    assert!(report.counters.reconcile().is_ok());
+    // The promotion round-trip must not double-count discovery or outcomes.
+    assert_eq!(report.counters.files_discovered, 1);
+    let full = bigcp_core::run_standalone_verify(&VerifyOptions {
+        source,
+        destination,
+    })?;
+    assert_eq!(full.failed, 0, "verify mismatches: {:?}", full.mismatches);
+    Ok(())
+}

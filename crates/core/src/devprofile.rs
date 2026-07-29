@@ -61,7 +61,7 @@ pub fn select_copy_profile(
         destination.workers = workers;
     }
     if let Some(memory_bytes) = tune.memory_bytes {
-        let large_threshold = tune.large_threshold.unwrap_or(4 * 1024 * 1024);
+        let large_threshold = tune.large_threshold.unwrap_or(16 * 1024 * 1024);
         let large_threshold = usize::try_from(large_threshold).map_err(|_| {
             BigcpError::Invalid("large-file threshold does not fit this address space".to_owned())
         })?;

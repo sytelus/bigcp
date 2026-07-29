@@ -719,7 +719,10 @@ impl Runner<'_> {
                 }
             }
         }
-        self.drain_small_workers()?;
+        // No drain here: keeping worker jobs in flight across sibling
+        // directories is where cross-directory pipelining comes from (the
+        // per-directory barrier measurably serialized small-file runs). The
+        // drain happens at directory exit, before timestamps are stamped.
         for extra in destination_map.into_values() {
             let rel = relative.join(extra.name);
             self.counters.extra = self.counters.extra.saturating_add(1);
@@ -836,6 +839,11 @@ impl Runner<'_> {
         destination_exists: bool,
         destination_metadata: Option<&ObjectMetadata>,
     ) -> Result<(), BigcpError> {
+        // A directory's timestamps may only be stamped after its files have
+        // stopped mutating it, and post-order guarantees every descendant's
+        // exit ran first — so draining here is both necessary and the only
+        // barrier the pipeline has.
+        self.drain_small_workers()?;
         if self.options.dry_run || !destination_exists {
             if self.options.dry_run {
                 self.counters.dirs_planned = self.counters.dirs_planned.saturating_add(1);
@@ -1149,7 +1157,7 @@ impl Runner<'_> {
             self.options.replace,
         ) {
             Classification::New => {
-                self.copy_classified(&source, &relative, &source_snapshot, None, None)?;
+                self.copy_classified(&source, &relative, &source_snapshot, None, None, true)?;
             }
             Classification::Same => {
                 self.record_file(
@@ -1200,6 +1208,7 @@ impl Runner<'_> {
                     &source_snapshot,
                     destination_snapshot.as_ref(),
                     Some((fields, destination_newer)),
+                    true,
                 )?;
             }
             Classification::SkipDifferent {
@@ -1247,6 +1256,7 @@ impl Runner<'_> {
         source_snapshot: &EntrySnapshot,
         destination_snapshot: Option<&EntrySnapshot>,
         replacement: Option<(Vec<&'static str>, bool)>,
+        dispatch: bool,
     ) -> Result<(), BigcpError> {
         let replacement_old = match (&replacement, destination_snapshot) {
             (Some(_), Some(snapshot)) => Some(&snapshot.metadata),
@@ -1257,6 +1267,51 @@ impl Runner<'_> {
             }
             (None, _) => None,
         };
+        // Fast dispatch — the small-file benchmark showed the coordinator's
+        // per-file source revalidation and stream probe serializing the
+        // whole pipeline (rsync's architecture teaches the same lesson: the
+        // stage that discovers work must never do per-item blocking work).
+        // Routing keys on the enumerated unnamed size alone; the engine
+        // revalidates at open (section 4.8) and discovers streams itself,
+        // and a worker that meets `promote_threshold` hands the file back
+        // untouched so checkpoints and mid-file cancel stay inline-only.
+        if dispatch && !self.options.dry_run {
+            let unnamed = source.metadata.size;
+            let checkpoint_possible =
+                self.journal.is_some() && unnamed >= self.options.checkpoint_threshold();
+            if unnamed < self.options.large_threshold() && !checkpoint_possible {
+                let promote_threshold = if self.journal.is_some() {
+                    self.options
+                        .large_threshold()
+                        .min(self.options.checkpoint_threshold())
+                } else {
+                    self.options.large_threshold()
+                };
+                let job = FileCopyJob {
+                    source_path: source.path.clone(),
+                    destination_path: self.destination_root.join(relative),
+                    source_snapshot: source_snapshot.clone(),
+                    destination_snapshot: destination_snapshot.cloned(),
+                    replacement: replacement.map(|(fields, destination_newer)| ReplacementWork {
+                        fields,
+                        destination_newer,
+                    }),
+                    run_id: self.run_id.to_owned(),
+                    large_threshold: self.options.large_threshold(),
+                    verify: self.options.verify,
+                    flush: self.options.flush,
+                    destination_supports_streams: self.destination_supports_streams,
+                    destination_supports_eas: self.destination_supports_eas,
+                    destination_supports_encryption: self.destination_supports_encryption,
+                    chunk_bytes: self.chunk_bytes,
+                    checkpoint_threshold: self.options.checkpoint_threshold(),
+                    streams: None,
+                    logical_bytes: unnamed,
+                    promote_threshold: Some(promote_threshold),
+                };
+                return self.submit_small_job(job);
+            }
+        }
         if let Err(error) = revalidate_source(source, relative) {
             return self.record_file(
                 relative,
@@ -1322,39 +1377,13 @@ impl Runner<'_> {
             return self.record_file(relative, outcome, replacement.map(|(fields, _)| fields));
         }
         let destination_path = self.destination_root.join(relative);
-        let largest_stream = streams
-            .iter()
-            .map(|stream| stream.size)
-            .max()
-            .unwrap_or(source.metadata.size);
         let replacement = replacement.map(|(fields, destination_newer)| ReplacementWork {
             fields,
             destination_newer,
         });
-        let checkpoint_eligible =
-            self.journal.is_some() && largest_stream >= self.options.checkpoint_threshold();
-        if largest_stream < self.options.large_threshold() && !checkpoint_eligible {
-            let job = FileCopyJob {
-                source_path: source.path.clone(),
-                destination_path,
-                source_snapshot: source_snapshot.clone(),
-                destination_snapshot: destination_snapshot.cloned(),
-                replacement,
-                run_id: self.run_id.to_owned(),
-                large_threshold: self.options.large_threshold(),
-                verify: self.options.verify,
-                flush: self.options.flush,
-                destination_supports_streams: self.destination_supports_streams,
-                destination_supports_eas: self.destination_supports_eas,
-                destination_supports_encryption: self.destination_supports_encryption,
-                chunk_bytes: self.chunk_bytes,
-                checkpoint_threshold: self.options.checkpoint_threshold(),
-                streams,
-                logical_bytes,
-            };
-            return self.submit_small_job(job);
-        }
-
+        // Every non-dry-run file reaching here copies inline: the fast path
+        // above dispatched everything routable by unnamed size, and promoted
+        // hand-backs re-enter with `dispatch: false`.
         let mut counters = Counters::default();
         // Large files copy inline on this thread, so the front end's cancel
         // flag is polled from inside the chunk loops — a graceful stop no
@@ -1380,10 +1409,12 @@ impl Runner<'_> {
             destination_supports_encryption: self.destination_supports_encryption,
             known_streams: Some(&streams),
             cancel: &cancel_probe,
+            promote_threshold: None,
         };
         let copy_started = Instant::now();
         let result = copy_file(&request, &mut counters, self.journal.as_mut());
         self.finish_copy(CompletedCopy {
+            source_path: source.path.clone(),
             destination_path,
             source_snapshot: source_snapshot.clone(),
             destination_snapshot: destination_snapshot.cloned(),
@@ -1418,6 +1449,40 @@ impl Runner<'_> {
     }
 
     fn finish_copy(&mut self, completed: CompletedCopy) -> Result<(), BigcpError> {
+        if let Err(error) = &completed.result
+            && error.operation == crate::engine::PROMOTED_TO_COORDINATOR
+        {
+            // The worker found a stream large enough to deserve checkpoints
+            // and mid-file cancellation, and copied nothing. Rerun the file
+            // inline where the journal and the cancel probe live; the rerun
+            // records the real outcome, so this attempt contributes nothing.
+            let CompletedCopy {
+                source_path,
+                source_snapshot,
+                destination_snapshot,
+                replacement,
+                ..
+            } = completed;
+            let source = DirectoryEntry {
+                name: source_snapshot
+                    .relative_path
+                    .file_name()
+                    .map(OsString::from)
+                    .unwrap_or_default(),
+                path: source_path,
+                metadata: source_snapshot.metadata.clone(),
+            };
+            let relative = source_snapshot.relative_path.clone();
+            let replacement = replacement.map(|work| (work.fields, work.destination_newer));
+            return self.copy_classified(
+                &source,
+                &relative,
+                &source_snapshot,
+                destination_snapshot.as_ref(),
+                replacement,
+                false,
+            );
+        }
         self.counters.bytes_read_source = self
             .counters
             .bytes_read_source
@@ -1551,16 +1616,12 @@ impl Runner<'_> {
             },
         };
         if let Some(analysis) = self.analysis.as_mut()
-            && matches!(
-                outcome,
-                FileOutcome::CopiedNew { .. } | FileOutcome::CopiedReplaced { .. }
-            )
+            && let FileOutcome::CopiedNew { bytes, .. } | FileOutcome::CopiedReplaced { bytes, .. } =
+                &outcome
         {
-            analysis.record(
-                &relative.to_string_lossy(),
-                completed.logical_bytes,
-                completed.seconds,
-            );
+            // The outcome's byte count is the engine's exact logical figure;
+            // fast-dispatched jobs only carried the enumerated unnamed size.
+            analysis.record(&relative.to_string_lossy(), *bytes, completed.seconds);
         }
         self.record_file(relative, outcome, differences)
     }

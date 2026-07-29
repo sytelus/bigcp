@@ -2,9 +2,14 @@
 
 `bigcp` is a reliability-first, high-throughput tree copier for local NTFS and
 ReFS volumes on Windows 11 22H2 or later. It is optimized for both large-file
-streaming and directories containing many small files, while making partial
-destination files structurally impossible: every file is completed under an
-opaque sibling name and published by an atomic rename.
+streaming and directories containing many small files. Its reliability
+promise is the one that matters: **when a run completes, every reported
+success and failure is exactly true.** If a run is interrupted, re-running it
+detects and repairs everything unfinished — including partial files an
+interruption may leave at their final names (small files write directly for
+speed; their timestamps are stamped only after the last byte, so a partial
+can never be mistaken for a finished copy). Very large files still go through
+opaque temporaries so resumed partials are verified, never trusted.
 
 The repository is currently **pre-1.0**. The bounded reference implementation
 and safe routine suites are operational; the IOCP transport and dedicated
@@ -18,8 +23,13 @@ blockers are summarized in
 
 - Source handles are read-only.
 - Destination-only files are reported, never deleted.
-- Replacements are written to a new temporary, revalidated, then atomically
-  renamed; an existing destination is never truncated in place.
+- A completed run's report is exact: every success and failure it states is
+  true. Until a run reports success, treat the destination as in progress —
+  an interrupted run may leave incomplete files that the next run replaces.
+- Large-file replacements are written to a new temporary, revalidated, then
+  atomically renamed. Small-file replacements overwrite in place (keeping
+  the destination file's permissions); if interrupted, the rerun replaces
+  them — the source is never touched, so nothing is ever lost.
 - FAT, exFAT, remote/mapped network volumes, UNC paths, and nested roots are
   rejected before tree copying.
 - A machine-wide exact-destination lock prevents two writers from targeting
@@ -144,13 +154,21 @@ repairs it, but only after the drive is reconnected.
 - **Why did a rerun recopy a file I saw complete?** The run was interrupted
   after data landed but before metadata; the mismatch makes the rerun replace
   it with a fully finished copy. That is the crash-safety design working.
-- **What are `.bigcp-…part` files?** Opaque in-flight temps. In-process kills
-  remove them automatically; a resumable large-file partial persists on
-  purpose and is verified before reuse. Anything the journal cannot prove
-  bigcp created is reported, never auto-deleted.
+- **What are `.bigcp-…part` files?** Opaque in-flight temps for large files.
+  In-process kills remove them automatically; a resumable large-file partial
+  persists on purpose and is verified before reuse. Anything the journal
+  cannot prove bigcp created is reported, never auto-deleted.
+- **A run was interrupted — can I trust the destination?** Not until a rerun
+  completes. Small files write directly to their final names for speed, so an
+  interruption can leave partial files there. They can never be mistaken for
+  finished copies (their timestamps are only stamped after the last byte),
+  and re-running the same command finds and replaces every one of them.
 - **Why is a second run on the same destination refused?** One run per exact
   destination root per machine, by design (run lock).
 - **Why NTFS/ReFS only, local volumes only?** See LIMITATIONS.md — the
   restriction buys exact timestamps, stable file IDs, and atomic replaces.
+  Note that ReFS support is best-effort at v1 (code-reviewed, not yet
+  certified by its dedicated test matrix); NTFS is the fully verified path,
+  and `bigcp verify` validates any copy regardless of filesystem.
 
 Licensed under either Apache-2.0 or MIT, at your option.

@@ -22,11 +22,22 @@ product code remains to build for 1.0 — only verification and evidence:**
 | # | Item | Lands with |
 |---|---|---|
 | R1 | Verification matrices: wrapper-boundary fault injection, exhaustive deterministic kill-point simulation, bounded chaos binary + mutator mode, adversarial §12.8 E-case suite, destination sentinel snapshots, emitted-instance schema validation | These are themselves the verification; all bounded and sandbox-confined per §12.0 |
-| R2 | Elevated graceful-VHDX ReFS matrix (§12.5) pinning ReFS publication | Requires elevation and an explicit safety-script exemption for sandboxed VHDX operations — **operator permission required** |
-| R3 | Real-hardware checklist + bounded performance evidence (§8.7, `[HW]`) with extent-count fragmentation evidence in BENCHMARKS.md; this evidence also arbitrates whether buffered streaming leaves anything material on the table (the only trigger that reopens unbuffered I/O, post-v1) | Operator with designated drives; bounded write budgets; heavy-tier opt-in |
+| R2 | Real-hardware external-drive evidence (§8.7, `[HW]`) — internal-drive cells recorded 2026-07-29; the external cell needs a healthy drive (H: disqualified by hardware CRC errors) | Operator with a designated healthy drive; bounded write budgets |
 
-Proposed order: R1 first (the net that catches everything else), then R2/R3 when elevation
-and hardware are available.
+(The former elevated ReFS matrix left this registry by owner decision — ReFS is best-effort
+at v1, ADR 0029, matrix post-v1. The unbuffered question is likewise parked post-v1 with
+its trigger recorded in BENCHMARKS.md.)
+
+Proposed order: R1 (the remaining engineering), then R2 when hardware is available.
+
+Status 2026-07-29 (owner-approved one-time evidence run): the internal-drive share of R3's
+bounded performance evidence is recorded in `BENCHMARKS.md` (single-run, indicative — the
+certified repeated-run protocol remains open) with two honest findings registered there: the
+small-file coordinator bottleneck (benchmark-backed optimization candidate) and the NVMe
+buffered-vs-unbuffered gap (ADR 0028's reopening condition met on that cell — owner
+decision pending). R3's external-HDD cell aborted with zero writes on a hardware CRC error
+(H: needs owner investigation), and R2 awaits an elevated session with the Hyper-V module
+(operator script prepared).
 
 Maintenance rule: new deviations get an entry here *before* the deviating code merges, and
 each entry must name its verdict target — a normative PLAN.md change (whereupon the entry is

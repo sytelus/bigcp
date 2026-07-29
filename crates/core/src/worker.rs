@@ -37,9 +37,15 @@ pub(crate) struct FileCopyJob {
     pub destination_supports_encryption: bool,
     pub chunk_bytes: usize,
     pub checkpoint_threshold: u64,
-    pub streams: Vec<StreamInfo>,
-    /// Unnamed data plus every discovered named `$DATA` stream.
+    /// Known stream set, or None for the fast-dispatch path: the engine
+    /// discovers streams itself at open, keeping the coordinator probe-free.
+    pub streams: Option<Vec<StreamInfo>>,
+    /// Best-known logical bytes at dispatch (the enumerated unnamed size on
+    /// the fast path); successful outcomes carry the engine's exact figure.
     pub logical_bytes: u64,
+    /// Streams at or above this size promote the file back to the
+    /// coordinator before any write (see `EngineRequest::promote_threshold`).
+    pub promote_threshold: Option<u64>,
 }
 
 impl FileCopyJob {
@@ -62,10 +68,11 @@ impl FileCopyJob {
             preserve_sparse: false,
             checkpoint_threshold: self.checkpoint_threshold,
             destination_supports_encryption: self.destination_supports_encryption,
-            known_streams: Some(&self.streams),
+            known_streams: self.streams.as_deref(),
             // Small files finish in bounded time; between-file cancellation
             // at the coordinator is responsive enough for this path.
             cancel: &|| false,
+            promote_threshold: self.promote_threshold,
         };
         // A panicking engine call must still produce a completion: the
         // coordinator's blocking `receive` would otherwise deadlock forever
@@ -83,6 +90,7 @@ impl FileCopyJob {
             )),
         };
         CompletedCopy {
+            source_path: self.source_path,
             destination_path: self.destination_path,
             source_snapshot: self.source_snapshot,
             destination_snapshot: self.destination_snapshot,
@@ -97,6 +105,8 @@ impl FileCopyJob {
 
 /// One worker completion awaiting single-threaded accounting and audit.
 pub(crate) struct CompletedCopy {
+    /// Absolute source path, retained so a promoted file can rerun inline.
+    pub source_path: std::path::PathBuf,
     pub destination_path: std::path::PathBuf,
     pub source_snapshot: EntrySnapshot,
     pub destination_snapshot: Option<EntrySnapshot>,

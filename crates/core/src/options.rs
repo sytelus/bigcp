@@ -108,9 +108,15 @@ impl CopyOptions {
     }
 
     /// Returns the configured large-file threshold.
+    ///
+    /// Default 16 MiB, chosen by measurement (BENCHMARKS.md 2026-07-29):
+    /// the direct final-name path ran 8 MiB files ~1.85× faster than the
+    /// temp+rename path, so the boundary sits where whole-file buffering
+    /// stays RAM-safe (64 workers × 16 MiB ≤ 1 GiB transient on the ≥32 GB
+    /// machines VISION targets) rather than at the older 4 MiB citation.
     #[must_use]
     pub fn large_threshold(&self) -> u64 {
-        self.tune.large_threshold.unwrap_or(4 * 1024 * 1024)
+        self.tune.large_threshold.unwrap_or(16 * 1024 * 1024)
     }
 
     /// Returns the configured checkpoint threshold.

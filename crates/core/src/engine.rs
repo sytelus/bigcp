@@ -1,16 +1,17 @@
 //! Shared semantic file engine.
 //!
 //! Small files are fully read and source-revalidated before the destination is
-//! touched. Large files stream through a bounded buffer. Both paths terminate
-//! through DestinationTemp's single atomic finalizer.
+//! touched, then written directly to their final name (rerun-repair crash
+//! contract, ADR 0030). Large files stream through a bounded buffer into an
+//! opaque temporary published by DestinationTemp's atomic finalizer.
 
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use bigcp_win::{
-    DestinationStream, DestinationTemp, ObjectMetadata, SourceFile, SourceStream, StreamInfo,
-    is_encrypted, is_sparse, list_streams, metadata_at, read_extended_attributes_checked,
-    read_protected_dacl,
+    DestinationFinal, DestinationStream, DestinationTemp, ObjectMetadata, SourceFile, SourceStream,
+    StreamInfo, is_encrypted, is_readonly, is_sparse, list_streams, metadata_at,
+    read_extended_attributes_checked, read_protected_dacl, set_basic_at, without_readonly,
 };
 use xxhash_rust::xxh3::Xxh3;
 
@@ -76,11 +77,18 @@ pub struct EngineRequest<'a> {
     /// not delay a requested stop until they finish (the in-flight temp
     /// self-deletes or resumes from its last verified checkpoint).
     pub cancel: &'a dyn Fn() -> bool,
+    /// When set, a discovered stream at or above this size aborts before any
+    /// write with [`PROMOTED_TO_COORDINATOR`]: worker dispatch routes by the
+    /// enumerated unnamed size alone (no coordinator-side stream probe), so a
+    /// file hiding a huge ADS is handed back to the coordinator, which owns
+    /// the journal and the responsive cancel probe. Inline callers pass None.
+    pub promote_threshold: Option<u64>,
     /// Streams already discovered by the scheduler, avoiding a duplicate call.
     pub known_streams: Option<&'a [StreamInfo]>,
 }
 
-/// Copies one ordinary file without ever writing its final path directly.
+/// Copies one ordinary file through the size-appropriate strategy: direct
+/// final-name write below the large threshold, temp+rename above it.
 pub fn copy_file(
     request: &EngineRequest<'_>,
     counters: &mut Counters,
@@ -108,6 +116,18 @@ pub fn copy_file(
         .map(|stream| stream.size)
         .max()
         .unwrap_or(request.source_snapshot.metadata.size);
+    if let Some(threshold) = request.promote_threshold
+        && largest_stream >= threshold
+    {
+        // Nothing has been created or written yet; the coordinator reruns
+        // this file inline with checkpoints and the cancel probe.
+        return Err(OperationError::semantic(
+            ErrorCategory::Internal,
+            PROMOTED_TO_COORDINATOR,
+            request.relative_path.to_path_buf(),
+            "stream set requires coordinator streaming",
+        ));
+    }
     let checkpoint_eligible = journal.is_some()
         && streams
             .iter()
@@ -144,7 +164,6 @@ pub fn copy_file(
             streams,
             extended_attributes.as_ref(),
             should_hash,
-            journal.as_deref_mut(),
         )
     } else {
         copy_streamed(
@@ -395,7 +414,6 @@ fn copy_small(
     streams: &[StreamInfo],
     extended_attributes: Option<&bigcp_win::ExtendedAttributes>,
     should_hash: bool,
-    mut journal: Option<&mut Journal>,
 ) -> Result<EngineResult, OperationError> {
     let expected = usize::try_from(request.source_snapshot.metadata.size).map_err(|_| {
         OperationError::semantic(
@@ -430,54 +448,31 @@ fn copy_small(
     }
     post_read_validate(request, source)?;
 
-    let parent = destination_parent(request)?;
-    let mut temp = DestinationTemp::create(parent, request.run_id, wants_encryption(request))
-        .map_err(|error| operation_error("create_dst_temp", request.relative_path, &error))?;
-    let efs_downgraded = efs_downgraded_for(request, &temp);
-    temp.write_all(&bytes)
+    // ADR 0030: small files write directly to their final name. Atomic
+    // publication measured at ~2× the AV-filter cost of a direct write on
+    // small-file floods, and VISION's rerun contract makes the
+    // partial-on-interrupt window acceptable — `finish` stamps timestamps
+    // only after the last data byte of every stream, so a partial can never
+    // match the exact size+mtime skip heuristic and the next run replaces
+    // it. Routing guarantees every stream here is below the large and
+    // checkpoint thresholds, so no journal interplay exists on this path.
+    let replace = request.replacement_snapshot.is_some();
+    let destination = create_final(request, replace)?;
+    let efs_downgraded =
+        wants_encryption(request) && !destination.basic_attributes().is_ok_and(is_encrypted);
+    let mut destination = destination;
+    destination
+        .write_all(&bytes)
         .map_err(|error| operation_error("write", request.relative_path, &error))?;
     counters.bytes_written_destination = counters
         .bytes_written_destination
         .saturating_add(bytes.len() as u64);
-    let checkpoint_hasher = streams
-        .iter()
-        .any(|stream| !stream.is_unnamed() && stream.size >= request.checkpoint_threshold)
-        .then(|| {
-            let mut value = Xxh3::new();
-            value.update(&bytes);
-            value
-        });
-    let mut journal_degraded = ensure_base_checkpoint_for_named(
-        request,
-        &mut temp,
-        streams,
-        bytes.len() as u64,
-        checkpoint_hasher.as_ref(),
-        &mut journal,
-    )?;
-    let named = copy_named_streams(
-        request,
-        counters,
-        &mut temp,
-        streams,
-        journal.as_deref_mut(),
-    )?;
-    journal_degraded |= named.journal_degraded;
-    let eas_dropped = copy_eas(request, &temp, extended_attributes)?;
+    let named = copy_named_streams_direct(request, counters, &destination, streams)?;
+    let eas_dropped = copy_eas_direct(request, &destination, extended_attributes)?;
     post_read_validate(request, source)?;
-    let dacl = precommit_validate(request)?;
-    if let Some(dacl) = &dacl {
-        temp.apply_protected_dacl(dacl)
-            .map_err(|error| operation_error("preserve_dacl", request.relative_path, &error))?;
-    }
-    let checkpoint_used = temp.is_persistent();
-    temp.commit(
-        request.destination_path,
-        request.replacement_snapshot.is_some(),
-        request.source_snapshot.metadata.basic,
-        request.flush,
-    )
-    .map_err(|error| operation_error("commit", request.relative_path, &error))?;
+    destination
+        .finish(request.source_snapshot.metadata.basic, request.flush)
+        .map_err(|error| operation_error("set_meta", request.relative_path, &error))?;
     Ok(EngineResult {
         bytes: (bytes.len() as u64).saturating_add(named.bytes),
         digest: should_hash.then(|| digest_bytes(&bytes)),
@@ -486,10 +481,142 @@ fn copy_small(
             .then(|| digest_bytes(extended_attributes.map_or(&[], |value| value.as_bytes()))),
         streams_dropped: named.dropped,
         eas_dropped,
-        journal_degraded,
+        journal_degraded: false,
         efs_downgraded,
-        checkpoint_used,
+        checkpoint_used: false,
     })
+}
+
+/// Opens the direct final-name writer, clearing a read-only attribute first
+/// when the classification already saw it on the file being replaced.
+fn create_final(
+    request: &EngineRequest<'_>,
+    replace: bool,
+) -> Result<DestinationFinal, OperationError> {
+    let encrypted = wants_encryption(request);
+    match DestinationFinal::create(request.destination_path, replace, encrypted) {
+        Ok(value) => Ok(value),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied && replace => {
+            let Some(snapshot) = request
+                .replacement_snapshot
+                .filter(|snapshot| is_readonly(snapshot.metadata.basic.attributes))
+            else {
+                return Err(operation_error("create_dst", request.relative_path, &error));
+            };
+            let mut cleared = snapshot.metadata.basic;
+            cleared.attributes = without_readonly(cleared.attributes);
+            set_basic_at(request.destination_path, cleared).map_err(|error| {
+                operation_error("clear_readonly", request.relative_path, &error)
+            })?;
+            DestinationFinal::create(request.destination_path, replace, encrypted)
+                .map_err(|error| operation_error("create_dst", request.relative_path, &error))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(OperationError::from_io_as(
+                ErrorCategory::DestinationChanged,
+                "create_dst",
+                request.relative_path.to_path_buf(),
+                &error,
+            ))
+        }
+        Err(error) => Err(operation_error("create_dst", request.relative_path, &error)),
+    }
+}
+
+/// Copies every named stream directly onto the final file. Streams on this
+/// path are all below the large/checkpoint thresholds (routing), so there is
+/// no resume state and no journal interplay.
+fn copy_named_streams_direct(
+    request: &EngineRequest<'_>,
+    counters: &mut Counters,
+    destination: &DestinationFinal,
+    streams: &[StreamInfo],
+) -> Result<NamedStreamResult, OperationError> {
+    let named: Vec<&StreamInfo> = streams
+        .iter()
+        .filter(|stream| !stream.is_unnamed())
+        .collect();
+    if !request.destination_supports_streams {
+        return Ok(NamedStreamResult {
+            digests: Vec::new(),
+            dropped: u32::try_from(named.len()).unwrap_or(u32::MAX),
+            journal_degraded: false,
+            bytes: 0,
+        });
+    }
+    let mut digests = Vec::new();
+    let mut logical_bytes = 0_u64;
+    for stream in named {
+        let mut source = SourceStream::open(request.source_path, stream)
+            .map_err(|error| source_open_error("open_src_stream", request.relative_path, &error))?;
+        let stream_identity = source.identity().map_err(|error| {
+            source_open_error("identify_src_stream", request.relative_path, &error)
+        })?;
+        if stream_identity != request.source_snapshot.metadata.identity {
+            return Err(OperationError::semantic(
+                ErrorCategory::SourceChanged,
+                "identify_src_stream",
+                request.relative_path.to_path_buf(),
+                "named stream belongs to a different source object",
+            ));
+        }
+        let mut writer = destination
+            .create_stream(stream)
+            .map_err(|error| operation_error("create_dst_stream", request.relative_path, &error))?;
+        let mut hasher = request.verify.then(Xxh3::new);
+        let mut buffer = vec![0_u8; request.chunk_bytes.clamp(64 * 1024, 8 * 1024 * 1024)];
+        let mut copied = 0_u64;
+        while copied < stream.size {
+            let count = source
+                .read(&mut buffer)
+                .map_err(|error| operation_error("read_stream", request.relative_path, &error))?;
+            if count == 0 {
+                return Err(OperationError::semantic(
+                    ErrorCategory::SourceChanged,
+                    "read_stream",
+                    request.relative_path.to_path_buf(),
+                    "named stream ended before its enumerated size",
+                ));
+            }
+            if let Some(hasher) = &mut hasher {
+                hasher.update(&buffer[..count]);
+            }
+            writer
+                .write_all(&buffer[..count])
+                .map_err(|error| operation_error("write_stream", request.relative_path, &error))?;
+            counters.bytes_read_source = counters.bytes_read_source.saturating_add(count as u64);
+            counters.bytes_written_destination = counters
+                .bytes_written_destination
+                .saturating_add(count as u64);
+            copied = copied.saturating_add(count as u64);
+        }
+        logical_bytes = logical_bytes.saturating_add(copied);
+        if let Some(hasher) = hasher {
+            digests.push((stream.clone(), format!("xxh3:{:032x}", hasher.digest128())));
+        }
+    }
+    Ok(NamedStreamResult {
+        digests,
+        dropped: 0,
+        journal_degraded: false,
+        bytes: logical_bytes,
+    })
+}
+
+fn copy_eas_direct(
+    request: &EngineRequest<'_>,
+    destination: &DestinationFinal,
+    attributes: Option<&bigcp_win::ExtendedAttributes>,
+) -> Result<bool, OperationError> {
+    if let Some(attributes) = attributes {
+        if !request.destination_supports_eas {
+            return Ok(true);
+        }
+        destination
+            .write_extended_attributes(attributes)
+            .map_err(|error| operation_error("write_ea", request.relative_path, &error))?;
+    }
+    Ok(false)
 }
 
 fn copy_streamed(
@@ -1274,6 +1401,11 @@ fn operation_error(
 /// converts errors carrying it into a not-attempted outcome instead of a
 /// failure: a clean cancel is not an error condition.
 pub(crate) const CANCELED_MID_FILE: &str = "canceled_mid_file";
+
+/// Operation name marking a worker hand-back of a file whose discovered
+/// stream set deserves inline streaming (see `EngineRequest::promote_threshold`).
+/// Not a failure: the coordinator reruns the file and records the real outcome.
+pub(crate) const PROMOTED_TO_COORDINATOR: &str = "promoted_to_coordinator";
 
 fn check_cancel(request: &EngineRequest<'_>) -> Result<(), OperationError> {
     if (request.cancel)() {

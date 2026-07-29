@@ -157,6 +157,64 @@ versioning once its 1.0 release gates are complete.
 - Remaining 1.0 work is verification and evidence only: the test matrices,
   the elevated ReFS cells, and the operator hardware checklist.
 
+### 2026-07-29 one-time evidence run (owner-approved)
+
+- Recorded bounded benchmark evidence in `BENCHMARKS.md` (raw reports in
+  `docs/evidence/2026-07-29/`): small-file 674 files/s vs robocopy /MT:32
+  1,500 files/s (KPI not met — coordinator-side stream probe identified as
+  the benchmark-backed optimization candidate); large-file buffered
+  1,109 MB/s vs robocopy /J ~2,497 MB/s on NVMe→NVMe (ADR 0028 reopening
+  condition met on that cell, owner decision pending); perfect extent
+  evidence — every preallocated 8 GiB copy landed as a single extent.
+- H: external-HDD evidence run aborted with zero writes: the first
+  metadata operation failed with a hardware CRC error; all H: activity
+  halted per the owner's no-harm instruction.
+- Elevated ReFS matrix blocked (unelevated session, no Hyper-V module);
+  a one-time VHDX-confined operator script was prepared outside the repo.
+
+### 2026-07-29 investigation and scope decisions (evening)
+
+- H: external drive definitively disqualified: with the drive awake (root
+  listing instant), directory creation failed twice with hardware CRC
+  errors while zero bytes were written; the owner was alerted to
+  investigate the drive.
+- Small-file gap investigated to root cause (BENCHMARKS.md): moved the
+  coordinator's per-file revalidation and stream probe into the workers
+  (rsync-style pipelining; promote-back sentinel returns hidden huge-ADS
+  files to the coordinator for checkpointed, cancellable inline streaming)
+  and replaced the per-directory drain barrier with a directory-exit drain.
+  Single-thread floor improved 57.9→47.9 s; the dominant remainder is
+  structural — the atomic-publication protocol costs ~1.6× robocopy's
+  per-file work and ~2× its Defender filter evaluations, so PLAN §8.7's H2
+  is restated as falsified-with-data and a `FILE_FLAG_DELETE_ON_CLOSE`
+  creation candidate is registered benchmark-gated. New e2e test pins the
+  promotion round-trip (72 tests total).
+- ReFS descoped to best-effort at v1 by owner decision (ADR 0029): code
+  paths reviewed, elevated certification matrix moved post-v1, plain-
+  language guidance added to LIMITATIONS.md and the README.
+
+### 2026-07-29 reliability-contract redesign (ADR 0030)
+
+- The owner rescoped the reliability bar (VISION amended): the hard
+  guarantee is that a completed run's reported successes and failures are
+  exactly true; interrupted runs are recovered by re-running, and partial
+  files at final names in that window are acceptable. VISION also now
+  states the throughput goal: meet or exceed robocopy by default,
+  automatically.
+- Small files now write directly to their final names via the new
+  `DestinationFinal` primitive (in-place truncate for replacements,
+  preserving the destination ACL; read-only attributes cleared when known;
+  timestamps stamped strictly last as the completion marker). Large files
+  keep temp+rename and checkpointed resume. Invariants I3/I5 rescoped; the
+  chaos assertion becomes kill-anywhere → rerun converges.
+- Large-threshold default raised 4→16 MiB by measurement (direct path
+  1.85× faster at 8 MiB; worker buffering bounded ≤1 GiB); further
+  decoupling of buffering from destination strategy registered.
+- Result: small-file throughput ~0.45× → ~0.8–0.87× robocopy `/MT:32`
+  (BENCHMARKS.md); the ≥1×-by-default release gate is now explicit in
+  PLAN §8.7 and remains open. README and LIMITATIONS state the new
+  contract in plain user language.
+
 ### Known pre-1.0 work
 
 - IOCP/no-buffering engine and its sans-I/O model, comprehensive fault/chaos
