@@ -323,6 +323,16 @@ versioning once its 1.0 release gates are complete.
   filesystem itself, beyond any re-run's ability to repair, for marginal
   extra speed).
 
+### 2026-07-29 candidate experiments 1–2 (measurement-only, no code)
+
+- Worker sweep and affinity-vs-round-robin A/B on the cached-policy drive:
+  defaults (affinity, 32 workers) posted the fastest results yet recorded
+  (3.31–4.02 s) and no alternative beat them consistently; the round-robin
+  prototype was reverted. Real yield: cached destinations leak each run's
+  flush backlog into the next, so back-to-back A/Bs swing up to ~3× — the
+  certified protocol now requires per-repetition quiesce and rotated
+  orderings (BENCHMARKS.md).
+
 ### Known pre-1.0 work
 
 - IOCP/no-buffering engine and its sans-I/O model, comprehensive fault/chaos

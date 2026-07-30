@@ -361,6 +361,29 @@ floor near ~100–150 µs suggests up to ~2× may remain reachable before the
 irreducible per-file cost; beyond that only container semantics (not real
 files) go faster.
 
+## 2026-07-29 candidate experiments 1–2 executed: defaults confirmed, methodology finding
+
+Ran the first two registered candidates on the cached-policy H: — a
+worker-count sweep (16/32/48/64) crossed with dispatch policy (directory
+affinity vs an env-gated round-robin prototype), then an interleaved
+repetition round of the four contenders:
+
+- **Defaults win:** directory affinity at 32 workers posted **3.31 s and
+  4.02 s** — the fastest small-file results recorded on this drive (up from
+  5.18 s in the policy-flip session). No configuration beat it with any
+  consistency; no change to defaults is justified.
+- **Round-robin showed no reliable advantage** on the cached regime (its
+  best single runs were matched or beaten by affinity's, and its worst were
+  3× slower); the write-through rationale for affinity stands unchanged.
+- **Methodology finding, the real yield:** on a write-cached destination,
+  each run's lazy flush backlog drains into the *following* run, producing
+  order-dependent swings up to ~3× that dwarf any policy difference.
+  Back-to-back A/Bs on cached drives are not a valid instrument.
+  Consequence recorded for the certified protocol (§12.10): every
+  repetition must be preceded by a quiesce step (flush wait or settle
+  interval) and orderings must be rotated. The round-robin prototype was
+  reverted, not committed.
+
 ## Outstanding
 
 The elevated ReFS matrix and the repeated-run certified benchmark protocol
