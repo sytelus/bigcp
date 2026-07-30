@@ -1097,7 +1097,12 @@ made; nothing here blocks feature or performance work:
   shipped schemas.
 - **Certified performance protocol**: median of ≥5 quiet-machine repetitions
   for every BENCHMARKS.md scoreboard cell (single-session numbers stay
-  labeled indicative until this runs).
+  labeled indicative until this runs). Two requirements added by the
+  2026-07-29 measurements: every repetition is preceded by a **quiesce
+  step** (flush wait or settle interval — a write-cached destination drains
+  each run's lazy flush backlog into the following run, swinging results up
+  to ~3×), and configuration **orderings are rotated** so no variant
+  systematically inherits another's backlog.
 
 An initial code review of the paths these validations cover was performed
 2026-07-29 (per-directory outstanding-counter symmetry including promoted
