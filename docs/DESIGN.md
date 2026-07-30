@@ -121,5 +121,6 @@ regression that quietly drops preallocation.
 - No filesystem write probes during profiling.
 - No alternate product copy backend hidden behind an option.
 
-Known intentional differences from the frozen plan are recorded in
-`PLAN_DEVIATIONS.md`.
+Known intentional differences from the frozen plan are recorded inline at
+their PLAN.md sections and in the ADRs (0027–0032); there is no separate
+deviations file.

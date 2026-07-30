@@ -157,6 +157,7 @@ elevated VHDX/ReFS cells (graceful operations only), CopyFile2/robocopy
 differential runs on bounded workloads, synthetic-enumeration scale simulation,
 and real-hardware throughput gates within bounded write budgets require
 dedicated work and hardware. They are explicitly release-blocking before a 1.0
-claim; see PLAN §13.2, `PLAN_DEVIATIONS.md`, and `BENCHMARKS.md`. Hours-long
+claim and run only on explicit owner request; see PLAN §12.10, §13.2, and
+`BENCHMARKS.md`. Hours-long
 soaks, million-entry real trees, and forced-disconnect tests are not deferred —
 they are prohibited (VISION) and will never run.

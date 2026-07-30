@@ -134,8 +134,9 @@ replacements, warnings, grouped failures, extras, hints, and verification.
 3. Confirm both JSON schema files parse and carry the expected `$id`/version
    (the in-repo test); full emitted-instance-vs-schema validation tooling is
    release work — do not claim it before it exists.
-4. Complete the release-required fault, chaos, VHDX, differential, performance,
-   and hardware gates documented as pending in `PLAN_DEVIATIONS.md`.
+4. Run the final production-validation pass (PLAN §12.10 — chaos/kill
+   convergence, adversarial set, sentinel/schema checks, certified benchmark
+   protocol); it executes only on explicit owner request.
 5. Build `--release --locked`, smoke `--help`, copy, rerun, both verification
    forms, and report reopening.
 6. Update `CHANGELOG.md`, `BENCHMARKS.md`, and version; tag only a clean commit.

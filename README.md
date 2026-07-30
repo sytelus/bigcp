@@ -12,12 +12,13 @@ always shorter than its source and can never be mistaken for a finished
 copy). Very large files still go through opaque temporaries so resumed
 partials are verified, never trusted.
 
-The repository is currently **pre-1.0**. The bounded reference implementation
-and safe routine suites are operational; the IOCP transport and dedicated
-fault/chaos/ReFS/performance release matrix remain open and are listed in
-[PLAN_DEVIATIONS.md](PLAN_DEVIATIONS.md). Do not treat this build as v1.0
-certified until those gates pass. The current evidence and remaining release
-blockers are summarized in
+The repository is currently **pre-1.0**. The engine, safety contract, and
+performance work are complete and measured (bigcp leads robocopy on every
+measured small-file cell with default settings; see `BENCHMARKS.md`). What
+separates this build from a 1.0 claim is validation evidence only — the
+final production-validation pass defined in PLAN §12.10, which runs on
+explicit owner request. Do not treat this build as v1.0 certified until it
+has run. Current evidence and status are summarized in
 [docs/PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md).
 
 ## Safety contract

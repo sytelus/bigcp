@@ -40,10 +40,10 @@ lifespan-reducing writes, no machine-stability impact — see PLAN §12.0):
 - **Bounded** workloads (W1s/W2s-class), differential OS-copy comparison, and
   topology-matched performance runs on scratch-designated storage;
   million-entry behavior via synthetic enumeration simulation, never real trees.
-- Real hardware/controller coverage within bounded write budgets, and the
-  remaining scheduler, breaker, restart-manager, and full TUI work listed in
-  PLAN §13.2 / `PLAN_DEVIATIONS.md`.
+- The final production-validation pass (PLAN §12.10), executed only on
+  explicit owner request: chaos/kill-convergence, the adversarial set,
+  sentinel/schema checks, and the certified benchmark protocol.
 
-No release process may reinterpret an unrun gate as a pass. `TESTING_SUMMARY.md`
-records dated evidence; `PLAN_DEVIATIONS.md` is the authoritative list of known
-differences from the frozen plan.
+No release process may reinterpret an unrun gate as a pass.
+`TESTING_SUMMARY.md` records dated evidence; intentional differences from
+the frozen plan are recorded inline in PLAN.md and in ADRs 0027–0032.
