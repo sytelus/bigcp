@@ -64,14 +64,22 @@ The CRC32C-framed JSONL journal is a resume hint, never a completion database.
 (One non-content use of a second hash exists: run-lock and job identity derive
 from SHA-256 of the resolved root paths — identity naming, not data integrity,
 so VISION's single-content-hash rule is unaffected.)
-Loading retains only the valid prefix and discards a torn tail. Job signatures
-bind checkpoints to semantic source, destination, and option identity. A temp
-prefix is reread and hashed before resume. Each resumable record also binds the
+Loading truncates only an invalid final/torn record. Invalid interior records
+are ignored without being trusted or destroying later valid records; an
+unsupported journal version fails closed without rewriting the file. Job
+signatures bind checkpoints to the resolved source/destination pair and resume
+protocol version, so harmless CLI-option changes do not erase safe hints. A
+temp prefix is reread and hashed before resume. Each resumable record also binds the
 source and temp to their volume serial plus filesystem file ID. NTFS/ReFS use
 the 128-bit `FileIdInfo` path; FAT-family drivers can fall back to the legacy
 64-bit ID. A stale, legacy,
 type-swapped, or identity-mismatched candidate is ignored without modifying
 the path it names.
+
+Clean-end compaction retains the current job header and live checkpoints. It
+shares the report's artifact publisher: a unique exclusive sibling is
+synchronized and atomically replaces the old path, so no predictable neighbor
+is overwritten and no remove/rename gap is exposed.
 
 The versioned JSONL audit is lossless and rolls back partial line writes. It
 reopens once, then fails over to the state directory. The final JSON report is
@@ -164,7 +172,9 @@ knowable; this endpoint branch does not alter local allocation behavior.
 - No audit artifacts inside active trees.
 - No filesystem write probes during profiling.
 - No alternate product copy backend hidden behind an option.
+- Native and redirector output is bounds/order checked before parsing; stream
+  suffixes and NUL-terminated Win32 strings cannot redirect a validated path.
 
 Known intentional differences from the governing plan are recorded inline at
-their PLAN.md sections and in the ADRs (0027–0032); there is no separate
+their PLAN.md sections and in the ADRs (0027–0039); there is no separate
 deviations file.

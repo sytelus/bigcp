@@ -1,20 +1,16 @@
 //! Self-contained, versioned JSON report model and atomic persistence.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-
-use serde::{Deserialize, Serialize};
-use uuid::Uuid;
-
-use bigcp_win::publish_audit_temporary;
 
 use crate::REPORT_SCHEMA_VERSION;
 use crate::devprofile::CopyProfile;
 use crate::error::{BigcpError, ErrorCategory, OperationError};
 use crate::model::Counters;
 use crate::stats::{AnalysisSummary, TimelinePoint};
+use serde::{Deserialize, Serialize};
 
 /// Run identity and lifecycle facts.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -177,7 +173,7 @@ pub struct VerificationSummary {
     /// Destination filesystem used to interpret representable fidelity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub destination_filesystem: Option<String>,
-    /// Whether comparison used FAT-family projection semantics.
+    /// Whether comparison used destination-projected filesystem semantics.
     #[serde(default)]
     pub projected: bool,
     /// Objects passing every strict field.
@@ -233,34 +229,23 @@ pub struct RunReport {
 impl RunReport {
     /// Writes a report as temp, flush, atomic rename.
     pub fn write_atomic(&self, path: &Path) -> Result<(), BigcpError> {
-        let parent = path
-            .parent()
-            .ok_or_else(|| BigcpError::Invalid("report path has no parent".to_owned()))?;
-        fs::create_dir_all(parent)
-            .map_err(|error| BigcpError::io("create report parent", error))?;
-        let temp = parent.join(format!(".bigcp-report-{}.part", Uuid::new_v4().simple()));
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
+        let mut artifact = crate::artifact::AtomicArtifact::create(path, "report")
             .map_err(|error| BigcpError::io("create report temp", error))?;
-        let mut writer = BufWriter::new(file);
-        if let Err(error) = serde_json::to_writer_pretty(&mut writer, self) {
-            drop(writer);
-            let _ = fs::remove_file(&temp);
-            return Err(BigcpError::Format(format!("serialize report: {error}")));
+        {
+            let mut writer = BufWriter::new(
+                artifact
+                    .writer()
+                    .map_err(|error| BigcpError::io("open report temp", error))?,
+            );
+            serde_json::to_writer_pretty(&mut writer, self)
+                .map_err(|error| BigcpError::Format(format!("serialize report: {error}")))?;
+            writer
+                .flush()
+                .map_err(|error| BigcpError::io("flush report temp", error))?;
         }
-        if let Err(error) = writer.flush().and_then(|()| writer.get_ref().sync_all()) {
-            drop(writer);
-            let _ = fs::remove_file(&temp);
-            return Err(BigcpError::io("flush report temp", error));
-        }
-        drop(writer);
-        if let Err(error) = publish_audit_temporary(&temp, path) {
-            let _ = fs::remove_file(&temp);
-            return Err(BigcpError::io("publish report", error));
-        }
-        Ok(())
+        artifact
+            .publish()
+            .map_err(|error| BigcpError::io("publish report", error))
     }
 }
 

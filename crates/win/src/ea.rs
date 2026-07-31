@@ -377,7 +377,15 @@ impl<'a> BackupReader<'a> {
             }
             return Err(error);
         }
-        usize::try_from(read).map_err(|_| io::Error::other("backup read count is too large"))
+        let read = usize::try_from(read)
+            .map_err(|_| io::Error::other("backup read count is too large"))?;
+        if read > output.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "BackupRead returned more bytes than requested",
+            ));
+        }
+        Ok(read)
     }
 
     fn skip(&mut self, mut bytes: u64) -> io::Result<()> {
@@ -500,10 +508,18 @@ impl<'a> BackupWriter<'a> {
             }
             let written = usize::try_from(written)
                 .map_err(|_| io::Error::other("backup write count is too large"))?;
-            if written == 0 {
+            if written == 0 || written > input.len() {
                 return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "backup writer made no progress",
+                    if written == 0 {
+                        io::ErrorKind::WriteZero
+                    } else {
+                        io::ErrorKind::InvalidData
+                    },
+                    if written == 0 {
+                        "backup writer made no progress"
+                    } else {
+                        "BackupWrite returned more bytes than requested"
+                    },
                 ));
             }
             input = &input[written..];

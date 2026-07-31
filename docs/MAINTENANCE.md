@@ -4,10 +4,10 @@
 
 | Area | Responsibility |
 |---|---|
-| `crates/win/src/endpoint.rs`, `path.rs`, `metadata.rs`, `volume.rs`, `device.rs`, `lock.rs`, `util.rs` | Local/UNC/WSL classification, lossless paths, 128/64-bit handle identity, fast/fallback 256 KiB enumeration, local/handle-bound-remote volume facts, query-only local device facts, run lock, shared error helpers. |
-| `crates/win/src/file.rs`, `streams.rs`, `ea.rs`, `sparse.rs`, `reparse.rs`, `security.rs` | Read-only source and capability-bearing destination primitives; the only unsafe boundary. |
+| `crates/win/src/endpoint.rs`, `path.rs`, `metadata.rs`, `volume.rs`, `device.rs`, `extents.rs`, `lock.rs`, `util.rs` | Local/UNC/WSL classification, lossless paths, 128/64-bit handle identity, fast/fallback 256 KiB enumeration, local/handle-bound-remote volume facts, query-only local device/extent facts, run lock, shared fail-closed helpers. |
+| `crates/win/src/file.rs`, `streams.rs`, `ea.rs`, `sparse.rs`, `reparse.rs`, `security.rs` | Read-only source and capability-bearing destination primitives; the only unsafe boundary. Native/provider lengths, ranges, and stream suffixes are validated here before core sees them. |
 | `crates/core/src/model.rs`, `options.rs`, `filesystem.rs`, `classify.rs`, `copy.rs`, `transport.rs`, `worker.rs`, `engine.rs` | Work model, validated options, immutable source/destination semantic policy, endpoint-aware join, terminal outcomes, topology-selected standard/same-spindle transport, bounded scheduling, direct-plain-small and transactional auxiliary/sparse/large copy. |
-| `crates/core/src/journal.rs`, `audit.rs`, `report.rs`, `stats.rs`, `devprofile.rs` | Resume hints, public artifacts, throughput windows, static profiles. |
+| `crates/core/src/artifact.rs`, `journal.rs`, `audit.rs`, `report.rs`, `stats.rs`, `devprofile.rs` | Shared atomic artifact publication, resume hints, public artifacts, throughput windows, static profiles. |
 | `crates/core/src/verify.rs` | Post-copy and standalone verification. |
 | `crates/tui` | Immutable-snapshot live UI and saved report browser. |
 | `crates/cli` | Grammar, option validation, exit mapping. |
@@ -24,7 +24,7 @@
 | I5 | Multi-part logical files and large-file final names never contain partial data; interrupted direct plain-file work is repairable by rerun. | Transactional ADS/EA/sparse/large coverage plus direct-plain-small interruption/rerun tests. |
 | I6 | Counters reconcile. | `Counters::reconcile` at run end and unit tests. |
 | I7 | Every per-object failure is auditable. | Typed `OperationError`, coordinator-only outcome/audit ownership. |
-| I8 | Journal never creates a skip. | Journal API exposes checkpoints only; every-byte torn-tail test. |
+| I8 | Journal never creates a skip. | Journal API exposes checkpoints only; every-byte torn-tail/interior-record tests and atomic compaction preserving only the job plus live hints. |
 | I9 | Memory/work queues are bounded. | `crossbeam_channel::bounded`; per-stream buffers/profile caps. |
 | I10 | No source-tree writes. | All write constructors accept destination/audit paths; preflight audit containment. |
 | I11 | Destination mutations revalidate targets. | Identity/kind/size/mtime/attributes/reparse-tag snapshot before repair/replacement; directory stream, EA, and metadata updates recheck identity on their write handle. |
@@ -79,12 +79,15 @@ counters/audit/integrity closure. A missing `run_end` means interruption or
 audit failure, not failure of already committed files.
 
 Journal records are not user reports. Each line contains version, tagged event,
-and CRC. A torn last line is ignored; an unsupported version is left untouched
-and disables checkpointing for that run. A new checkpoint records a temp
+and CRC. A torn/invalid last line is truncated; an invalid interior line is
+skipped without trusting it or deleting later valid records; an unsupported
+version is left untouched and disables checkpointing for that run. A new checkpoint records a temp
 sibling, source and temp filesystem identities, stream key, source size/mtime,
 watermark, and prefix digest. Older identity-less records load but cannot
 authorize resume. Never repair a journal manually or infer completion from
-`part_done`; rerun normal copy.
+`part_done`; rerun normal copy. Clean-end compaction atomically retains the
+current job header plus live checkpoints; audit artifact retention is operator
+managed.
 
 Reports are versioned aggregate JSON. `bigcp report FILE --plain` provides a
 stable terminal summary; the full document contains devices, timeline,

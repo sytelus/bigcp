@@ -152,7 +152,7 @@ pub struct VolumeInfo {
 /// use handle-bound native volume queries because SMB deliberately does not
 /// implement Win32 volume-management functions.
 pub fn probe_volume(path: &Path) -> io::Result<VolumeInfo> {
-    let input = wide_null(path.as_os_str());
+    let input = wide_null(path.as_os_str())?;
     let mut volume_path = vec![0_u16; 32_768];
     // SAFETY: both UTF-16 buffers are valid for the documented lengths.
     unsafe {
@@ -166,7 +166,7 @@ pub fn probe_volume(path: &Path) -> io::Result<VolumeInfo> {
     truncate_nul(&mut volume_path);
     let volume_root = PathBuf::from(OsString::from_wide(&volume_path));
     let endpoint = classify_endpoint(&volume_root);
-    let volume_root_wide = wide_null(volume_root.as_os_str());
+    let volume_root_wide = wide_null(volume_root.as_os_str())?;
 
     // SAFETY: volume_root_wide is a live, nul-terminated string.
     let drive_type = unsafe { GetDriveTypeW(volume_root_wide.as_ptr()) };
@@ -351,7 +351,9 @@ fn query_remote_attributes(handle: &File) -> io::Result<RemoteAttributes> {
     // page keeps this query allocation bounded while leaving ample room for a
     // third-party redirector's identifier.
     let mut words = vec![0_u64; 4096 / size_of::<u64>()];
-    query_remote_bytes(handle, FileFsAttributeInformation, &mut words)?;
+    let returned = query_remote_bytes(handle, FileFsAttributeInformation, &mut words)?;
+    let name_offset = std::mem::offset_of!(FILE_FS_ATTRIBUTE_INFORMATION, FileSystemName);
+    validate_query_length(returned, words.len() * size_of::<u64>(), name_offset)?;
     let info = words.as_ptr().cast::<FILE_FS_ATTRIBUTE_INFORMATION>();
     // SAFETY: the buffer is eight-byte aligned and at least one page. The
     // native query succeeded before these fixed fields are read.
@@ -364,11 +366,10 @@ fn query_remote_attributes(handle: &File) -> io::Result<RemoteAttributes> {
             (*info).FileSystemName.as_ptr(),
         )
     };
-    let name_offset = std::mem::offset_of!(FILE_FS_ATTRIBUTE_INFORMATION, FileSystemName);
     if !name_bytes.is_multiple_of(size_of::<u16>())
         || name_offset
             .checked_add(name_bytes)
-            .is_none_or(|end| end > words.len() * size_of::<u64>())
+            .is_none_or(|end| end > returned)
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -390,7 +391,12 @@ fn query_remote_serial(handle: &File) -> io::Result<u32> {
     // would reject ordinary SMB shares. One bounded page covers Windows label
     // limits while preserving eight-byte alignment for the fixed header.
     let mut words = vec![0_u64; 4096 / size_of::<u64>()];
-    query_remote_bytes(handle, FileFsVolumeInformation, &mut words)?;
+    let returned = query_remote_bytes(handle, FileFsVolumeInformation, &mut words)?;
+    validate_query_length(
+        returned,
+        words.len() * size_of::<u64>(),
+        std::mem::offset_of!(FILE_FS_VOLUME_INFORMATION, VolumeLabel),
+    )?;
     let info = words.as_ptr().cast::<FILE_FS_VOLUME_INFORMATION>();
     // SAFETY: the aligned page is larger than the fixed portion of the native
     // structure, and the query succeeded before this field is read.
@@ -413,10 +419,11 @@ fn query_remote_struct<T: Default>(handle: &File, class: i32) -> io::Result<T> {
         )
     };
     nt_result(result)?;
+    validate_query_length(status.Information, size_of::<T>(), size_of::<T>())?;
     Ok(value)
 }
 
-fn query_remote_bytes(handle: &File, class: i32, words: &mut [u64]) -> io::Result<()> {
+fn query_remote_bytes(handle: &File, class: i32, words: &mut [u64]) -> io::Result<usize> {
     let mut status = IO_STATUS_BLOCK::default();
     let length = words
         .len()
@@ -434,7 +441,20 @@ fn query_remote_bytes(handle: &File, class: i32, words: &mut [u64]) -> io::Resul
             class,
         )
     };
-    nt_result(result)
+    nt_result(result)?;
+    validate_query_length(status.Information, length as usize, 0)?;
+    Ok(status.Information)
+}
+
+fn validate_query_length(returned: usize, capacity: usize, minimum: usize) -> io::Result<()> {
+    if returned < minimum || returned > capacity {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "remote filesystem returned an invalid query byte count",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn nt_result(status: i32) -> io::Result<()> {
@@ -484,7 +504,9 @@ fn truncate_nul(buffer: &mut Vec<u16>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{EndpointKind, FileSystem, effective_remote_endpoint, probe_volume};
+    use super::{
+        EndpointKind, FileSystem, effective_remote_endpoint, probe_volume, validate_query_length,
+    };
     use std::path::Path;
 
     #[test]
@@ -535,5 +557,12 @@ mod tests {
             effective_remote_endpoint(EndpointKind::Local, None),
             EndpointKind::Unc
         );
+    }
+
+    #[test]
+    fn remote_query_lengths_stay_within_initialized_output() {
+        assert!(validate_query_length(16, 64, 8).is_ok());
+        assert!(validate_query_length(7, 64, 8).is_err());
+        assert!(validate_query_length(65, 64, 8).is_err());
     }
 }

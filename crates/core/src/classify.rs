@@ -5,7 +5,7 @@ use bigcp_win::ObjectKind;
 use crate::filesystem::FilesystemPolicy;
 use crate::model::{Classification, EntrySnapshot};
 
-/// Classifies a source entry against its case-insensitive destination twin.
+/// Classifies a source entry against its destination-policy-matched twin.
 #[must_use]
 pub(crate) fn classify(
     source: &EntrySnapshot,

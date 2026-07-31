@@ -5,6 +5,7 @@
 
 #![deny(missing_docs, unsafe_code)]
 
+mod artifact;
 pub mod audit;
 pub mod classify;
 pub mod copy;

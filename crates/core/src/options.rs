@@ -78,8 +78,8 @@ pub struct CopyOptions {
     ///
     /// The CLI sets this after its combined startup confirmation or when
     /// `--accept-remote-paths` is supplied. Library callers must opt in before
-    /// a destination-mutating UNC copy; dry-runs and standalone verification
-    /// are exempt.
+    /// a mutating copy involving any remote endpoint; dry-runs and standalone
+    /// verification are exempt.
     pub accept_remote_paths: bool,
     /// Optional audit state directory.
     pub state_dir: Option<PathBuf>,

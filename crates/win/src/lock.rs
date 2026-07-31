@@ -27,8 +27,8 @@ impl DestinationLock {
     /// Acquires a named mutex or returns WouldBlock if another run owns it.
     pub fn acquire(name_suffix: &str) -> io::Result<Self> {
         let mutex_name = format!("Global\\bigcp-{name_suffix}");
-        let mutex_name = wide_null(mutex_name.as_ref());
-        let sddl = wide_null("D:(A;;GA;;;WD)".as_ref());
+        let mutex_name = wide_null(mutex_name.as_ref())?;
+        let sddl = wide_null("D:(A;;GA;;;WD)".as_ref())?;
         let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
         // SAFETY: sddl is a valid nul-terminated SDDL string and descriptor is
         // a valid out pointer. The returned LocalAlloc allocation is freed

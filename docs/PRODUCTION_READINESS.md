@@ -12,7 +12,7 @@ by the governing plan.
 - Direct, rerun-recoverable publication for plain small files; opaque-temp plus
   atomic-rename publication for ADS/EA, sparse, large, and reparse objects.
 - Checkpoint source/temp identity binding, non-following resume opens, and
-  exact-handle delete-on-close ownership.
+  exact-handle delete-on-close ownership; unique atomic journal compaction.
 - Destination snapshot revalidation before replacement and metadata repair.
 - Handle-bound source/destination identity checks for named streams, EAs, and
   post-order directory metadata finalization.
@@ -25,7 +25,8 @@ by the governing plan.
 - Exact terminal counter reconciliation and a durably synchronized `run_end`.
 - Structurally confined, budgeted tests under a new validated temporary root
   on a whitelisted drive; only the system drive and the code-checkout drive
-  are permitted, and everything else is rejected before filesystem access.
+  are permitted, and prefixes, rooted children, traversal, and every other
+  drive are rejected before filesystem access.
 - Formatting, warning-free Clippy, unit/integration/doc tests, locked release
   builds, schema parse/version checks (full emitted-instance validation is
   release work), dependency policy, and vulnerability audit.
@@ -39,6 +40,8 @@ by the governing plan.
   local-device IOCTLs, static bounded redirector profiles, WSL exact-name and
   basic-metadata projection, combined startup acceptance, and redirector-loss
   breaker mapping without changing the local transport/profile path.
+- Fail-closed Win32/provider parsing for returned lengths, sparse-range order,
+  reparse framing, stream suffix containment, and embedded-NUL path input.
 
 ## Release-blocking evidence still required
 
@@ -83,4 +86,4 @@ release pass.
 
 No release process may reinterpret an unrun gate as a pass.
 `TESTING_SUMMARY.md` records dated evidence; intentional differences from
-the governing plan are recorded inline in PLAN.md and in ADRs 0027–0037.
+the governing plan are recorded inline in PLAN.md and in ADRs 0027–0039.

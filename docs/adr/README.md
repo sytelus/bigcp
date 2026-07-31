@@ -11,5 +11,8 @@ topology-gated phased transport for same-spindle HDD copies without changing
 the standard device path. ADR 0037 supersedes the local-only network boundary
 with an isolated UNC/WSL endpoint axis, bounded redirector profiles, and one
 explicit remote-copy acceptance without changing local discovery or transport.
+ADR 0038 unifies report and journal-compaction publication behind unique,
+synchronized, atomic siblings. ADR 0039 makes native/provider parsing and the
+testkit path boundary explicitly fail closed on malformed or rooted input.
 
 The index is filename ordered. `docs/MAINTENANCE.md` maps decisions to code and release checks.

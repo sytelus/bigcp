@@ -66,9 +66,7 @@ pub fn extent_count(file: &File) -> io::Result<u64> {
         } else {
             false
         };
-        let returned_words = usize::try_from(returned)
-            .map_err(|_| io::Error::other("extent byte count is too large"))?
-            / size_of::<u64>();
+        let returned_words = returned_word_count(returned, buffer.len())?;
         if returned_words < HEADER_WORDS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -111,7 +109,9 @@ pub fn extent_count(file: &File) -> io::Result<u64> {
                     "extent enumeration made no progress",
                 ));
             }
-            let clusters = next_vcn.wrapping_sub(previous_vcn);
+            let clusters = next_vcn.checked_sub(previous_vcn).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "extent cluster count overflow")
+            })?;
             if lcn == HOLE_LCN {
                 // A hole occupies no disk run; physical adjacency of the
                 // surrounding data runs is judged purely by their LCNs.
@@ -138,10 +138,36 @@ pub fn extent_count(file: &File) -> io::Result<u64> {
     Ok(extents)
 }
 
+fn returned_word_count(returned: u32, capacity_words: usize) -> io::Result<usize> {
+    let bytes = usize::try_from(returned)
+        .map_err(|_| io::Error::other("extent byte count is too large"))?;
+    if !bytes.is_multiple_of(size_of::<u64>()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "filesystem returned a partial retrieval-pointers word",
+        ));
+    }
+    let words = bytes / size_of::<u64>();
+    if words > capacity_words {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "filesystem returned more retrieval-pointer bytes than requested",
+        ));
+    }
+    Ok(words)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::extent_count;
+    use super::{extent_count, returned_word_count};
     use std::fs;
+
+    #[test]
+    fn malformed_retrieval_pointer_lengths_are_rejected() {
+        assert!(returned_word_count(15, 512).is_err());
+        assert!(returned_word_count(4096 + 8, 512).is_err());
+        assert_eq!(returned_word_count(16, 512).ok(), Some(2));
+    }
 
     #[test]
     fn counts_extents_of_test_owned_files_in_system_temp_sandbox() {

@@ -621,8 +621,8 @@ pub fn set_basic_at_checked(
 /// is outside the destination tree and `MoveFileExW` supplies atomic replace
 /// semantics for an existing report. The caller must own `temporary`.
 pub fn publish_audit_temporary(temporary: &Path, final_path: &Path) -> io::Result<()> {
-    let temporary = wide_null(temporary.as_os_str());
-    let final_path = wide_null(final_path.as_os_str());
+    let temporary = wide_null(temporary.as_os_str())?;
+    let final_path = wide_null(final_path.as_os_str())?;
     // SAFETY: both paths are nul-terminated and live for the synchronous call.
     unsafe {
         bool_result(MoveFileExW(

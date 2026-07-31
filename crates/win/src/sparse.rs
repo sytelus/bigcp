@@ -90,28 +90,14 @@ pub(crate) fn query_allocated_ranges(
             }
             break;
         }
+        let mut next = cursor;
         for raw in &output[..count] {
-            let offset = u64::try_from(raw.FileOffset).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "negative sparse range offset")
-            })?;
-            let length = u64::try_from(raw.Length).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "negative sparse range length")
-            })?;
-            let end = offset.checked_add(length).ok_or_else(|| {
+            let range = validated_range(raw, next, logical_size)?;
+            next = range.offset.checked_add(range.length).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "sparse range overflow")
             })?;
-            if length == 0 || offset < cursor || end > logical_size {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "filesystem returned an invalid sparse range",
-                ));
-            }
-            ranges.push(AllocatedRange { offset, length });
+            ranges.push(range);
         }
-        let Some(last) = ranges.last() else {
-            break;
-        };
-        let next = last.offset.saturating_add(last.length);
         if next <= cursor {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -124,6 +110,27 @@ pub(crate) fn query_allocated_ranges(
         }
     }
     Ok(ranges)
+}
+
+fn validated_range(
+    raw: &FILE_ALLOCATED_RANGE_BUFFER,
+    minimum_offset: u64,
+    logical_size: u64,
+) -> io::Result<AllocatedRange> {
+    let offset = u64::try_from(raw.FileOffset)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "negative sparse range offset"))?;
+    let length = u64::try_from(raw.Length)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "negative sparse range length"))?;
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "sparse range overflow"))?;
+    if length == 0 || offset < minimum_offset || end > logical_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "filesystem returned an invalid or overlapping sparse range",
+        ));
+    }
+    Ok(AllocatedRange { offset, length })
 }
 
 /// Marks a destination handle sparse before its logical EOF is established.
@@ -143,5 +150,49 @@ pub(crate) fn mark_sparse(file: &File) -> io::Result<()> {
             &raw mut returned,
             std::ptr::null_mut(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use windows_sys::Win32::System::Ioctl::FILE_ALLOCATED_RANGE_BUFFER;
+
+    use super::validated_range;
+
+    #[test]
+    fn sparse_range_validation_rejects_overlap_and_bounds_errors() {
+        let first = FILE_ALLOCATED_RANGE_BUFFER {
+            FileOffset: 4,
+            Length: 4,
+        };
+        let second = FILE_ALLOCATED_RANGE_BUFFER {
+            FileOffset: 7,
+            Length: 2,
+        };
+        let valid = validated_range(&first, 0, 16);
+        assert!(valid.is_ok());
+        assert!(validated_range(&second, 8, 16).is_err());
+        assert!(
+            validated_range(
+                &FILE_ALLOCATED_RANGE_BUFFER {
+                    FileOffset: 8,
+                    Length: 0,
+                },
+                8,
+                16,
+            )
+            .is_err()
+        );
+        assert!(
+            validated_range(
+                &FILE_ALLOCATED_RANGE_BUFFER {
+                    FileOffset: 15,
+                    Length: 2,
+                },
+                8,
+                16,
+            )
+            .is_err()
+        );
     }
 }

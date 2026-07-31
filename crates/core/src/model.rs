@@ -232,19 +232,18 @@ pub struct Counters {
 }
 
 impl Counters {
-    /// Applies exactly one terminal file outcome.
     /// Notes one file entry at *discovery* time (enumeration/subtree walks).
     ///
     /// Discovery and terminal outcomes are counted at different call sites on
     /// purpose: if any code path ever drops a discovered file without an
-    /// outcome, `reconcile` now detects it. Counting both from the same call
-    /// would make the I6 equation a tautology.
+    /// outcome, `reconcile` detects it. Counting both from the same call would
+    /// make the I6 equation a tautology.
     pub fn note_file_discovered(&mut self, enumerated_bytes: u64) {
         self.files_discovered = self.files_discovered.saturating_add(1);
         self.bytes_enumerated = self.bytes_enumerated.saturating_add(enumerated_bytes);
     }
 
-    /// Applies one terminal file outcome to the disjoint outcome counters.
+    /// Applies exactly one terminal file outcome to the disjoint counters.
     pub fn apply_file(&mut self, outcome: &FileOutcome) {
         // `files_discovered` is deliberately NOT incremented here — see
         // `note_file_discovered`. Logical byte totals stay outcome-time

@@ -6,7 +6,6 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
@@ -30,7 +29,7 @@ use crate::file::{close_file, rename_by_handle, set_basic_by_handle, set_delete_
 use crate::metadata::{BasicMetadata, FileIdentity, ObjectMetadata, metadata_at};
 use crate::security::ProtectedDacl;
 use crate::streams::{DestinationStream, SourceStream, StreamInfo, list_streams};
-use crate::util::bool_result;
+use crate::util::{bool_result, wide_null};
 
 /// Complete opaque reparse buffer plus classification facts.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -88,13 +87,8 @@ pub fn read_reparse_data(path: &Path) -> io::Result<ReparseData> {
             std::ptr::null_mut(),
         ))?;
     }
-    if returned < 8 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "reparse buffer is shorter than its standard header",
-        ));
-    }
-    buffer.truncate(returned as usize);
+    let returned = validated_reparse_length(&buffer, returned)?;
+    buffer.truncate(returned);
     let tag = u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
     let attributes = crate::metadata::metadata_from_file(&file)?.basic.attributes;
     Ok(ReparseData {
@@ -102,6 +96,25 @@ pub fn read_reparse_data(path: &Path) -> io::Result<ReparseData> {
         bytes: buffer,
         directory: attributes & FILE_ATTRIBUTE_DIRECTORY != 0,
     })
+}
+
+fn validated_reparse_length(buffer: &[u8], returned: u32) -> io::Result<usize> {
+    let returned = usize::try_from(returned)
+        .map_err(|_| io::Error::other("reparse byte count is too large"))?;
+    if returned < 8 || returned > buffer.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "reparse response length lies outside its output buffer",
+        ));
+    }
+    let payload = usize::from(u16::from_le_bytes([buffer[4], buffer[5]]));
+    if payload.checked_add(8) != Some(returned) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "reparse response disagrees with its declared payload length",
+        ));
+    }
+    Ok(returned)
 }
 
 /// Copies a reparse point through an opaque sibling and atomic publication.
@@ -315,7 +328,7 @@ impl ReparseTemp {
         for _ in 0..128 {
             let nonce = Uuid::new_v4().simple().to_string();
             let path = parent.join(format!(".bigcp-{run_id}-{}.part", &nonce[..12]));
-            let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+            let path_wide = wide_null(path.as_os_str())?;
             let flags = SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE
                 | if directory {
                     SYMBOLIC_LINK_FLAG_DIRECTORY
@@ -552,7 +565,16 @@ impl Drop for ReparseTemp {
 
 #[cfg(test)]
 mod tests {
-    use super::symlink_target;
+    use super::{symlink_target, validated_reparse_length};
+
+    #[test]
+    fn reparse_response_length_must_match_the_header_and_buffer() {
+        let mut value = vec![0_u8; 12];
+        value[4..6].copy_from_slice(&4_u16.to_le_bytes());
+        assert_eq!(validated_reparse_length(&value, 12).ok(), Some(12));
+        assert!(validated_reparse_length(&value, 11).is_err());
+        assert!(validated_reparse_length(&value, 13).is_err());
+    }
 
     fn buffer(substitute: &str, print: &str) -> Vec<u8> {
         let substitute: Vec<u16> = substitute.encode_utf16().collect();

@@ -153,7 +153,8 @@ fn query_write_cache(handle: &File) -> Option<bool> {
             std::ptr::null_mut(),
         )
     };
-    (succeeded != 0).then_some(info.WriteCacheEnabled)
+    let expected = u32::try_from(size_of::<DISK_CACHE_INFORMATION>()).ok()?;
+    (succeeded != 0 && returned == expected).then_some(info.WriteCacheEnabled)
 }
 
 /// Builds the `\\.\X:` query-only device path for a drive-letter volume root.
@@ -222,7 +223,7 @@ fn query_property<T: Default>(handle: &File, property: i32) -> Option<T> {
             std::ptr::null_mut(),
         )
     };
-    if result == 0 || returned < u32::try_from(size_of::<T>()).ok()? {
+    if result == 0 || returned != u32::try_from(size_of::<T>()).ok()? {
         None
     } else {
         Some(output)
@@ -250,13 +251,18 @@ fn query_disk_numbers(handle: &File) -> Option<Vec<u32>> {
         ))
         .ok()?;
     }
-    if returned < 8 {
+    disk_numbers_from_bytes(&output.0, returned)
+}
+
+fn disk_numbers_from_bytes(output: &[u8], returned: u32) -> Option<Vec<u32>> {
+    let returned = usize::try_from(returned).ok()?;
+    if returned < 8 || returned > output.len() {
         return None;
     }
-    let count = u32::from_le_bytes(output.0[..4].try_into().ok()?) as usize;
+    let count = u32::from_le_bytes(output[..4].try_into().ok()?) as usize;
     let extent_offset = 8_usize;
     let extent_size = size_of::<DISK_EXTENT>();
-    if extent_offset.checked_add(count.checked_mul(extent_size)?)? > returned as usize {
+    if extent_offset.checked_add(count.checked_mul(extent_size)?)? > returned {
         return None;
     }
     let mut disks = Vec::with_capacity(count);
@@ -264,9 +270,8 @@ fn query_disk_numbers(handle: &File) -> Option<Vec<u32>> {
         let offset = extent_offset + index * extent_size;
         // SAFETY: bounds were validated above. read_unaligned handles any
         // compiler padding assumptions conservatively.
-        let extent = unsafe {
-            std::ptr::read_unaligned(output.0.as_ptr().add(offset).cast::<DISK_EXTENT>())
-        };
+        let extent =
+            unsafe { std::ptr::read_unaligned(output.as_ptr().add(offset).cast::<DISK_EXTENT>()) };
         if !disks.contains(&extent.DiskNumber) {
             disks.push(extent.DiskNumber);
         }
@@ -276,7 +281,7 @@ fn query_disk_numbers(handle: &File) -> Option<Vec<u32>> {
 
 #[cfg(test)]
 mod tests {
-    use super::device_path_for_root;
+    use super::{device_path_for_root, disk_numbers_from_bytes};
     use std::ffi::OsString;
     use std::path::Path;
 
@@ -298,5 +303,13 @@ mod tests {
     fn non_letter_roots_are_rejected() {
         assert!(device_path_for_root(Path::new(r"\\?\Volume{0000}\a")).is_err());
         assert!(device_path_for_root(Path::new(r"relative")).is_err());
+    }
+
+    #[test]
+    fn disk_extent_parser_rejects_impossible_returned_lengths() {
+        let buffer = [0_u8; 16];
+        assert!(disk_numbers_from_bytes(&buffer, 17).is_none());
+        assert!(disk_numbers_from_bytes(&buffer, 7).is_none());
+        assert_eq!(disk_numbers_from_bytes(&buffer, 8), Some(Vec::new()));
     }
 }

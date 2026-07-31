@@ -35,7 +35,7 @@ const EXTENDED_UNC_PREFIX: &[u16] = &[
 /// This function deliberately does not follow reparse points. Root identity is
 /// established separately by opening the path and calling final_path.
 pub fn absolute_extended(path: &Path) -> io::Result<PathBuf> {
-    let input = wide_null(path.as_os_str());
+    let input = wide_null(path.as_os_str())?;
     // SAFETY: input is nul-terminated and remains alive for both calls. A null
     // output with length zero is the documented size query.
     let required = unsafe {

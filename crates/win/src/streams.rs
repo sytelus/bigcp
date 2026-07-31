@@ -137,7 +137,7 @@ impl DestinationStream {
                 "unnamed data must use the primary temporary handle",
             ));
         }
-        let path = stream_path(base, &stream.name);
+        let path = stream_path(base, &stream.name)?;
         let mut options = OpenOptions::new();
         options
             // `access_mode` controls CreateFileW, while these flags also
@@ -217,7 +217,7 @@ impl SourceStream {
     }
 
     fn open_with_flags(base: &Path, stream: &StreamInfo, flags: u32) -> io::Result<Self> {
-        let path = stream_path(base, &stream.name);
+        let path = stream_path(base, &stream.name)?;
         let mut options = OpenOptions::new();
         options
             .access_mode(GENERIC_READ)
@@ -250,7 +250,7 @@ impl Seek for SourceStream {
 ///
 /// Filesystem-internal non-data streams are deliberately excluded.
 pub fn list_streams(path: &Path) -> io::Result<Vec<StreamInfo>> {
-    let path = wide_null(path.as_os_str());
+    let path = wide_null(path.as_os_str())?;
     let mut data = WIN32_FIND_STREAM_DATA::default();
     // SAFETY: path is nul-terminated and data is a valid writable structure.
     let handle = unsafe {
@@ -295,14 +295,53 @@ pub fn list_streams(path: &Path) -> io::Result<Vec<StreamInfo>> {
     Ok(result)
 }
 
-/// Builds a base-path-plus-stream path without Unicode conversion.
-pub(crate) fn stream_path(base: &Path, stream_name: &OsStr) -> PathBuf {
+/// Builds a validated base-path-plus-stream path without Unicode conversion.
+fn stream_path(base: &Path, stream_name: &OsStr) -> io::Result<PathBuf> {
+    validate_stream_name(stream_name)?;
+    validate_data_stream_name(stream_name)?;
     if stream_name == OsStr::new("::$DATA") {
-        return base.to_path_buf();
+        return Ok(base.to_path_buf());
     }
     let mut wide: Vec<u16> = base.as_os_str().encode_wide().collect();
     wide.extend(stream_name.encode_wide());
-    PathBuf::from(OsString::from_wide(&wide))
+    Ok(PathBuf::from(OsString::from_wide(&wide)))
+}
+
+/// Accepts exactly the unnamed stream or one nonempty named `$DATA` stream.
+///
+/// A second colon inside the user-controlled portion could be reinterpreted
+/// as another Win32 stream/type separator, so public open helpers fail closed
+/// even if a malformed suffix happens to end in `:$DATA`.
+fn validate_data_stream_name(name: &OsStr) -> io::Result<()> {
+    const DATA_SUFFIX: &[u16] = &[
+        b':' as u16,
+        b'$' as u16,
+        b'D' as u16,
+        b'A' as u16,
+        b'T' as u16,
+        b'A' as u16,
+    ];
+    const UNNAMED_DATA: &[u16] = &[
+        b':' as u16,
+        b':' as u16,
+        b'$' as u16,
+        b'D' as u16,
+        b'A' as u16,
+        b'T' as u16,
+        b'A' as u16,
+    ];
+    let units = name.encode_wide().collect::<Vec<_>>();
+    let valid = units == UNNAMED_DATA
+        || (units.len() > DATA_SUFFIX.len() + 1
+            && units.ends_with(DATA_SUFFIX)
+            && !units[1..units.len() - DATA_SUFFIX.len()].contains(&u16::from(b':')));
+    if !valid {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "only well-formed data-stream suffixes can be opened",
+        ));
+    }
+    Ok(())
 }
 
 fn stream_from_data(data: &WIN32_FIND_STREAM_DATA) -> io::Result<StreamInfo> {
@@ -310,13 +349,36 @@ fn stream_from_data(data: &WIN32_FIND_STREAM_DATA) -> io::Result<StreamInfo> {
         .cStreamName
         .iter()
         .position(|value| *value == 0)
-        .unwrap_or(data.cStreamName.len());
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "filesystem returned an unterminated stream name",
+            )
+        })?;
     let size = u64::try_from(data.StreamSize)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "negative stream size"))?;
-    Ok(StreamInfo {
-        name: OsString::from_wide(&data.cStreamName[..end]),
-        size,
-    })
+    let name = OsString::from_wide(&data.cStreamName[..end]);
+    validate_stream_name(&name)?;
+    Ok(StreamInfo { name, size })
+}
+
+/// Rejects provider output that could turn suffix concatenation into a path
+/// traversal or a different Win32 string. Implementation streams are allowed
+/// here and filtered by `list_streams`; open paths additionally require DATA.
+fn validate_stream_name(name: &OsStr) -> io::Result<()> {
+    let units = name.encode_wide().collect::<Vec<_>>();
+    if units.first() != Some(&u16::from(b':'))
+        || units.contains(&0)
+        || units
+            .iter()
+            .any(|unit| *unit == u16::from(b'\\') || *unit == u16::from(b'/'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "filesystem returned an invalid stream suffix",
+        ));
+    }
+    Ok(())
 }
 
 struct FindGuard(windows_sys::Win32::Foundation::HANDLE);
@@ -332,12 +394,13 @@ impl Drop for FindGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::{DestinationStream, SourceStream, StreamInfo};
+    use super::{DestinationStream, SourceStream, StreamInfo, stream_path};
     use crate::metadata::metadata_at;
     use std::ffi::OsString;
     use std::fs;
     use std::io::{Read, Write};
     use std::os::windows::fs::symlink_file;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn filesystem_implementation_streams_are_not_user_data() {
@@ -356,6 +419,18 @@ mod tests {
         assert!(unnamed.is_data());
         assert!(alternate.is_data());
         assert!(!directory_index.is_data());
+    }
+
+    #[test]
+    fn stream_paths_reject_traversal_and_non_data_suffixes() {
+        let base = Path::new(r"C:\safe\base.bin");
+        assert!(stream_path(base, std::ffi::OsStr::new(r":\..\escape:$DATA")).is_err());
+        assert!(stream_path(base, std::ffi::OsStr::new("::$INDEX_ALLOCATION")).is_err());
+        assert!(stream_path(base, std::ffi::OsStr::new(":bad:name:$DATA")).is_err());
+        assert_eq!(
+            stream_path(base, std::ffi::OsStr::new(":safe:$DATA")).ok(),
+            Some(PathBuf::from(r"C:\safe\base.bin:safe:$DATA"))
+        );
     }
 
     #[test]

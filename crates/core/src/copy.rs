@@ -1,8 +1,9 @@
 //! End-to-end copy orchestration and iterative directory join.
 //!
-//! Pre-flight resolves and pins both roots, rejects remote or unsupported
-//! volumes, validates audit-path containment, and acquires the exact-root
-//! machine-wide lock before enumeration begins.
+//! Pre-flight resolves and pins both roots, enforces remote/degraded-filesystem
+//! acceptance, rejects unsupported local volumes, validates audit-path
+//! containment, and acquires the exact-root machine-wide lock before
+//! enumeration begins.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap, HashSet};

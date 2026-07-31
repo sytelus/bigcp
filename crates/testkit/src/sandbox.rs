@@ -78,11 +78,16 @@ impl SandboxRoot {
     /// Resolves a relative path and rejects traversal or reparse intermediates.
     pub fn child(&self, relative: &Path) -> Result<PathBuf> {
         if relative.is_absolute()
-            || relative
-                .components()
-                .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+            || relative.components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
         {
-            bail!("test path must be relative and may not contain parent traversal");
+            bail!(
+                "test path must be relative and may not contain roots, prefixes, or parent traversal"
+            );
         }
         let mut current = self.root.clone();
         for component in relative.components() {
@@ -266,6 +271,17 @@ mod tests {
         ] {
             assert!(initialize_empty(Path::new(path)).is_err());
         }
+    }
+
+    #[test]
+    fn rooted_child_paths_cannot_reset_to_the_drive_root() {
+        let Ok(sandbox) = SandboxRoot::create_system_temp("rooted-child") else {
+            return;
+        };
+        // On Windows, `\escape` can be rooted without carrying a drive
+        // prefix. PathBuf::push would otherwise reset the sandbox-relative
+        // portion and target the current drive root.
+        assert!(sandbox.child(Path::new(r"\bigcp-must-not-touch")).is_err());
     }
 
     #[test]

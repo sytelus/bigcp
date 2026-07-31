@@ -126,7 +126,9 @@ struct StoredRecord {
 /// Loaded journal state and append handle.
 pub struct Journal {
     path: PathBuf,
-    file: File,
+    /// Present during ordinary append operation; temporarily taken and closed
+    /// while Windows atomically replaces the journal during compaction.
+    file: Option<File>,
     resumable: BTreeMap<(String, String), Checkpoint>,
     torn_tail: bool,
     active_job: Option<JobSignature>,
@@ -148,7 +150,8 @@ struct JobSignature {
 }
 
 impl Journal {
-    /// Loads a journal, dropping a bad line and everything after it.
+    /// Loads a journal, truncating only an invalid final record and ignoring
+    /// invalid interior records without trusting them.
     pub fn open(path: PathBuf, fresh: bool) -> Result<Self, BigcpError> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -252,7 +255,7 @@ impl Journal {
             .map_err(|error| BigcpError::io("seek journal", error))?;
         Ok(Self {
             path,
-            file,
+            file: Some(file),
             resumable,
             torn_tail,
             active_job,
@@ -305,9 +308,9 @@ impl Journal {
     ///
     /// Called on clean run end (PLAN section 5.12) so the file never replays
     /// unbounded history. Live checkpoints survive: a canceled run's partials
-    /// stay resumable. The rewrite is temp-file based; the tiny non-atomic
-    /// remove/rename window can at worst lose *hints* (I8 — the journal is
-    /// never a completion database).
+    /// stay resumable. The synchronized unique sibling is atomically published
+    /// so compaction neither overwrites a predictable neighbor nor exposes a
+    /// remove/rename gap (the journal remains hints only under I8).
     pub fn compact(&mut self) -> Result<(), BigcpError> {
         let Some(job) = self.job_record.clone() else {
             return Ok(());
@@ -319,41 +322,32 @@ impl Journal {
                 checkpoint.clone(),
             ))?);
         }
-        let temporary = self.path.with_extension("compact-tmp");
-        fs::write(&temporary, &contents)
-            .map_err(|error| BigcpError::io("write compacted journal", error))?;
-        // Windows `rename` cannot replace; remove-then-rename is acceptable
-        // for a hint store (see doc comment above).
-        if let Err(error) = fs::remove_file(&self.path)
-            .or_else(|error| {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    Ok(())
-                } else {
-                    Err(error)
-                }
-            })
-            .and_then(|()| fs::rename(&temporary, &self.path))
-        {
-            let _ = fs::remove_file(&temporary);
-            return Err(BigcpError::io("swap compacted journal", error));
-        }
+        // Windows does not permit replacement while this ordinary append
+        // handle is open. Closing only our handle keeps the final path intact
+        // until the subsequent atomic replace.
+        drop(self.file.take());
+        let publish = crate::artifact::write_atomic_bytes(&self.path, "journal", &contents)
+            .map_err(|error| BigcpError::io("publish compacted journal", error));
         let mut options = OpenOptions::new();
         options.read(true).write(true);
-        self.file = options
+        let mut reopened = options
             .open(&self.path)
             .map_err(|error| BigcpError::io("reopen compacted journal", error))?;
-        self.file
+        reopened
             .seek(std::io::SeekFrom::End(0))
             .map_err(|error| BigcpError::io("seek compacted journal", error))?;
-        Ok(())
+        self.file = Some(reopened);
+        publish
     }
 
     /// Appends one CRC-tagged record and flushes it.
     pub fn append(&mut self, event: JournalEvent) -> Result<(), BigcpError> {
         let state_event = event.clone();
         let line = encode_record(&event)?;
-        let mut before = self
-            .file
+        let file = self.file.as_mut().ok_or_else(|| {
+            BigcpError::Invariant("journal append handle is unavailable".to_owned())
+        })?;
+        let mut before = file
             .seek(std::io::SeekFrom::End(0))
             .map_err(|error| BigcpError::io("seek journal append", error))?;
         // Self-heal a missing trailing newline (an interrupted append whose
@@ -361,27 +355,23 @@ impl Journal {
         // silently corrupt both records on the next load.
         if before > 0 {
             let mut last = [0_u8; 1];
-            self.file
-                .seek(std::io::SeekFrom::Start(before - 1))
-                .and_then(|_| self.file.read_exact(&mut last))
+            file.seek(std::io::SeekFrom::Start(before - 1))
+                .and_then(|_| file.read_exact(&mut last))
                 .map_err(|error| BigcpError::io("probe journal tail", error))?;
-            self.file
-                .seek(std::io::SeekFrom::End(0))
+            file.seek(std::io::SeekFrom::End(0))
                 .map_err(|error| BigcpError::io("seek journal append", error))?;
             if last[0] != b'\n' {
-                self.file
-                    .write_all(b"\n")
+                file.write_all(b"\n")
                     .map_err(|error| BigcpError::io("heal journal tail", error))?;
                 before = before.saturating_add(1);
             }
         }
-        if let Err(error) = self.file.write_all(&line) {
-            let _ = self.file.set_len(before);
-            let _ = self.file.seek(std::io::SeekFrom::Start(before));
+        if let Err(error) = file.write_all(&line) {
+            let _ = file.set_len(before);
+            let _ = file.seek(std::io::SeekFrom::Start(before));
             return Err(BigcpError::io("append journal", error));
         }
-        self.file
-            .flush()
+        file.flush()
             .map_err(|error| BigcpError::io("flush journal", error))?;
         match state_event {
             JournalEvent::Checkpoint(checkpoint) => {
@@ -700,6 +690,39 @@ mod tests {
             reloaded
                 .ok()
                 .is_some_and(|journal| journal.checkpoint("u16:live", "").is_some())
+        );
+    }
+
+    #[test]
+    fn compaction_never_overwrites_the_old_predictable_sibling_name() {
+        let directory = tempfile::tempdir();
+        assert!(directory.is_ok());
+        let Some(directory) = directory.ok() else {
+            return;
+        };
+        let path = directory.path().join("journal.jsonl");
+        let old_temporary = path.with_extension("compact-tmp");
+        assert!(fs::write(&old_temporary, b"unrelated sentinel").is_ok());
+        let Some(mut journal) = open_job_journal(&path) else {
+            return;
+        };
+        assert!(journal.compact().is_ok());
+        assert_eq!(
+            fs::read(&old_temporary).ok(),
+            Some(b"unrelated sentinel".to_vec())
+        );
+        let entries = fs::read_dir(directory.path())
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            entries
+                .iter()
+                .all(|name| !name.starts_with(".bigcp-journal-")),
+            "leftover compaction temporary: {entries:?}"
         );
     }
 

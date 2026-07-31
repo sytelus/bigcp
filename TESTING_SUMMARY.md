@@ -1,6 +1,32 @@
 # Implementation testing and drive-safety summary
 
-Latest review: 2026-07-30
+Latest review: 2026-07-31
+
+## 2026-07-31 full repository review and boundary hardening
+
+The owner-authorized full review covered the workspace architecture, copy and
+verification engines, Win32 wrappers, CLI/TUI policy, testkit confinement,
+scripts, CI configuration, and maintained documentation. It fixed atomic
+journal compaction, fail-closed native/provider parsing, stream-suffix
+containment, and a Windows rooted-child sandbox escape. ADRs 0038/0039 record
+the persistence and boundary decisions; PLAN's journal examples, loader rules,
+retention statement, and same-spindle status now match the implementation.
+
+All 119 bounded workspace tests passed with zero failures: 8 CLI, 42 core unit,
+15 core end-to-end, 9 testkit safety, 2 TUI, and 43 Windows-boundary tests. Nine
+new regression cases cover the old predictable compaction sibling, rooted
+sandbox children, embedded NUL input, stream traversal/non-data suffixes,
+overlapping or invalid sparse ranges, malformed retrieval-pointer lengths,
+out-of-buffer disk-extent counts, reparse framing, and remote query lengths.
+The existing end-to-end run also exercised the refactored atomic report and
+journal publication paths.
+
+`cargo fmt --all -- --check`, warning-free workspace/all-target Clippy, locked
+documentation, the locked release build, the test-storage safety backstop,
+`cargo-deny`, and `cargo-audit` passed. `cargo-deny` retained only its allowed
+duplicate-version warnings (`hashbrown` and `syn`); the RustSec scan found no
+vulnerability. No physical-drive, remote-write, VHDX, performance, stress,
+large-scale, endurance, or forced-disconnect test ran.
 
 ## 2026-07-30 UNC and WSL endpoint validation
 
