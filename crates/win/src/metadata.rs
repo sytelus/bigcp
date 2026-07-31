@@ -3,14 +3,14 @@
 //! Every object is opened with OPEN_REPARSE_POINT before classification. This
 //! keeps traversal from accidentally crossing a junction or symbolic link.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::mem::size_of;
-use std::os::windows::ffi::OsStringExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use windows_sys::Win32::Foundation::{
     ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED,
@@ -264,30 +264,20 @@ pub fn enumerate_directory(path: &Path) -> io::Result<Vec<DirectoryEntry>> {
                     .add(offset / size_of::<u64>())
                     .cast::<FILE_ID_EXTD_DIR_INFO>()
             };
-            let name_bytes = usize::try_from(record.FileNameLength)
-                .map_err(|_| io::Error::other("file name length does not fit address space"))?;
-            if name_bytes % size_of::<u16>() != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "directory enumeration returned an odd UTF-16 byte length",
-                ));
-            }
-            let name_offset = offset + std::mem::offset_of!(FILE_ID_EXTD_DIR_INFO, FileName);
-            if name_offset
-                .checked_add(name_bytes)
-                .is_none_or(|end| end > byte_len)
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "directory enumeration returned a truncated file name",
-                ));
-            }
+            let (name_units, next_offset) = directory_record_layout(
+                offset,
+                byte_len,
+                size_of::<FILE_ID_EXTD_DIR_INFO>(),
+                std::mem::offset_of!(FILE_ID_EXTD_DIR_INFO, FileName),
+                record.FileNameLength,
+                record.NextEntryOffset,
+                "directory enumeration",
+            )?;
             // SAFETY: the name bounds and two-byte alignment were checked.
-            let name_slice = unsafe {
-                std::slice::from_raw_parts(record.FileName.as_ptr(), name_bytes / size_of::<u16>())
-            };
+            let name_slice =
+                unsafe { std::slice::from_raw_parts(record.FileName.as_ptr(), name_units) };
             let name = OsString::from_wide(name_slice);
-            if name != "." && name != ".." {
+            if validate_child_name(&name)? {
                 let kind = classify_kind(record.FileAttributes, record.ReparsePointTag);
                 entries.push(DirectoryEntry {
                     path: path.join(&name),
@@ -315,22 +305,10 @@ pub fn enumerate_directory(path: &Path) -> io::Result<Vec<DirectoryEntry>> {
                     },
                 });
             }
-            if record.NextEntryOffset == 0 {
+            let Some(next_offset) = next_offset else {
                 break;
-            }
-            let next = usize::try_from(record.NextEntryOffset)
-                .map_err(|_| io::Error::other("directory record offset is too large"))?;
-            if next < size_of::<FILE_ID_EXTD_DIR_INFO>()
-                || offset
-                    .checked_add(next)
-                    .is_none_or(|value| value >= byte_len)
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "directory enumeration returned an invalid record offset",
-                ));
-            }
-            offset += next;
+            };
+            offset = next_offset;
         }
     }
     Ok(entries)
@@ -399,30 +377,20 @@ fn enumerate_directory_legacy(
                     .add(offset / size_of::<u64>())
                     .cast::<FILE_ID_BOTH_DIR_INFO>()
             };
-            let name_bytes = usize::try_from(record.FileNameLength)
-                .map_err(|_| io::Error::other("file name length does not fit address space"))?;
-            if name_bytes % size_of::<u16>() != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "legacy directory enumeration returned an odd UTF-16 byte length",
-                ));
-            }
-            let name_offset = offset + std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
-            if name_offset
-                .checked_add(name_bytes)
-                .is_none_or(|end| end > byte_len)
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "legacy directory enumeration returned a truncated file name",
-                ));
-            }
+            let (name_units, next_offset) = directory_record_layout(
+                offset,
+                byte_len,
+                size_of::<FILE_ID_BOTH_DIR_INFO>(),
+                std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName),
+                record.FileNameLength,
+                record.NextEntryOffset,
+                "legacy directory enumeration",
+            )?;
             // SAFETY: the name bounds and two-byte alignment were checked.
-            let name_slice = unsafe {
-                std::slice::from_raw_parts(record.FileName.as_ptr(), name_bytes / size_of::<u16>())
-            };
+            let name_slice =
+                unsafe { std::slice::from_raw_parts(record.FileName.as_ptr(), name_units) };
             let name = OsString::from_wide(name_slice);
-            if name != "." && name != ".." {
+            if validate_child_name(&name)? {
                 // FAT/exFAT do not support reparse points. Preserving the
                 // attribute classification still fails safely if a third-
                 // party driver returns one through this legacy class.
@@ -454,25 +422,90 @@ fn enumerate_directory_legacy(
                     },
                 });
             }
-            if record.NextEntryOffset == 0 {
+            let Some(next_offset) = next_offset else {
                 break;
-            }
-            let next = usize::try_from(record.NextEntryOffset)
-                .map_err(|_| io::Error::other("directory record offset is too large"))?;
-            if next < size_of::<FILE_ID_BOTH_DIR_INFO>()
-                || offset
-                    .checked_add(next)
-                    .is_none_or(|value| value >= byte_len)
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "legacy directory enumeration returned an invalid record offset",
-                ));
-            }
-            offset += next;
+            };
+            offset = next_offset;
         }
     }
     Ok(entries)
+}
+
+/// Validates record-local lengths before a variable-length name is observed.
+/// A provider-supplied name must never reach into the next record, even when
+/// the complete enumeration buffer is large enough to make such a slice safe.
+fn directory_record_layout(
+    offset: usize,
+    buffer_len: usize,
+    fixed_size: usize,
+    name_field_offset: usize,
+    name_bytes: u32,
+    next_entry_offset: u32,
+    context: &str,
+) -> io::Result<(usize, Option<usize>)> {
+    let name_bytes = usize::try_from(name_bytes)
+        .map_err(|_| io::Error::other("file name length does not fit address space"))?;
+    if name_bytes % size_of::<u16>() != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{context} returned an odd UTF-16 byte length"),
+        ));
+    }
+
+    let next_offset = if next_entry_offset == 0 {
+        None
+    } else {
+        let next = usize::try_from(next_entry_offset)
+            .map_err(|_| io::Error::other("directory record offset is too large"))?;
+        let absolute = offset.checked_add(next);
+        if next < fixed_size
+            || !next.is_multiple_of(size_of::<u64>())
+            || absolute.is_none_or(|value| value >= buffer_len)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{context} returned an invalid record offset"),
+            ));
+        }
+        absolute
+    };
+    let record_end = next_offset.unwrap_or(buffer_len);
+    let name_offset = offset
+        .checked_add(name_field_offset)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "file name offset overflow"))?;
+    if name_offset
+        .checked_add(name_bytes)
+        .is_none_or(|end| end > record_end)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{context} returned a file name outside its record"),
+        ));
+    }
+    Ok((name_bytes / size_of::<u16>(), next_offset))
+}
+
+/// Accept only one literal child component. This is defense in depth around
+/// filesystem/redirector output: a malformed name must not turn `join` into a
+/// path outside the directory handle that produced it.
+fn validate_child_name(name: &OsStr) -> io::Result<bool> {
+    if name == "." || name == ".." {
+        return Ok(false);
+    }
+    if name.encode_wide().any(|unit| unit == 0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "directory enumeration returned a name containing NUL",
+        ));
+    }
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(component)), None) if component == name => Ok(true),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "directory enumeration returned a non-child name",
+        )),
+    }
 }
 
 fn identity_from_file(file: &File) -> io::Result<FileIdentity> {
@@ -544,9 +577,14 @@ fn nonnegative_u64(value: i64, message: &'static str) -> io::Result<u64> {
 /// Re-exports the last Win32 error for focused wrapper tests.
 #[cfg(test)]
 mod tests {
-    use super::{ObjectKind, enumerate_directory, metadata_at, unsupported_information_class};
+    use super::{
+        ObjectKind, directory_record_layout, enumerate_directory, metadata_at,
+        unsupported_information_class, validate_child_name,
+    };
+    use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::io;
+    use std::os::windows::ffi::OsStringExt;
 
     #[test]
     fn enumerates_only_inside_system_temp_sandbox() {
@@ -581,5 +619,22 @@ mod tests {
         assert!(!unsupported_information_class(
             &io::Error::from_raw_os_error(5)
         ));
+    }
+
+    #[test]
+    fn provider_names_and_record_lengths_cannot_escape_their_record() {
+        assert_eq!(
+            validate_child_name(OsStr::new("ordinary.txt")).ok(),
+            Some(true)
+        );
+        assert_eq!(validate_child_name(OsStr::new(".")).ok(), Some(false));
+        for invalid in [r"\escape", r"..\escape", r"C:escape", "two/parts"] {
+            assert!(validate_child_name(OsStr::new(invalid)).is_err());
+        }
+        assert!(validate_child_name(&OsString::from_wide(&[u16::from(b'a'), 0])).is_err());
+
+        assert!(directory_record_layout(0, 256, 64, 60, 2, 64, "test").is_ok());
+        assert!(directory_record_layout(0, 256, 64, 60, 6, 64, "test").is_err());
+        assert!(directory_record_layout(0, 256, 64, 60, 2, 65, "test").is_err());
     }
 }

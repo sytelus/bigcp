@@ -14,5 +14,8 @@ explicit remote-copy acceptance without changing local discovery or transport.
 ADR 0038 unifies report and journal-compaction publication behind unique,
 synchronized, atomic siblings. ADR 0039 makes native/provider parsing and the
 testkit path boundary explicitly fail closed on malformed or rooted input.
+ADR 0040 extends those guarantees to record-local directory names, disjoint
+audit-artifact roles, exact concurrent-buffer accounting, and streaming
+journal replay.
 
 The index is filename ordered. `docs/MAINTENANCE.md` maps decisions to code and release checks.

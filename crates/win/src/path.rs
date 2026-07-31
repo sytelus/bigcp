@@ -35,6 +35,12 @@ const EXTENDED_UNC_PREFIX: &[u16] = &[
 /// This function deliberately does not follow reparse points. Root identity is
 /// established separately by opening the path and calling final_path.
 pub fn absolute_extended(path: &Path) -> io::Result<PathBuf> {
+    if path.as_os_str().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path must not be empty",
+        ));
+    }
     let input = wide_null(path.as_os_str())?;
     // SAFETY: input is nul-terminated and remains alive for both calls. A null
     // output with length zero is the documented size query.
@@ -50,7 +56,9 @@ pub fn absolute_extended(path: &Path) -> io::Result<PathBuf> {
         return Err(last_error());
     }
 
-    let mut buffer = vec![0_u16; required as usize];
+    let required_usize = usize::try_from(required)
+        .map_err(|_| io::Error::other("absolute path length exceeds address space"))?;
+    let mut buffer = vec![0_u16; required_usize];
     // SAFETY: buffer has the size returned by the preceding API call; all
     // pointers remain valid for the duration of the call.
     let written = unsafe {
@@ -64,7 +72,15 @@ pub fn absolute_extended(path: &Path) -> io::Result<PathBuf> {
     if written == 0 {
         return Err(last_error());
     }
-    buffer.truncate(written as usize);
+    let written_usize = usize::try_from(written)
+        .map_err(|_| io::Error::other("absolute path length exceeds address space"))?;
+    if written_usize >= buffer.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "absolute path changed while it was being resolved",
+        ));
+    }
+    buffer.truncate(written_usize);
 
     if starts_with_ascii_case_insensitive(&buffer, EXTENDED_UNC_PREFIX) {
         buffer = canonicalize_wsl_server(buffer);
@@ -109,8 +125,14 @@ pub fn final_path(file: &File) -> io::Result<PathBuf> {
     };
     let written_usize = usize::try_from(written)
         .map_err(|_| io::Error::other("final path length exceeds address space"))?;
-    if written == 0 || written_usize >= buffer.len() {
+    if written == 0 {
         return Err(last_error());
+    }
+    if written_usize >= buffer.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "final path exceeded the buffer size reported by Windows",
+        ));
     }
     buffer.truncate(written_usize);
     buffer = canonicalize_wsl_server(buffer);
@@ -163,10 +185,15 @@ pub fn ordinal_case_key(name: &OsStr) -> io::Result<Vec<u16>> {
     if written == 0 {
         return Err(last_error());
     }
-    mapped.truncate(
-        usize::try_from(written)
-            .map_err(|_| io::Error::other("case mapping result was negative"))?,
-    );
+    let written_usize = usize::try_from(written)
+        .map_err(|_| io::Error::other("case mapping result was negative"))?;
+    if written_usize > mapped.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "case mapping exceeded the buffer size reported by Windows",
+        ));
+    }
+    mapped.truncate(written_usize);
     Ok(mapped)
 }
 
@@ -335,6 +362,11 @@ mod tests {
             absolute_extended(Path::new(r"\\WSL.LOCALHOST\Ubuntu\home")).ok(),
             Some(Path::new(r"\\?\UNC\wsl.localhost\Ubuntu\home").to_path_buf())
         );
+    }
+
+    #[test]
+    fn empty_paths_are_rejected_instead_of_resolving_to_the_working_directory() {
+        assert!(absolute_extended(Path::new("")).is_err());
     }
 
     #[test]

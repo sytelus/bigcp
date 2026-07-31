@@ -10,6 +10,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, Write};
 use std::mem::size_of;
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsRawHandle, IntoRawHandle};
 use std::path::{Path, PathBuf};
@@ -659,9 +660,7 @@ pub(crate) fn rename_by_handle(
     replace: bool,
     posix_unlink_rename: bool,
 ) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
-    let name: Vec<u16> = final_path.as_os_str().encode_wide().collect();
+    let name = rename_name(final_path)?;
     let name_bytes = name
         .len()
         .checked_mul(size_of::<u16>())
@@ -723,6 +722,17 @@ pub(crate) fn rename_by_handle(
     }
 }
 
+fn rename_name(path: &Path) -> io::Result<Vec<u16>> {
+    let name: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if name.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "rename path contains NUL",
+        ));
+    }
+    Ok(name)
+}
+
 fn unsupported_rename_class(error: &io::Error) -> bool {
     matches!(
         error.raw_os_error(),
@@ -771,11 +781,14 @@ fn size_u32<T>() -> io::Result<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DestinationTemp, SourceFile, unsupported_rename_class};
+    use super::{DestinationTemp, SourceFile, rename_name, unsupported_rename_class};
     use crate::metadata::BasicMetadata;
+    use std::ffi::OsString;
     use std::fs;
     use std::io::{Read, Write};
+    use std::os::windows::ffi::OsStringExt;
     use std::os::windows::fs::symlink_file;
+    use std::path::PathBuf;
 
     #[test]
     fn legacy_rename_fallback_does_not_hide_real_io_errors() {
@@ -787,6 +800,19 @@ mod tests {
         assert!(!unsupported_rename_class(
             &std::io::Error::from_raw_os_error(5)
         ));
+    }
+
+    #[test]
+    fn handle_rename_rejects_embedded_nul_before_calling_windows() {
+        let path = PathBuf::from(OsString::from_wide(&[
+            u16::from(b'C'),
+            u16::from(b':'),
+            u16::from(b'\\'),
+            u16::from(b'a'),
+            0,
+            u16::from(b'b'),
+        ]));
+        assert!(rename_name(&path).is_err());
     }
 
     #[test]

@@ -40,8 +40,11 @@ by the governing plan.
   local-device IOCTLs, static bounded redirector profiles, WSL exact-name and
   basic-metadata projection, combined startup acceptance, and redirector-loss
   breaker mapping without changing the local transport/profile path.
-- Fail-closed Win32/provider parsing for returned lengths, sparse-range order,
-  reparse framing, stream suffix containment, and embedded-NUL path input.
+- Fail-closed Win32/provider parsing for returned lengths, record-local child
+  names, sparse-range order, reparse framing, stream suffix containment, and
+  embedded-NUL path input.
+- Disjoint resolved log/report/state/journal roles, streaming journal replay,
+  and exact standard-path concurrent-buffer accounting for `mem` overrides.
 
 ## Release-blocking evidence still required
 
@@ -51,8 +54,8 @@ lifespan-reducing writes, no machine-stability impact — see PLAN §12.0):
 - Sans-I/O and injected-fault coverage for every completion and Win32 fault
   site, exhaustive **deterministic kill-point simulation**, and bounded
   (minutes-scale) real-process chaos passes.
-- **Bounded** workloads (W1s/W2s-class), differential OS-copy comparison, and
-  topology-matched performance runs on scratch-designated storage;
+- **Bounded** workloads (W1s/W2s-class) and topology-matched performance runs
+  on scratch-designated storage;
   million-entry behavior via synthetic enumeration simulation, never real trees.
 - The same-spindle HDD `[HW]` cell remains required before claiming a measured
   speedup or universal optimality for the new 256 MiB default.
@@ -86,4 +89,4 @@ release pass.
 
 No release process may reinterpret an unrun gate as a pass.
 `TESTING_SUMMARY.md` records dated evidence; intentional differences from
-the governing plan are recorded inline in PLAN.md and in ADRs 0027–0039.
+the governing plan are recorded inline in PLAN.md and in ADRs 0027–0040.

@@ -166,76 +166,66 @@ impl Journal {
             let mut reader = BufReader::new(
                 File::open(&path).map_err(|error| BigcpError::io("open journal", error))?,
             );
-            // Collect complete lines first so a bad record can be classified:
-            // only the *final* line may be a torn tail (append-only writes);
-            // an interior bad record is skipped without truncation.
-            let mut lines: Vec<(String, u64)> = Vec::new();
+            // One-record lookahead distinguishes a torn final append from an
+            // invalid interior record without retaining the complete journal
+            // in memory. Clean-run compaction bounds history in normal use;
+            // this also keeps interrupted-run replay O(one record).
+            let mut pending: Option<(String, u64)> = None;
             loop {
                 let mut line = String::new();
                 match reader.read_line(&mut line) {
-                    Ok(0) => break,
-                    Ok(bytes) => lines.push((line, bytes as u64)),
-                    Err(_) => {
-                        torn_tail = true;
-                        break;
-                    }
-                }
-            }
-            let count = lines.len();
-            for (index, (raw, bytes)) in lines.into_iter().enumerate() {
-                let is_last = index + 1 == count && !torn_tail;
-                let line = raw.trim_end_matches(['\r', '\n']);
-                let parsed = serde_json::from_str::<StoredRecord>(line)
-                    .ok()
-                    .filter(|stored| crc_matches(stored).unwrap_or(false));
-                let Some(stored) = parsed else {
-                    if is_last {
-                        // Genuine torn tail: truncate to the last good record.
-                        torn_tail = true;
-                        break;
-                    }
-                    skipped_records = skipped_records.saturating_add(1);
-                    valid_length = valid_length.saturating_add(bytes);
-                    continue;
-                };
-                if stored.j != 1 {
-                    return Err(BigcpError::Format(format!(
-                        "unsupported journal version {}; this build supports 1",
-                        stored.j
-                    )));
-                }
-                match stored.event {
-                    JournalEvent::Job {
-                        source,
-                        destination,
-                        options_hash,
-                        ..
-                    } => {
-                        let signature = JobSignature {
-                            source,
-                            destination,
-                            options_hash,
-                        };
-                        if active_job
-                            .as_ref()
-                            .is_some_and(|current| current != &signature)
-                        {
-                            resumable.clear();
+                    Ok(0) => {
+                        if let Some((raw, bytes)) = pending.take() {
+                            if apply_loaded_line(
+                                &raw,
+                                true,
+                                &mut resumable,
+                                &mut active_job,
+                                &mut skipped_records,
+                            )? {
+                                valid_length = valid_length.saturating_add(bytes);
+                            } else {
+                                torn_tail = true;
+                            }
                         }
-                        active_job = Some(signature);
+                        break;
                     }
-                    JournalEvent::Checkpoint(checkpoint) => {
-                        resumable.insert(
-                            (checkpoint.relative_path.clone(), checkpoint.stream.clone()),
-                            checkpoint,
-                        );
+                    Ok(bytes) => {
+                        let bytes = u64::try_from(bytes).map_err(|_| {
+                            BigcpError::Format(
+                                "journal record length exceeds address space".to_owned(),
+                            )
+                        })?;
+                        if let Some((raw, previous_bytes)) = pending.replace((line, bytes)) {
+                            let retained = apply_loaded_line(
+                                &raw,
+                                false,
+                                &mut resumable,
+                                &mut active_job,
+                                &mut skipped_records,
+                            )?;
+                            debug_assert!(retained, "an interior record is always retained");
+                            valid_length = valid_length.saturating_add(previous_bytes);
+                        }
                     }
-                    JournalEvent::PartDone { relative_path } => {
-                        resumable.retain(|(path, _), _| path != &relative_path);
+                    Err(_) => {
+                        // A read error makes the prior complete line interior;
+                        // only unread bytes after it are discarded.
+                        if let Some((raw, bytes)) = pending.take() {
+                            let retained = apply_loaded_line(
+                                &raw,
+                                false,
+                                &mut resumable,
+                                &mut active_job,
+                                &mut skipped_records,
+                            )?;
+                            debug_assert!(retained, "an interior record is always retained");
+                            valid_length = valid_length.saturating_add(bytes);
+                        }
+                        torn_tail = true;
+                        break;
                     }
-                    JournalEvent::End { .. } => {}
                 }
-                valid_length = valid_length.saturating_add(bytes);
             }
         }
 
@@ -412,6 +402,67 @@ impl Journal {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// Applies one complete record. `false` means the final record was invalid and
+/// must be truncated; invalid interior records are counted and retained so a
+/// newer additive format cannot destroy later valid checkpoints.
+fn apply_loaded_line(
+    raw: &str,
+    is_last: bool,
+    resumable: &mut BTreeMap<(String, String), Checkpoint>,
+    active_job: &mut Option<JobSignature>,
+    skipped_records: &mut u64,
+) -> Result<bool, BigcpError> {
+    let line = raw.trim_end_matches(['\r', '\n']);
+    let parsed = serde_json::from_str::<StoredRecord>(line)
+        .ok()
+        .filter(|stored| crc_matches(stored).unwrap_or(false));
+    let Some(stored) = parsed else {
+        if is_last {
+            return Ok(false);
+        }
+        *skipped_records = skipped_records.saturating_add(1);
+        return Ok(true);
+    };
+    if stored.j != 1 {
+        return Err(BigcpError::Format(format!(
+            "unsupported journal version {}; this build supports 1",
+            stored.j
+        )));
+    }
+    match stored.event {
+        JournalEvent::Job {
+            source,
+            destination,
+            options_hash,
+            ..
+        } => {
+            let signature = JobSignature {
+                source,
+                destination,
+                options_hash,
+            };
+            if active_job
+                .as_ref()
+                .is_some_and(|current| current != &signature)
+            {
+                resumable.clear();
+            }
+            *active_job = Some(signature);
+        }
+        JournalEvent::Checkpoint(checkpoint) => {
+            resumable.insert(
+                (checkpoint.relative_path.clone(), checkpoint.stream.clone()),
+                checkpoint,
+            );
+        }
+        JournalEvent::PartDone { relative_path } => {
+            resumable.retain(|(path, _), _| path != &relative_path);
+        }
+        JournalEvent::End { .. } => {}
+    }
+    Ok(true)
 }
 
 /// Serializes one CRC-framed journal line (shared by append and compaction).

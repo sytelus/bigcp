@@ -202,11 +202,13 @@ Fault-site injection, exhaustive deterministic kill-point simulation plus
 bounded real-process chaos passes, emitted-instance schema validation,
 synthetic-enumeration scale simulation, and real-hardware throughput gates
 within bounded write budgets require dedicated work and hardware. They are
-release-blocking before a 1.0 claim and run only on explicit owner request;
-the elevated NTFS/ReFS/FAT32/exFAT VHDX matrix, the approved generic-UNC/
-mapped-drive/WSL destination matrix, and differential OS-copy comparisons are
-  post-v1/matrix-certification evidence under ADRs 0029/0035/0037.
-See PLAN §12.10, §13.2, and `BENCHMARKS.md`.
-Hours-long
-soaks, million-entry real trees, and forced-disconnect tests are not deferred —
-they are prohibited (VISION) and will never run.
+release-blocking before a 1.0 claim and run only on explicit owner request.
+
+By owner decision, the elevated NTFS/ReFS/FAT32/exFAT VHDX matrix, approved
+generic-UNC/mapped-drive/WSL destination matrix, and differential OS-copy
+comparisons are post-v1 or matrix-certification evidence under ADRs
+0029/0035/0037; they are not silently promoted back into the v1 gate. See PLAN
+§12.10, §13.2, and `BENCHMARKS.md`.
+
+Hours-long soaks, million-entry real trees, and forced-disconnect tests are not
+deferred: they are prohibited by VISION and will never run.

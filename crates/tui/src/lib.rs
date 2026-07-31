@@ -58,12 +58,12 @@ impl RunObserver for PlainObserver {
             return;
         }
         println!(
-            "state={:?} discovered={} copied={} replaced={} skipped={} failed={} read={} written={} {}",
+            "state={:?} discovered={} copied={} replaced={} {} failed={} read={} written={} {}",
             snapshot.state,
             snapshot.counters.files_discovered,
             snapshot.counters.copied_new,
             snapshot.counters.copied_replaced,
-            snapshot.counters.skipped_same,
+            skipped_counts(&snapshot.counters),
             snapshot.counters.failed,
             snapshot.counters.bytes_read_source,
             snapshot.counters.bytes_written_destination,
@@ -175,10 +175,10 @@ pub fn print_report_summary(report: &RunReport) {
         );
     }
     println!(
-        "copied={} replaced={} skipped={} meta-fixed={} failed={} extras={}",
+        "copied={} replaced={} {} meta-fixed={} failed={} extras={}",
         report.counters.copied_new,
         report.counters.copied_replaced,
-        report.counters.skipped_same,
+        skipped_counts(&report.counters),
         report.counters.meta_fixed,
         report.counters.failed,
         report.counters.extra
@@ -197,6 +197,13 @@ pub fn print_report_summary(report: &RunReport) {
         report.integrity,
         report.run.log_path.display()
     );
+}
+
+fn skipped_counts(counters: &bigcp_core::Counters) -> String {
+    format!(
+        "skipped-same={} skipped-different={}",
+        counters.skipped_same, counters.skipped_diff
+    )
 }
 
 fn dashboard_loop(
@@ -585,7 +592,7 @@ pub const fn product_name() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{LIVE_TABS, LiveState, draw_live};
+    use super::{LIVE_TABS, LiveState, draw_live, skipped_counts};
     use bigcp_core::{Counters, RunSnapshot, RunState};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -650,5 +657,18 @@ mod tests {
         // Nothing outstanding: suppressed again.
         snapshot.counters.bytes_logical_discovered = snapshot.counters.bytes_enumerated;
         assert_eq!(super::eta_line(&snapshot), "ETA: —");
+    }
+
+    #[test]
+    fn plain_summary_distinguishes_identical_and_withheld_files() {
+        let counters = Counters {
+            skipped_same: 2,
+            skipped_diff: 3,
+            ..Counters::default()
+        };
+        assert_eq!(
+            skipped_counts(&counters),
+            "skipped-same=2 skipped-different=3"
+        );
     }
 }

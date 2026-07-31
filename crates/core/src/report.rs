@@ -285,7 +285,10 @@ mod tests {
             let parsed = serde_json::from_str::<serde_json::Value>(schema);
             assert!(parsed.is_ok());
             assert!(parsed.ok().is_some_and(|value| {
-                value.get("$schema").is_some() && value.get("$id").is_some()
+                value.get("$schema").is_some()
+                    && value["$id"]
+                        .as_str()
+                        .is_some_and(|id| id.starts_with("https://github.com/sytelus/bigcp/"))
             }));
         }
     }

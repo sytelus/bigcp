@@ -133,8 +133,10 @@ uses provider-returned volume data and immutable generic-UNC/WSL profiles;
 remote sources cap the composed worker count. Static profiles choose per-side
 chunk size and small-file workers. Intersecting local disk extents plus
 rotational classification select one phased worker and a bounded same-spindle
-burst; SSD overlap stays on the standard path. Manual values are range checked;
-the memory override caps chunks, threshold-sized workers, and the burst. All
+burst; SSD overlap stays on the standard path. Manual values are range checked.
+On standard transport the memory override reserves the concurrently live
+coordinator chunk before capping threshold-sized workers; on same-spindle
+transport the drain-before-inline rule permits one direct burst cap. All
 effective transport facts are reported.
 
 The directory join avoids a destination `stat` per source file. Stream and EA

@@ -2913,20 +2913,23 @@ fn audit_paths(
             .unwrap_or(&state_dir.join(format!("run-{run_stub}.report.json"))),
     )
     .map_err(|error| BigcpError::io("normalize report path", error))?;
-    for (label, path) in [
-        ("state directory", &state_dir),
-        ("log", &log_path),
-        ("report", &report_path),
+    let resolved_state = prospective_final_path(&state_dir)?;
+    let resolved_log = prospective_final_path(&log_path)?;
+    let resolved_report = prospective_final_path(&report_path)?;
+    validate_audit_layout(&resolved_state, &resolved_log, &resolved_report)?;
+    for (label, resolved) in [
+        ("state directory", &resolved_state),
+        ("log", &resolved_log),
+        ("report", &resolved_report),
     ] {
-        let resolved = prospective_final_path(path)?;
         if is_same_or_descendant_with(
-            &resolved,
+            resolved,
             source,
             classify_endpoint(source).names_are_case_sensitive(),
         )
         .map_err(|error| BigcpError::io("validate audit path", error))?
             || is_same_or_descendant_with(
-                &resolved,
+                resolved,
                 destination,
                 classify_endpoint(destination).names_are_case_sensitive(),
             )
@@ -2938,6 +2941,51 @@ fn audit_paths(
         }
     }
     Ok((state_dir, log_path, report_path))
+}
+
+/// Keeps the three durable artifact roles disjoint. Log/report files may live
+/// inside the state directory (the defaults do), but neither may replace its
+/// container, its journal, the other artifact, or an ancestor of the state
+/// directory. These checks run on paths resolved through their nearest
+/// existing ancestors, so aliases cannot bypass them.
+fn validate_audit_layout(state: &Path, log: &Path, report: &Path) -> Result<(), BigcpError> {
+    if resolved_paths_equal(log, report)? {
+        return Err(BigcpError::Invalid(
+            "log and report paths must be distinct".to_owned(),
+        ));
+    }
+    let journal = state.join("journal.jsonl");
+    for (label, artifact) in [("log", log), ("report", report)] {
+        if resolved_paths_equal(artifact, state)? {
+            return Err(BigcpError::Invalid(format!(
+                "{label} path may not replace the state directory"
+            )));
+        }
+        if resolved_paths_equal(artifact, &journal)? {
+            return Err(BigcpError::Invalid(format!(
+                "{label} path may not replace the checkpoint journal"
+            )));
+        }
+        let case_sensitive = classify_endpoint(state).names_are_case_sensitive()
+            || classify_endpoint(artifact).names_are_case_sensitive();
+        if is_same_or_descendant_with(state, artifact, case_sensitive)
+            .map_err(|error| BigcpError::io("validate audit artifact layout", error))?
+        {
+            return Err(BigcpError::Invalid(format!(
+                "{label} path may not be an ancestor of the state directory"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn resolved_paths_equal(left: &Path, right: &Path) -> Result<bool, BigcpError> {
+    let case_sensitive = classify_endpoint(left).names_are_case_sensitive()
+        || classify_endpoint(right).names_are_case_sensitive();
+    Ok(comparison_key(left.as_os_str(), case_sensitive)
+        .map_err(|error| BigcpError::io("compare audit artifact paths", error))?
+        == comparison_key(right.as_os_str(), case_sensitive)
+            .map_err(|error| BigcpError::io("compare audit artifact paths", error))?)
 }
 
 fn prospective_final_path(path: &Path) -> Result<PathBuf, BigcpError> {
@@ -3340,7 +3388,7 @@ fn revalidate_destination(
 mod tests {
     use std::path::Path;
 
-    use super::{completed_exit, path_hash, summarize_phases};
+    use super::{completed_exit, path_hash, summarize_phases, validate_audit_layout};
     use crate::model::Counters;
     use crate::report::VerificationSummary;
     use crate::stats::TimelinePoint;
@@ -3403,6 +3451,17 @@ mod tests {
         let lower = path_hash(Path::new(r"\\?\c:\copytarget"));
         assert!(upper.is_ok());
         assert_eq!(upper.ok(), lower.ok());
+    }
+
+    #[test]
+    fn audit_artifact_roles_cannot_collide() {
+        let state = Path::new(r"\\?\C:\safe\state");
+        let log = state.join("run.log.jsonl");
+        let report = state.join("run.report.json");
+        assert!(validate_audit_layout(state, &log, &report).is_ok());
+        assert!(validate_audit_layout(state, &log, &log).is_err());
+        assert!(validate_audit_layout(state, &log, &state.join("journal.jsonl")).is_err());
+        assert!(validate_audit_layout(state, Path::new(r"\\?\C:\safe"), &report).is_err());
     }
 
     #[test]

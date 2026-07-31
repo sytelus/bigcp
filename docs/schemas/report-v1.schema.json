@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/shitals/bigcp/docs/schemas/report-v1.schema.json",
+  "$id": "https://github.com/sytelus/bigcp/docs/schemas/report-v1.schema.json",
   "title": "bigcp run report v1",
   "type": "object",
   "required": [

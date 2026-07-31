@@ -127,7 +127,7 @@ xxh3-128 digest agrees.
 | `--profile CLASS[,CLASS]` | Force static source/destination device classes. |
 | `--tune key=value,...` | Override bounded advanced settings. |
 | `--analyze` | Collect bounded live-run insight (size-class timings, top-20 slowest copies, finer stat samples) into the log and report. |
-| `--state-dir`, `--log`, `--report` | Select audit locations outside both trees. |
+| `--state-dir`, `--log`, `--report` | Select distinct audit locations outside both trees; log/report cannot replace the state directory or journal. |
 | `--plain`, `--quiet`, `--no-color` | Select noninteractive output behavior. |
 
 Accepted profile classes are `auto`, `nvme`, `sata-ssd`, `usb-ssd`, `hdd`, and
@@ -138,10 +138,12 @@ no stream-count or queue-depth keys: large files stream through one strictly
 sequential coordinator path, so those settings would not describe real work.
 Manual bounds are enforced in the core library as well as the CLI: workers are
 `1..=256`, chunks `64 KiB..=64 MiB`, and thresholds
-must be positive. A `mem` budget must hold at least one large-threshold buffer
-and caps both chunk size and threshold-sized workers. The same-spindle burst
-defaults to 256 MiB, is capped by `mem`, and accepts a 1 MiB–1 GiB override
-that must still hold one effective small-file buffer and one request chunk.
+must be positive. On the standard path, a `mem` budget reserves one coordinator
+chunk and must also hold at least one large-threshold worker buffer; remaining
+bytes cap the worker count. The same-spindle path serializes coordinator and
+worker I/O, so its 256 MiB burst is instead capped directly by `mem`; a
+1 MiB–1 GiB override must be at least the larger of the effective chunk and
+small-file threshold.
 The phased scheduler requires one worker, so a same-spindle run rejects an
 explicit `threads` value other than `1` instead of silently defeating the
 topology policy.

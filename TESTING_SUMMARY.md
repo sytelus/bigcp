@@ -2,6 +2,51 @@
 
 Latest review: 2026-07-31
 
+## 2026-07-31 second repository review and structural-boundary hardening
+
+The follow-up whole-tree review fixed four correctness/resource issues and one
+reporting defect: native directory names and lengths are now confined to one
+record and one child component; resolved log/report/state/journal roles cannot
+collide; the standard-path `mem` override reserves the coordinator chunk that
+can coexist with worker buffers; journal replay retains one record instead of
+the complete history; and plain output distinguishes identical skips from
+different files withheld by `--replace=false`. Win32 sizing results, empty
+paths, and handle-rename NUL input now fail closed. Workspace package metadata
+and public schema IDs consistently use the canonical `sytelus/bigcp` URL.
+
+All 126 bounded workspace tests passed with zero failures: 8 CLI, 44 core unit,
+16 core end-to-end, 9 testkit safety, 3 TUI, and 46 Windows-boundary tests. The
+final serial run used this newly created system-temporary root:
+
+`C:\Users\shitals\AppData\Local\Temp\bigcp-review-79bfeaac447b41c988fbdfa523cc08df`
+
+New regression coverage pins record-local provider names, empty input paths,
+embedded-NUL handle rename, audit-role collision before destination creation,
+concurrent-buffer accounting, canonical schema IDs, and truthful skipped-file
+output. Existing journal tests revalidated every-byte truncation, invalid
+interior records, compaction, and checkpoint identity after the streaming-load
+refactor.
+
+Formatting, warning-denied workspace/all-target Clippy, warning-denied rustdoc,
+the locked optimized workspace build, frozen-input and test-storage safety
+scripts, `cargo-deny`, and `cargo-audit` all passed. Cargo metadata confirmed
+the canonical repository URL on all five packages. Cargo-deny reported only
+the allowed duplicate-version warnings for `hashbrown` and `syn`; RustSec found
+no vulnerability among 146 locked dependencies. No heavy, physical-drive,
+remote-write, VHDX, performance, stress, large-scale, endurance, or
+forced-disconnect test ran.
+
+The optimized binaries then ran a bounded local NTFS smoke workflow under:
+
+`C:\Users\shitals\AppData\Local\Temp\bigcp-review-smoke-a9432b812b084d0b964207dfcc8c5860`
+
+The testkit generated 3 directories, 5 files, and 78,848 bytes. Copy plus
+same-run verification passed all five files; rerun classified all five as
+identical; standalone verification passed all nine objects; the independent
+oracle reported zero mismatches/extras; and the saved report reopened through
+the release CLI. The root remains as auditable evidence and was not broadly or
+recursively cleaned up.
+
 ## 2026-07-31 full repository review and boundary hardening
 
 The owner-authorized full review covered the workspace architecture, copy and

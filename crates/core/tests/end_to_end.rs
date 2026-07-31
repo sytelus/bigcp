@@ -389,6 +389,33 @@ fn unsafe_audit_path_is_rejected_before_destination_creation()
 }
 
 #[test]
+fn colliding_audit_roles_are_rejected_before_destination_creation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let allowed_temp = validated_system_temp()?;
+    let lease = tempfile::Builder::new()
+        .prefix("bigcp-audit-collision-")
+        .tempdir_in(allowed_temp)?;
+    let sandbox = initialize_empty(lease.path())?;
+    let source = sandbox.child(Path::new("source"))?;
+    let destination = sandbox.child(Path::new("destination"))?;
+    let state = sandbox.child(Path::new("state"))?;
+    let shared_artifact = sandbox.child(Path::new("shared-audit.json"))?;
+    fs::create_dir(&source)?;
+    fs::write(source.join("fixture.txt"), b"bounded fixture")?;
+
+    let mut options = CopyOptions::new(source, destination.clone());
+    options.state_dir = Some(state.clone());
+    options.log_path = Some(shared_artifact.clone());
+    options.report_path = Some(shared_artifact.clone());
+    let result = run_copy(&options, &SilentObserver);
+    assert!(result.is_err_and(|error| error.to_string().contains("must be distinct")));
+    assert!(!destination.exists());
+    assert!(!state.exists());
+    assert!(!shared_artifact.exists());
+    Ok(())
+}
+
+#[test]
 fn report_fallback_and_terminal_audit_record_agree() -> Result<(), Box<dyn std::error::Error>> {
     let sandbox = SandboxRoot::create_system_temp("report-fallback")?;
     let source = sandbox.child(Path::new("source"))?;

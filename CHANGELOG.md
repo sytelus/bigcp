@@ -36,6 +36,14 @@ versioning once its 1.0 release gates are complete.
 
 ### Changed
 
+- 2026-07-31 second review: rejected provider child names and directory records
+  that cross structural boundaries; made path-sizing wrappers and handle rename
+  inputs fail closed; prohibited collisions among resolved log, report, state,
+  and journal roles; made `mem` account for concurrently live standard-path
+  buffers; changed journal loading from whole-history collection to one-record
+  lookahead; and made plain summaries distinguish identical skips from
+  differing files withheld by `--replace=false`. Canonical repository metadata
+  now consistently names `sytelus/bigcp` across packages and public schemas.
 - Kept the local hot paths intact while separating filesystem, endpoint, and
   physical-device policy. WSL and unknown remote providers use explicit
   content/last-write projection; remote destinations skip local-volume dense
@@ -390,6 +398,9 @@ versioning once its 1.0 release gates are complete.
 
 ### Known pre-1.0 work
 
-- IOCP/no-buffering engine and its sans-I/O model, comprehensive fault/chaos
-  harness, elevated filesystem matrix, differential copier, and performance
-  evidence remain release gates. See `PLAN_DEVIATIONS.md`.
+- Deterministic fault/kill simulation, bounded chaos/adversarial validation,
+  emitted-instance schema validation, the huge-directory bounded fallback, and
+  certified hardware/performance evidence remain v1 gates. Elevated filesystem
+  and remote-destination matrices plus differential copier comparisons are
+  separately tracked post-v1 certification evidence. See PLAN §12.10/§13.2 and
+  `docs/PRODUCTION_READINESS.md`.

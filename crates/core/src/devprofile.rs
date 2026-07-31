@@ -10,6 +10,8 @@ use crate::transport::TransportProfile;
 const DEFAULT_SAME_SPINDLE_BURST_BYTES: usize = 256 * 1024 * 1024;
 const MIN_SAME_SPINDLE_BURST_BYTES: usize = 1024 * 1024;
 const MAX_SAME_SPINDLE_BURST_BYTES: usize = 1024 * 1024 * 1024;
+const MIN_CHUNK_BYTES: usize = 64 * 1024;
+const MAX_CHUNK_BYTES: usize = 64 * 1024 * 1024;
 
 /// One side's initial static settings.
 ///
@@ -65,20 +67,17 @@ pub fn select_copy_profile(
         source.workers = workers;
         destination.workers = workers;
     }
-    if let Some(memory_bytes) = tune.memory_bytes {
-        let large_threshold = tune.large_threshold.unwrap_or(16 * 1024 * 1024);
-        let large_threshold = usize::try_from(large_threshold).map_err(|_| {
+    let large_threshold = usize::try_from(tune.large_threshold.unwrap_or(16 * 1024 * 1024))
+        .map_err(|_| {
             BigcpError::Invalid("large-file threshold does not fit this address space".to_owned())
         })?;
-        if memory_bytes < large_threshold {
-            return Err(BigcpError::Invalid(format!(
-                "memory budget {memory_bytes} is smaller than the large-file threshold {large_threshold}"
-            )));
-        }
-        let budgeted_workers = (memory_bytes / large_threshold).clamp(1, 256);
-        source.workers = source.workers.min(budgeted_workers);
-        destination.workers = destination.workers.min(budgeted_workers);
-    }
+    let same_physical_disk = !source_info.disk_numbers.is_empty()
+        && source_info
+            .disk_numbers
+            .iter()
+            .any(|disk| destination_info.disk_numbers.contains(disk));
+    let same_spindle = same_physical_disk
+        && (source.class == DeviceClass::Hdd || destination.class == DeviceClass::Hdd);
     let mut chunk_bytes = tune
         .chunk_bytes
         .unwrap_or_else(|| source.chunk_bytes.min(destination.chunk_bytes));
@@ -94,18 +93,25 @@ pub fn select_copy_profile(
         }
     }
     if let Some(memory_bytes) = tune.memory_bytes {
-        chunk_bytes = chunk_bytes.min(memory_bytes);
+        let chunk_budget = if same_spindle {
+            memory_bytes
+        } else {
+            memory_bytes
+                .checked_sub(large_threshold)
+                .filter(|available| *available >= MIN_CHUNK_BYTES)
+                .ok_or_else(|| {
+                    BigcpError::Invalid(format!(
+                        "memory budget {memory_bytes} must hold one small-file buffer ({large_threshold}) and a minimum coordinator chunk ({MIN_CHUNK_BYTES})"
+                    ))
+                })?
+        };
+        chunk_bytes = chunk_bytes.min(chunk_budget);
     }
     if chunk_bytes == 0 {
         return Err(BigcpError::Invalid(
             "profile chunk size must be positive".to_owned(),
         ));
     }
-    let same_physical_disk = !source_info.disk_numbers.is_empty()
-        && source_info
-            .disk_numbers
-            .iter()
-            .any(|disk| destination_info.disk_numbers.contains(disk));
     // Small-file cost is destination-bound (creates, writes, closes all land
     // on the destination), so worker count follows the destination's row —
     // measured 2026-07-29: a min() composition let one low-confidence side
@@ -118,8 +124,22 @@ pub fn select_copy_profile(
     } else {
         destination.workers
     };
-    let same_spindle = same_physical_disk
-        && (source.class == DeviceClass::Hdd || destination.class == DeviceClass::Hdd);
+    if !same_spindle && let Some(memory_bytes) = tune.memory_bytes {
+        // Standard transport can run one coordinator-owned chunk transfer
+        // while small workers each hold one threshold-bounded file. Reserve
+        // that chunk before deriving the worker cap so `mem=` is an actual
+        // aggregate copy-buffer bound, not merely a per-allocation bound.
+        let worker_bytes = memory_bytes.saturating_sub(chunk_bytes);
+        if worker_bytes < large_threshold {
+            return Err(BigcpError::Invalid(format!(
+                "memory budget {memory_bytes} must hold one chunk ({chunk_bytes}) and one small-file buffer ({large_threshold})"
+            )));
+        }
+        let budgeted_workers = (worker_bytes / large_threshold).clamp(1, 256);
+        source.workers = source.workers.min(budgeted_workers);
+        destination.workers = destination.workers.min(budgeted_workers);
+        workers = workers.min(budgeted_workers);
+    }
     let transport = if same_spindle {
         if tune.threads.is_some_and(|workers| workers != 1) {
             return Err(BigcpError::Invalid(
@@ -127,12 +147,6 @@ pub fn select_copy_profile(
                     .to_owned(),
             ));
         }
-        let large_threshold = usize::try_from(tune.large_threshold.unwrap_or(16 * 1024 * 1024))
-            .map_err(|_| {
-                BigcpError::Invalid(
-                    "large-file threshold does not fit this address space".to_owned(),
-                )
-            })?;
         let mut burst_bytes = tune
             .same_spindle_burst_bytes
             .unwrap_or(DEFAULT_SAME_SPINDLE_BURST_BYTES);
@@ -164,8 +178,6 @@ pub fn select_copy_profile(
 }
 
 fn validate_tuning(tune: &TuneOptions) -> Result<(), BigcpError> {
-    const MIN_CHUNK_BYTES: usize = 64 * 1024;
-    const MAX_CHUNK_BYTES: usize = 64 * 1024 * 1024;
     if let Some(workers) = tune.threads
         && !(1..=256).contains(&workers)
     {
@@ -398,7 +410,46 @@ mod tests {
         );
         assert!(profile.is_ok());
         assert!(
-            profile.is_ok_and(|value| value.workers == 2 && value.chunk_bytes <= 8 * 1024 * 1024)
+            profile.is_ok_and(|value| value.workers == 1 && value.chunk_bytes <= 8 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn standard_memory_budget_reserves_the_concurrent_coordinator_chunk() {
+        let mut unlimited = nvme();
+        unlimited.maximum_transfer_length = None;
+        let bounded = TuneOptions {
+            chunk_bytes: Some(8 * 1024 * 1024),
+            memory_bytes: Some(8 * 1024 * 1024),
+            large_threshold: Some(4 * 1024 * 1024),
+            ..TuneOptions::default()
+        };
+        let profile = select_copy_profile(
+            &unlimited,
+            &unlimited,
+            DeviceClass::Auto,
+            DeviceClass::Auto,
+            &bounded,
+        );
+        assert!(
+            profile
+                .is_ok_and(|value| { value.chunk_bytes == 4 * 1024 * 1024 && value.workers == 1 })
+        );
+
+        let too_small = TuneOptions {
+            memory_bytes: Some(4 * 1024 * 1024),
+            large_threshold: Some(4 * 1024 * 1024),
+            ..TuneOptions::default()
+        };
+        assert!(
+            select_copy_profile(
+                &unlimited,
+                &unlimited,
+                DeviceClass::Auto,
+                DeviceClass::Auto,
+                &too_small,
+            )
+            .is_err_and(|error| error.to_string().contains("must hold"))
         );
     }
 
