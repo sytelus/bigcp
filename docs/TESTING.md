@@ -194,10 +194,15 @@ certification debt.
 
 ## Adding a test
 
-1. State its fresh-write ceiling in the test or scenario.
-2. Obtain the base with `validated_system_temp()` before creating anything.
-3. Create a unique child, initialize its marker, and resolve every path through
-   `SandboxRoot::child`.
+1. Pure parser/policy tests should not touch the filesystem. For a mutating
+   test, state its fresh-write ceiling in the test or scenario.
+2. Integration and testkit tests obtain the base with
+   `validated_system_temp()`, create a unique marked child, and resolve every
+   path through `SandboxRoot::child`.
+3. A crate-local Win32 wrapper test cannot depend on `bigcp-testkit` (that
+   would create a dependency cycle). It may use `tempfile::TempDir`, but every
+   path must derive from that owned directory. CI redirects `TEMP` and `TMP`
+   to its unique validated C: run root before executing any test.
 4. Snapshot or oracle-check the intended tree; assert no opaque temps remain
    after success.
 5. Do not reference any drive outside the system/code whitelist, physical

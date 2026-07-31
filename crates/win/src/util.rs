@@ -109,12 +109,45 @@ pub(crate) fn size_u32<T>() -> io::Result<u32> {
         .map_err(|_| io::Error::other("Win32 structure size does not fit u32"))
 }
 
+/// Performs one buffered read, retrying the non-terminal interruption signal.
+///
+/// `Read::read` leaves this retry to its caller. Keeping it at the shared file
+/// wrapper boundary makes every product data path consistent, including
+/// ordinary data, named streams, and checkpoint-prefix validation.
+pub(crate) fn read_retry_interrupted<R: io::Read + ?Sized>(
+    reader: &mut R,
+    buffer: &mut [u8],
+) -> io::Result<usize> {
+    loop {
+        match reader.read(buffer) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            result => return result,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::io::{self, Cursor, Read};
     use std::os::windows::ffi::OsStringExt;
 
-    use super::{CLOUD_FILE_ERRORS, is_cloud_file_error, wide_null};
+    use super::{CLOUD_FILE_ERRORS, is_cloud_file_error, read_retry_interrupted, wide_null};
+
+    struct InterruptedOnce {
+        interrupted: bool,
+        inner: Cursor<Vec<u8>>,
+    }
+
+    impl Read for InterruptedOnce {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            self.inner.read(buffer)
+        }
+    }
 
     #[test]
     fn cloud_file_error_family_is_complete_and_does_not_use_a_range() {
@@ -138,6 +171,20 @@ mod tests {
             u16::from(b'b'),
         ]);
         let error = wide_null(&value).err();
-        assert!(error.is_some_and(|value| value.kind() == std::io::ErrorKind::InvalidInput));
+        assert!(error.is_some_and(|value| value.kind() == io::ErrorKind::InvalidInput));
+    }
+
+    #[test]
+    fn file_wrapper_reads_retry_interrupted_operations() {
+        let mut source = InterruptedOnce {
+            interrupted: false,
+            inner: Cursor::new(b"complete".to_vec()),
+        };
+        let mut output = [0_u8; 8];
+        assert_eq!(
+            read_retry_interrupted(&mut source, &mut output).ok(),
+            Some(output.len())
+        );
+        assert_eq!(&output, b"complete");
     }
 }

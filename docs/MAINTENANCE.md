@@ -5,7 +5,7 @@
 | Area | Responsibility |
 |---|---|
 | `crates/win/src/endpoint.rs`, `path.rs`, `metadata.rs`, `volume.rs`, `device.rs`, `extents.rs`, `lock.rs`, `util.rs` | Local/UNC/WSL classification, lossless paths, 128/64-bit handle identity, fast/fallback 256 KiB enumeration, local/handle-bound-remote volume facts, query-only local device/extent facts, run lock, shared fail-closed helpers. |
-| `crates/win/src/file.rs`, `streams.rs`, `ea.rs`, `sparse.rs`, `reparse.rs`, `security.rs` | Read-only source and capability-bearing destination primitives; the only unsafe boundary. Native/provider lengths, ranges, and stream suffixes are validated here before core sees them. |
+| `crates/win/src/file.rs`, `streams.rs`, `ea.rs`, `sparse.rs`, `reparse.rs`, `security.rs` | Read-only source and capability-bearing destination primitives; the only unsafe boundary. Interrupted reads are retried here; native/provider lengths, EA records, sparse ranges, and stream suffixes are validated before core sees them. |
 | `crates/core/src/model.rs`, `options.rs`, `filesystem.rs`, `classify.rs`, `copy.rs`, `transport.rs`, `worker.rs`, `engine.rs` | Work model, validated options, immutable source/destination semantic policy, endpoint-aware join, terminal outcomes, isolated standard/generic-redirector/WSL/same-spindle transports, bounded scheduling, direct-plain-small and transactional auxiliary/sparse/large copy. |
 | `crates/core/src/artifact.rs`, `journal.rs`, `audit.rs`, `report.rs`, `stats.rs`, `devprofile.rs` | Shared exact-handle artifact publication, one-record-lookahead resume replay, disjoint public artifact roles, throughput windows, and exact static-profile buffer budgets. |
 | `crates/core/src/verify.rs` | Post-copy and standalone verification. |

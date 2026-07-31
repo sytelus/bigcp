@@ -18,7 +18,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use crate::metadata::{FileIdentity, metadata_from_file};
-use crate::util::{last_error, wide_null};
+use crate::util::{last_error, read_retry_interrupted, wide_null};
 
 /// One data stream reported by Windows.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -187,7 +187,7 @@ impl Write for DestinationStream {
 
 impl Read for DestinationStream {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        self.file.read(buffer)
+        read_retry_interrupted(&mut self.file, buffer)
     }
 }
 
@@ -236,7 +236,7 @@ impl SourceStream {
 
 impl Read for SourceStream {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        self.file.read(buffer)
+        read_retry_interrupted(&mut self.file, buffer)
     }
 }
 

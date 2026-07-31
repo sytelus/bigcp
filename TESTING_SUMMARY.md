@@ -2,6 +2,50 @@
 
 Latest review: 2026-07-31
 
+## 2026-07-31 whole-repository robustness review
+
+This pass reviewed the workspace architecture, copy/verification engines,
+standard/generic-redirector/WSL/same-spindle transports, Win32 ownership and
+provider parsing boundaries, CLI/TUI, testkit confinement, schemas, scripts,
+CI, and active documentation. Four focused hardening changes resulted:
+
+- ordinary and named-stream wrappers now retry non-terminal `Interrupted`
+  reads, and the redirector/same-spindle mechanics do the same for their
+  generic read/write boundaries;
+- the redirector pipeline's setup invariant now returns a typed internal
+  failure instead of reaching the last production `unreachable!` abort site;
+- `BACKUP_EA_DATA` is accepted only after every
+  `FILE_FULL_EA_INFORMATION` record-local offset, supported flag, name,
+  terminator, value length, alignment hop, and terminal boundary validates;
+  constructed EA sets also enforce the one-MiB aggregate cap before building
+  the payload; and
+- volume disk-extent parsing derives the first-extent offset from the bound
+  `VOLUME_DISK_EXTENTS` ABI layout rather than a hand-maintained constant.
+
+Five new pure/bounded regressions cover interrupted file-wrapper I/O,
+interrupted redirector and phased I/O, malformed EA framing, pre-allocation EA
+budget refusal, and ABI-derived disk-extent parsing/deduplication. All 152
+confined workspace tests passed serially with zero failures: 8 CLI, 61 core
+unit, 16 core end-to-end, 11 testkit safety, 3 TUI, and 53 Windows-boundary
+tests. Formatting, warning-denied workspace/all-target Clippy, warning-denied
+rustdoc, doc tests, the locked optimized workspace build, frozen-input and
+test-storage safety checks, local Markdown-link validation, cargo-deny, and
+cargo-audit all passed. Cargo-deny reported only the allowed `hashbrown` and
+`syn` duplicate-version warnings; RustSec found no vulnerability among 146
+locked dependencies after loading 1,177 advisories.
+
+PLAN and the testing guide now describe the actual safe dependency boundary:
+integration/testkit paths use the validated `SandboxRoot`; crate-local Win32
+round trips, which cannot depend back on testkit, own a new `TempDir` and
+derive every path from it, while CI redirects `TEMP`/`TMP` into its unique C:
+run root. `LIMITATIONS.md` remained current. `VISION.md` was not modified and
+remains at SHA-256
+`B970F59B791A53584FB57698B26CB70A7E7E9D80982B9118F4EF5A4199BE6C28`.
+
+No live UNC/WSL write, physical-drive, VHDX, performance, stress,
+large-scale, endurance, chaos, forced-disconnect, reboot, shutdown, or
+machine-stability test ran.
+
 ## 2026-07-31 WSL Plan 9 throughput specialization
 
 WSL now has a distinct `wsl` transport/profile identity while reusing the

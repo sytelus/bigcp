@@ -8,11 +8,13 @@
 use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
 use std::io;
+use std::mem::offset_of;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::ptr;
 
+use windows_sys::Wdk::Storage::FileSystem::{FILE_FULL_EA_INFORMATION, FILE_NEED_EA};
 use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
 use windows_sys::Win32::Storage::FileSystem::{
     BACKUP_EA_DATA, BackupRead, BackupSeek, BackupWrite, FILE_FLAG_BACKUP_SEMANTICS,
@@ -25,6 +27,7 @@ use crate::util::{bool_result, last_error};
 
 const STREAM_HEADER_BYTES: usize = 20;
 const MAX_EA_PAYLOAD_BYTES: u64 = 1024 * 1024;
+const EA_HEADER_BYTES: usize = offset_of!(FILE_FULL_EA_INFORMATION, EaName);
 
 /// An opaque, validated `BACKUP_EA_DATA` payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -40,16 +43,22 @@ impl ExtendedAttributes {
     /// Builds a validated EA set from raw name/value byte pairs.
     ///
     /// EA names are byte strings in the Win32 API. They must be non-empty,
-    /// contain no NUL, and fit the on-disk one-byte length field; values use a
-    /// two-byte length field. This constructor is also used by the bounded
-    /// testkit without exposing the internal backup-stream framing.
+    /// contain none of the filesystem-reserved bytes, and fit the on-disk
+    /// one-byte length field; values use a two-byte length field. This
+    /// constructor is also used by the bounded testkit without exposing the
+    /// internal backup-stream framing.
     pub fn from_pairs(entries: &[(&[u8], &[u8])]) -> io::Result<Self> {
-        let mut records = Vec::with_capacity(entries.len());
+        // Do not reserve from the caller-controlled entry count: a huge slice
+        // must encounter the aggregate byte cap before it can induce a huge
+        // auxiliary allocation. The record vector itself is therefore bounded
+        // by the same one-MiB payload calculation below.
+        let mut records = Vec::new();
+        let mut total_length = 0_usize;
         for (name, value) in entries {
-            if name.is_empty() || name.contains(&0) {
+            if !valid_ea_name(name) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "EA names must be non-empty and contain no NUL",
+                    "EA name is empty or contains a reserved byte",
                 ));
             }
             let name_length = u8::try_from(name.len()).map_err(|_| {
@@ -58,11 +67,23 @@ impl ExtendedAttributes {
             let value_length = u16::try_from(value.len()).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidInput, "EA value exceeds 65535 bytes")
             })?;
-            let raw_length = 8_usize
+            let raw_length = EA_HEADER_BYTES
                 .checked_add(name.len())
                 .and_then(|length| length.checked_add(1))
                 .and_then(|length| length.checked_add(value.len()))
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "EA size overflow"))?;
+            let padded = raw_length.checked_add(3).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "EA alignment overflow")
+            })? & !3;
+            total_length = total_length.checked_add(padded).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "EA set size overflow")
+            })?;
+            if total_length as u64 > MAX_EA_PAYLOAD_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "EA set exceeds the one MiB safety limit",
+                ));
+            }
             records.push((name, value, name_length, value_length, raw_length));
         }
 
@@ -89,12 +110,7 @@ impl ExtendedAttributes {
             payload.extend_from_slice(value);
             payload.resize(payload.len() + padded - raw_length, 0);
         }
-        if payload.len() as u64 > MAX_EA_PAYLOAD_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "EA set exceeds the one MiB safety limit",
-            ));
-        }
+        debug_assert_eq!(payload.len(), total_length);
         Ok(Self(payload))
     }
 
@@ -195,52 +211,37 @@ fn require_identity(file: &File, expected: FileIdentity) -> io::Result<()> {
     }
 }
 
-fn ea_tombstones(payload: &[u8]) -> io::Result<Vec<u8>> {
-    let mut names = Vec::new();
-    let mut offset = 0_usize;
-    loop {
-        if offset.checked_add(8).is_none_or(|end| end > payload.len()) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "truncated FILE_FULL_EA_INFORMATION header",
-            ));
-        }
-        let next = u32::from_le_bytes(array(&payload[offset..offset + 4], "EA next offset")?);
-        let flags = payload[offset + 4];
-        let name_length = usize::from(payload[offset + 5]);
-        let name_start = offset + 8;
-        let name_end = name_start
-            .checked_add(name_length)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "EA name overflow"))?;
-        if name_end >= payload.len() || payload[name_end] != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "truncated or unterminated EA name",
-            ));
-        }
-        names.push((flags, payload[name_start..name_end].to_vec()));
-        if next == 0 {
-            break;
-        }
-        let next = usize::try_from(next)
-            .map_err(|_| io::Error::other("EA next offset exceeds address space"))?;
-        if next < 8
-            || offset
-                .checked_add(next)
-                .is_none_or(|value| value >= payload.len())
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid EA next offset",
-            ));
-        }
-        offset += next;
-    }
+fn valid_ea_name(name: &[u8]) -> bool {
+    !name.is_empty()
+        && name.iter().all(|value| {
+            *value > 0x1f
+                && !matches!(
+                    *value,
+                    b'\\'
+                        | b'/'
+                        | b':'
+                        | b'*'
+                        | b'?'
+                        | b'"'
+                        | b'<'
+                        | b'>'
+                        | b'|'
+                        | b','
+                        | b'+'
+                        | b'='
+                        | b'['
+                        | b']'
+                        | b';'
+                )
+        })
+}
 
+fn ea_tombstones(payload: &[u8]) -> io::Result<Vec<u8>> {
+    let names = parse_ea_records(payload)?;
     let mut result = Vec::new();
     let count = names.len();
     for (index, (flags, name)) in names.into_iter().enumerate() {
-        let raw_length = 8_usize
+        let raw_length = EA_HEADER_BYTES
             .checked_add(name.len())
             .and_then(|value| value.checked_add(1))
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "EA record overflow"))?;
@@ -257,11 +258,104 @@ fn ea_tombstones(payload: &[u8]) -> io::Result<Vec<u8>> {
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "EA name exceeds u8"))?,
         );
         result.extend_from_slice(&0_u16.to_le_bytes());
-        result.extend_from_slice(&name);
+        result.extend_from_slice(name);
         result.push(0);
         result.resize(result.len() + padded - raw_length, 0);
     }
     Ok(result)
+}
+
+/// Validates the linked `FILE_FULL_EA_INFORMATION` records returned inside a
+/// provider-owned backup stream and returns only record-local names.
+///
+/// BackupRead bounds the outer payload but does not make its inner offsets
+/// trustworthy. Every name, value, alignment hop, and terminal record must be
+/// contained before the opaque bytes can cross the safe Win32 boundary.
+fn parse_ea_records(payload: &[u8]) -> io::Result<Vec<(u8, &[u8])>> {
+    if payload.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut records = Vec::new();
+    let mut offset = 0_usize;
+    loop {
+        if offset
+            .checked_add(EA_HEADER_BYTES)
+            .is_none_or(|end| end > payload.len())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated FILE_FULL_EA_INFORMATION header",
+            ));
+        }
+        let next = u32::from_le_bytes(array(&payload[offset..offset + 4], "EA next offset")?);
+        let flags = payload[offset + 4];
+        if flags != 0 && u32::from(flags) != FILE_NEED_EA {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "EA record contains unsupported flags",
+            ));
+        }
+        let name_length = usize::from(payload[offset + 5]);
+        let value_length = usize::from(u16::from_le_bytes(array(
+            &payload[offset + 6..offset + 8],
+            "EA value length",
+        )?));
+        let record_end = if next == 0 {
+            payload.len()
+        } else {
+            let next = usize::try_from(next)
+                .map_err(|_| io::Error::other("EA next offset exceeds address space"))?;
+            if !next.is_multiple_of(4) || next < EA_HEADER_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid EA next offset",
+                ));
+            }
+            offset
+                .checked_add(next)
+                .filter(|end| *end <= payload.len())
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid EA next offset")
+                })?
+        };
+        let name_start = offset + EA_HEADER_BYTES;
+        let name_end = name_start
+            .checked_add(name_length)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "EA name overflow"))?;
+        let value_end = name_end
+            .checked_add(1)
+            .and_then(|start| start.checked_add(value_length))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "EA value overflow"))?;
+        if name_length == 0
+            || name_end >= record_end
+            || payload[name_end] != 0
+            || !valid_ea_name(&payload[name_start..name_end])
+            || value_end > record_end
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid, truncated, or unterminated EA record",
+            ));
+        }
+        records.push((flags, &payload[name_start..name_end]));
+        if next == 0 {
+            if record_end.saturating_sub(value_end) >= 4 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "EA payload has bytes beyond terminal alignment padding",
+                ));
+            }
+            break;
+        }
+        if record_end == payload.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "EA next offset does not leave room for another record",
+            ));
+        }
+        offset = record_end;
+    }
+    Ok(records)
 }
 
 pub(crate) fn read_from_file(file: &File) -> io::Result<ExtendedAttributes> {
@@ -288,6 +382,7 @@ pub(crate) fn read_from_file(file: &File) -> io::Result<ExtendedAttributes> {
                 .map_err(|_| io::Error::other("EA payload does not fit address space"))?;
             let mut payload = vec![0_u8; length];
             reader.read_exact(&mut payload)?;
+            parse_ea_records(&payload)?;
             return Ok(ExtendedAttributes(payload));
         }
         reader.skip(size)?;
@@ -550,8 +645,8 @@ impl Drop for BackupWriter<'_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExtendedAttributes, clear_extended_attributes_checked, read_extended_attributes,
-        read_extended_attributes_checked, write_extended_attributes,
+        ExtendedAttributes, clear_extended_attributes_checked, ea_tombstones, parse_ea_records,
+        read_extended_attributes, read_extended_attributes_checked, write_extended_attributes,
         write_extended_attributes_checked,
     };
     use crate::metadata::metadata_at;
@@ -606,5 +701,68 @@ mod tests {
             Some(ExtendedAttributes(Vec::new()))
         );
         assert_eq!(fs::read(path).ok(), Some(b"ordinary data".to_vec()));
+    }
+
+    #[test]
+    fn ea_parser_rejects_record_boundary_and_framing_violations() {
+        let attributes = ExtendedAttributes::from_pairs(&[(b"first", b"value"), (b"second", b"")]);
+        assert!(attributes.is_ok());
+        let Some(attributes) = attributes.ok() else {
+            return;
+        };
+        assert_eq!(
+            parse_ea_records(attributes.as_bytes())
+                .ok()
+                .map(|records| records.len()),
+            Some(2)
+        );
+        assert!(ea_tombstones(attributes.as_bytes()).is_ok_and(|payload| {
+            parse_ea_records(&payload)
+                .ok()
+                .is_some_and(|records| records.len() == 2)
+        }));
+
+        let mut misaligned_next = attributes.as_bytes().to_vec();
+        misaligned_next[..4].copy_from_slice(&9_u32.to_le_bytes());
+        assert!(parse_ea_records(&misaligned_next).is_err());
+
+        let mut oversized_value = attributes.as_bytes().to_vec();
+        oversized_value[6..8].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(parse_ea_records(&oversized_value).is_err());
+
+        let mut unsupported_flags = attributes.as_bytes().to_vec();
+        unsupported_flags[4] = 1;
+        assert!(parse_ea_records(&unsupported_flags).is_err());
+
+        let mut embedded_nul = attributes.as_bytes().to_vec();
+        embedded_nul[8] = 0;
+        assert!(parse_ea_records(&embedded_nul).is_err());
+
+        let terminal = ExtendedAttributes::from_pairs(&[(b"name", b"value")]);
+        assert!(terminal.is_ok());
+        let Some(terminal) = terminal.ok() else {
+            return;
+        };
+        let mut trailing_record = terminal.as_bytes().to_vec();
+        trailing_record.extend_from_slice(&[0_u8; 4]);
+        assert!(parse_ea_records(&trailing_record).is_err());
+    }
+
+    #[test]
+    fn ea_constructor_enforces_total_budget_before_building_payload() {
+        for name in [
+            b"".as_slice(),
+            b"bad:name".as_slice(),
+            b"control\x1f".as_slice(),
+        ] {
+            assert!(ExtendedAttributes::from_pairs(&[(name, b"value")]).is_err());
+        }
+
+        let value = vec![0xA5_u8; usize::from(u16::MAX)];
+        let entries = (0..17)
+            .map(|_| (b"x".as_slice(), value.as_slice()))
+            .collect::<Vec<_>>();
+        let error = ExtendedAttributes::from_pairs(&entries).err();
+        assert!(error.is_some_and(|value| value.kind() == std::io::ErrorKind::InvalidInput));
     }
 }

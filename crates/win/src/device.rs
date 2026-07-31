@@ -7,7 +7,7 @@
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::mem::size_of;
+use std::mem::{offset_of, size_of};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
@@ -23,6 +23,7 @@ use windows_sys::Win32::System::Ioctl::{
     IOCTL_DISK_GET_CACHE_INFORMATION, IOCTL_STORAGE_QUERY_PROPERTY, PropertyStandardQuery,
     STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR, STORAGE_ADAPTER_DESCRIPTOR, STORAGE_PROPERTY_QUERY,
     StorageAccessAlignmentProperty, StorageAdapterProperty, StorageDeviceSeekPenaltyProperty,
+    VOLUME_DISK_EXTENTS,
 };
 
 use crate::EndpointKind;
@@ -256,11 +257,13 @@ fn query_disk_numbers(handle: &File) -> Option<Vec<u32>> {
 
 fn disk_numbers_from_bytes(output: &[u8], returned: u32) -> Option<Vec<u32>> {
     let returned = usize::try_from(returned).ok()?;
-    if returned < 8 || returned > output.len() {
+    // Use the binding's actual ABI layout rather than assuming the compiler's
+    // padding between NumberOfDiskExtents and the first i64-aligned extent.
+    let extent_offset = offset_of!(VOLUME_DISK_EXTENTS, Extents);
+    if returned < extent_offset || returned > output.len() {
         return None;
     }
     let count = u32::from_le_bytes(output[..4].try_into().ok()?) as usize;
-    let extent_offset = 8_usize;
     let extent_size = size_of::<DISK_EXTENT>();
     if extent_offset.checked_add(count.checked_mul(extent_size)?)? > returned {
         return None;
@@ -283,7 +286,10 @@ fn disk_numbers_from_bytes(output: &[u8], returned: u32) -> Option<Vec<u32>> {
 mod tests {
     use super::{device_path_for_root, disk_numbers_from_bytes};
     use std::ffi::OsString;
+    use std::mem::{offset_of, size_of};
     use std::path::Path;
+
+    use windows_sys::Win32::System::Ioctl::{DISK_EXTENT, VOLUME_DISK_EXTENTS};
 
     #[test]
     fn extended_length_root_yields_drive_device_path() {
@@ -307,9 +313,37 @@ mod tests {
 
     #[test]
     fn disk_extent_parser_rejects_impossible_returned_lengths() {
-        let buffer = [0_u8; 16];
-        assert!(disk_numbers_from_bytes(&buffer, 17).is_none());
-        assert!(disk_numbers_from_bytes(&buffer, 7).is_none());
-        assert_eq!(disk_numbers_from_bytes(&buffer, 8), Some(Vec::new()));
+        let extent_offset = offset_of!(VOLUME_DISK_EXTENTS, Extents);
+        let buffer = [0_u8; 32];
+        assert!(disk_numbers_from_bytes(&buffer, 33).is_none());
+        assert!(
+            disk_numbers_from_bytes(
+                &buffer,
+                u32::try_from(extent_offset.saturating_sub(1)).unwrap_or_default()
+            )
+            .is_none()
+        );
+        assert_eq!(
+            disk_numbers_from_bytes(&buffer, u32::try_from(extent_offset).unwrap_or_default()),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn disk_extent_parser_uses_the_bound_structure_layout_and_deduplicates() {
+        let extent_offset = offset_of!(VOLUME_DISK_EXTENTS, Extents);
+        let extent_size = size_of::<DISK_EXTENT>();
+        let mut buffer = vec![0_u8; extent_offset + 3 * extent_size];
+        buffer[..4].copy_from_slice(&3_u32.to_le_bytes());
+        buffer[extent_offset..extent_offset + 4].copy_from_slice(&7_u32.to_le_bytes());
+        buffer[extent_offset + extent_size..extent_offset + extent_size + 4]
+            .copy_from_slice(&7_u32.to_le_bytes());
+        buffer[extent_offset + 2 * extent_size..extent_offset + 2 * extent_size + 4]
+            .copy_from_slice(&9_u32.to_le_bytes());
+
+        assert_eq!(
+            disk_numbers_from_bytes(&buffer, u32::try_from(buffer.len()).unwrap_or_default()),
+            Some(vec![7, 9])
+        );
     }
 }

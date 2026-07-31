@@ -47,8 +47,8 @@ required by the governing plan.
   deferred final stamping; combined startup acceptance and redirector-loss
   breaker mapping without changing either local transport/profile path.
 - Fail-closed Win32/provider parsing for returned lengths, record-local child
-  names, sparse-range order, reparse framing, stream suffix containment, and
-  embedded-NUL path input.
+  names, EA record offsets/flags/name/value bounds, sparse-range order,
+  reparse framing, stream suffix containment, and embedded-NUL path input.
 - Disjoint resolved log/report/state/journal roles, streaming journal replay,
   and exact standard/redirector concurrent-buffer accounting for `mem`
   overrides.

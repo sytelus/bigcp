@@ -42,7 +42,7 @@ use crate::metadata::{
 use crate::security::ProtectedDacl;
 use crate::sparse::{AllocatedRange, mark_sparse, query_allocated_ranges};
 use crate::streams::{DestinationStream, StreamInfo};
-use crate::util::bool_result;
+use crate::util::{bool_result, read_retry_interrupted};
 
 /// Attributes that are user-copyable under the PLAN.md section 4.2 contract.
 pub const COPYABLE_ATTRIBUTES: u32 = FILE_ATTRIBUTE_READONLY
@@ -149,7 +149,7 @@ impl SourceFile {
 
 impl Read for SourceFile {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        self.file.read(buffer)
+        read_retry_interrupted(&mut self.file, buffer)
     }
 }
 
@@ -482,7 +482,8 @@ impl Write for DestinationTemp {
 
 impl Read for DestinationTemp {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        self.file_mut()?.read(buffer)
+        let file = self.file_mut()?;
+        read_retry_interrupted(file, buffer)
     }
 }
 

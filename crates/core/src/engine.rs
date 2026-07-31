@@ -1263,6 +1263,12 @@ fn transfer_redirector_segment<R: Read + Send, W: Write>(
                 request.relative_path.to_path_buf(),
                 "redirector reader thread panicked; this is a bigcp bug",
             ),
+            PipelinedFailureKind::Internal(message) => OperationError::semantic(
+                ErrorCategory::Internal,
+                "redirector_pipeline",
+                request.relative_path.to_path_buf(),
+                message,
+            ),
         }),
     }
 }

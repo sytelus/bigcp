@@ -148,6 +148,7 @@ pub(crate) enum PipelinedFailureKind {
     Write(io::Error),
     UnexpectedEof,
     ReaderPanicked,
+    Internal(&'static str),
 }
 
 enum ReadPacket {
@@ -199,7 +200,12 @@ where
     for buffer in buffers {
         // The receiver is live and the channel has exactly enough capacity.
         if free_sender.send(buffer).is_err() {
-            unreachable!("new redirector buffer channel disconnected");
+            return Err(PipelinedFailure {
+                kind: PipelinedFailureKind::Internal(
+                    "redirector free-buffer channel disconnected during setup",
+                ),
+                transfer: PipelinedTransfer::default(),
+            });
         }
     }
 
@@ -223,14 +229,21 @@ where
                 };
                 let requested =
                     usize::try_from(remaining.min(request_bytes as u64)).unwrap_or(request_bytes);
-                let packet = match source.read(&mut buffer[..requested]) {
-                    Ok(0) => ReadPacket::UnexpectedEof,
-                    Ok(count) => {
-                        reader_bytes_read.fetch_add(count as u64, Ordering::Relaxed);
-                        remaining = remaining.saturating_sub(count as u64);
-                        ReadPacket::Data(buffer, count)
+                let packet = loop {
+                    match source.read(&mut buffer[..requested]) {
+                        Ok(0) => break ReadPacket::UnexpectedEof,
+                        Ok(count) => {
+                            reader_bytes_read.fetch_add(count as u64, Ordering::Relaxed);
+                            remaining = remaining.saturating_sub(count as u64);
+                            break ReadPacket::Data(buffer, count);
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                            if canceled.is_canceled() || reader_stopped.load(Ordering::Acquire) {
+                                return;
+                            }
+                        }
+                        Err(error) => break ReadPacket::Failed(error),
                     }
-                    Err(error) => ReadPacket::Failed(error),
                 };
                 let terminal = !matches!(packet, ReadPacket::Data(_, _));
                 let mut pending = packet;
@@ -399,6 +412,7 @@ impl BurstBuffer {
             match source.read(&mut self.bytes[filled..end]) {
                 Ok(0) => break,
                 Ok(count) => filled = filled.saturating_add(count),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => {
                     return Err(TransferFailure {
                         kind: TransferFailureKind::Io(error),
@@ -438,6 +452,7 @@ impl BurstBuffer {
                     });
                 }
                 Ok(count) => written = written.saturating_add(count),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => {
                     return Err(TransferFailure {
                         kind: TransferFailureKind::Io(error),
@@ -684,6 +699,86 @@ mod tests {
         );
         assert!(result.is_ok());
         assert_eq!(destination.bytes, expected);
+    }
+
+    #[test]
+    fn transports_retry_interrupted_reads_and_phased_writes() {
+        struct InterruptedReader {
+            interrupted: bool,
+            inner: Cursor<Vec<u8>>,
+        }
+        impl Read for InterruptedReader {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                if !self.interrupted {
+                    self.interrupted = true;
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                self.inner.read(buffer)
+            }
+        }
+        struct InterruptedWriter {
+            interrupted: bool,
+            bytes: Vec<u8>,
+        }
+        impl Write for InterruptedWriter {
+            fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+                if !self.interrupted {
+                    self.interrupted = true;
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                self.bytes.extend_from_slice(buffer);
+                Ok(buffer.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let expected = (0_u8..12).collect::<Vec<_>>();
+        let mut pipeline_source = InterruptedReader {
+            interrupted: false,
+            inner: Cursor::new(expected.clone()),
+        };
+        let mut pipeline_destination = Vec::new();
+        assert!(
+            transfer_pipelined(
+                &mut pipeline_source,
+                &mut pipeline_destination,
+                expected.len() as u64,
+                4,
+                &|| false,
+                |_| {},
+            )
+            .is_ok()
+        );
+        assert_eq!(pipeline_destination, expected);
+
+        let profile = TransportProfile::same_spindle(expected.len());
+        let Ok(mut buffer) = BurstBuffer::new(profile, 4, expected.len() as u64) else {
+            return;
+        };
+        let mut phased_source = InterruptedReader {
+            interrupted: false,
+            inner: Cursor::new(expected.clone()),
+        };
+        assert_eq!(
+            buffer
+                .read_from(&mut phased_source, expected.len(), &|| false)
+                .ok(),
+            Some(expected.len())
+        );
+        let mut phased_destination = InterruptedWriter {
+            interrupted: false,
+            bytes: Vec::new(),
+        };
+        assert_eq!(
+            buffer
+                .write_to(&mut phased_destination, expected.len(), &|| false)
+                .ok(),
+            Some(expected.len())
+        );
+        assert_eq!(phased_destination.bytes, expected);
     }
 
     #[test]

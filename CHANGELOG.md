@@ -36,6 +36,16 @@ versioning once its 1.0 release gates are complete.
 
 ### Changed
 
+- 2026-07-31 whole-repository robustness review: retry non-terminal
+  `Interrupted` reads consistently across file/stream wrappers and both
+  specialized transports; replace the redirector pipeline's last production
+  `unreachable!` with a typed internal failure; validate every
+  `FILE_FULL_EA_INFORMATION` offset, flag, name, value, and terminal boundary
+  before copying provider bytes; reject oversized constructed EA sets before
+  payload allocation; and derive volume-extent offsets from the official
+  `windows-sys` structure layout instead of a magic constant. Added focused,
+  harmless regressions and clarified the crate-local temporary-directory test
+  boundary. `VISION.md` remains unchanged.
 - 2026-07-31 WSL throughput specialization: split WSL into its own stable
   transport/profile identity while reusing the ordered two-buffer engine;
   increased its bounded Auto row to 8 MiB/16 workers; striped small-file
