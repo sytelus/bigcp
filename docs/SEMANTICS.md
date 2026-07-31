@@ -123,9 +123,11 @@ projection. Linux uid/gid/mode/xattrs and special-file semantics are never
 invented by the Win32 engine. Network/WSL disconnect codes feed the ordinary
 device-gone breaker; recovery remains abort-and-rerun with no mid-run prompt.
 
-At a source volume root, OS artifacts such as `$RECYCLE.BIN`, `System Volume
-Information`, and page/hibernation files are excluded unless
-`--include-system`. Cloud placeholders hydrate unless `--skip-cloud`.
+At a source volume root, `System Volume Information`, paging, swap,
+hibernation, and dump-stack files are excluded unless `--include-system`.
+`$RECYCLE.BIN` is not part of that policy and is attempted through ordinary
+copy and error-reporting behavior by default. Cloud placeholders hydrate
+unless `--skip-cloud`.
 
 State, log, and report paths may share a volume with either tree but may not be
 inside either tree. JSONL is the complete event audit; the JSON report is an

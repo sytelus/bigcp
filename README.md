@@ -58,6 +58,10 @@ certification-gated. Current evidence and status are summarized in
   copying.
 - A machine-wide exact-destination lock prevents two writers from targeting
   the same root.
+- A volume-root copy attempts `$RECYCLE.BIN` normally. Protected recycle-bin
+  contents can still report ordinary access failures; the separate default OS
+  exclusions continue to cover system-volume, paging, swap, hibernation, and
+  dump-stack artifacts.
 - Every terminal outcome and requested same-run verification result is written
   to versioned JSONL and reconciled in the final report.
 
@@ -132,7 +136,9 @@ xxh3-128 digest agrees.
 | `--tune key=value,...` | Override bounded advanced settings. |
 | `--analyze` | Collect bounded live-run insight (size-class timings, top-20 slowest copies, finer stat samples) into the log and report. |
 | `--state-dir`, `--log`, `--report` | Select distinct audit locations outside both trees; log/report cannot replace the state directory or journal. |
-| `--plain`, `--quiet`, `--no-color` | Select noninteractive output behavior. |
+| `--plain` | Use stable line-oriented progress instead of the dashboard. This happens automatically when stdout is redirected. |
+| `--quiet` | Suppress live progress and print only the final summary. |
+| `--no-color` | Keep the interactive dashboard but remove color styling; the `NO_COLOR` environment convention is also honored. |
 
 Accepted profile classes are `auto`, `nvme`, `sata-ssd`, `usb-ssd`, `hdd`, and
 `unknown` (the conservative fallback profile). Advanced tune keys are
@@ -159,6 +165,20 @@ small-file threshold.
 The phased scheduler requires one worker, so a same-spindle run rejects an
 explicit `threads` value other than `1` instead of silently defeating the
 topology policy.
+
+### Command output
+
+- The final summary leads with the outcome and next action. It uses readable
+  data sizes and durations, distinguishes unchanged and intentionally withheld
+  files, groups failures with repair guidance, shows warnings and up to three
+  useful hints, and prints the exact log and report paths. A successful copy
+  that was not verified prints a ready-to-run standalone verification command.
+- Saved reports open on a Summary tab. Errors, device/profile facts,
+  performance evidence, hints, and audit locations remain one key away. Empty
+  error views say so explicitly instead of showing an unexplained blank table.
+- `--plain` progress remains stable and machine-friendly. Standalone
+  verification continues to emit JSON on stdout so it can be redirected or
+  parsed without scraping human text.
 
 ## Exit codes
 

@@ -63,10 +63,12 @@ run standalone verification for important copies.
   provider's placeholder can download its content and consume network and
   local storage. Use `--skip-cloud` to exclude placeholders. bigcp never copies
   a provider-owned cloud reparse buffer as though it were a portable link.
-- **Root-level Windows artifacts are excluded by default.** This includes
-  `$RECYCLE.BIN`, `System Volume Information`, page files, and hibernation
-  files. Exclusions are reported. Use `--include-system` only when you have
-  reviewed the implications.
+- **Selected root-level Windows artifacts are excluded by default.** This
+  includes `System Volume Information`, paging, swap, hibernation, and
+  dump-stack files. Exclusions are reported. `$RECYCLE.BIN` is not excluded:
+  a volume-root copy attempts it normally, and protected entries may report
+  access failures. Use `--include-system` only when you have reviewed the
+  implications of including the remaining OS artifacts.
 - **Locked files fail immediately.** There are no retries, waits, or lock-owner
   discovery. Close the program using the file and rerun; Task Manager or
   Resource Monitor can help identify it.
@@ -322,7 +324,10 @@ standalone verification against the actual provider.
 - **Logs and reports are not automatically expired.** Delete old audit files
   yourself if they accumulate.
 - **The dashboard is intentionally focused.** It shows progress, rates, ETA,
-  errors, and hints, but not per-file progress bars or historical sparklines.
+  the currently active path, errors, and hints, but not per-file progress bars
+  or historical sparklines. Use `--plain` for line-oriented progress,
+  `--quiet` for only the final summary, or `--no-color` to keep the dashboard
+  without color styling.
 
 ## Pre-1.0 evidence gaps
 

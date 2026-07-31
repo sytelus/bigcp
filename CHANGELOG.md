@@ -36,6 +36,16 @@ versioning once its 1.0 release gates are complete.
 
 ### Changed
 
+- Improved terminal UX without changing copy semantics: help now shows the
+  three command forms and practical examples; `--quiet` truly emits only the
+  final summary; `--no-color` and `NO_COLOR` retain the dashboard without color;
+  live state, sizes, rates, active paths, and empty-error states are clearer;
+  saved reports open on a Summary tab; and final summaries lead with outcome,
+  grouped issues, assurance state, audit paths, and a contextual next action.
+- `$RECYCLE.BIN` is no longer classified as a default volume-root OS-artifact
+  exclusion. It now follows ordinary copy and error-reporting behavior; the
+  remaining system-volume, paging, swap, hibernation, and dump-stack defaults
+  and `--include-system` behavior are unchanged (ADR 0047).
 - 2026-07-31 terminal-audit and journal-replay review: publish `Complete` only
   after the report and durably synchronized terminal JSONL record exist; emit
   same-run verification as a structured, schema-documented audit event; keep

@@ -12,7 +12,7 @@ use bigcp_core::{
     run_standalone_verify,
 };
 use bigcp_tui::{
-    PlainObserver, print_report_summary, run_dashboard, show_report, stdout_is_terminal,
+    PlainObserver, print_report_summary, run_dashboard_with_color, show_report, stdout_is_terminal,
 };
 use clap::{Args, Parser, Subcommand};
 
@@ -21,7 +21,9 @@ use clap::{Args, Parser, Subcommand};
     name = "bigcp",
     version,
     about = "Reliable, high-throughput local and UNC tree copy for Windows 11",
-    disable_help_subcommand = true
+    disable_help_subcommand = true,
+    override_usage = "bigcp [OPTIONS] <SOURCE> <DESTINATION>\n       bigcp verify <SOURCE> <DESTINATION>\n       bigcp report [--plain] <FILE>",
+    after_help = "Examples:\n  bigcp C:\\source D:\\backup\n  bigcp C:\\source D:\\backup --dry-run\n  bigcp C:\\source D:\\backup --verify --quiet\n  bigcp \\\\server\\share\\source D:\\backup --accept-remote-paths\n  bigcp verify C:\\source D:\\backup\n  bigcp report C:\\audit\\run.report.json"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -75,9 +77,8 @@ struct CopyFlags {
     skip_cloud: bool,
 
     /// Replace differing destination files (default true).
-    ///
-    /// `Option` so subcommand rejection can see an *explicit* `--replace=true`
-    /// too, not only `--replace=false`.
+    // Keep this as `Option` so subcommand rejection can see an explicit
+    // `--replace=true` too, not only `--replace=false`.
     #[arg(
         long,
         num_args = 0..=1,
@@ -230,6 +231,11 @@ fn execute(cli: Cli) -> Result<u8, (u8, String)> {
                     dry_run: cli.flags.dry_run,
                 },
             )?;
+            // Honor the NO_COLOR convention alongside --no-color (PLAN §11).
+            // Color selection is independent of the dashboard/plain choice.
+            let no_color = cli.flags.no_color
+                || std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
+            let display_mode = copy_display_mode(&cli.flags, no_color, stdout_is_terminal());
             let mut options = CopyOptions::new(source, destination);
             options.dry_run = cli.flags.dry_run;
             options.verify = cli.flags.verify;
@@ -252,19 +258,39 @@ fn execute(cli: Cli) -> Result<u8, (u8, String)> {
                 options.destination_profile = destination_profile;
             }
 
-            // Honor the NO_COLOR convention alongside --no-color (PLAN §11).
-            let no_color = cli.flags.no_color
-                || std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
-            let report = if cli.flags.plain || no_color || !stdout_is_terminal() {
-                let observer = PlainObserver::new(cli.flags.quiet);
-                run_copy(&options, &observer)
-            } else {
-                run_dashboard(options)
+            let report = match display_mode {
+                CopyDisplayMode::Plain { quiet } => {
+                    let observer = PlainObserver::new(quiet);
+                    run_copy(&options, &observer)
+                }
+                CopyDisplayMode::Dashboard { color_enabled } => {
+                    run_dashboard_with_color(options, color_enabled)
+                }
             }
             .map_err(|error| (exit_for_error(&error), error.to_string()))?;
             print_report_summary(&report)
                 .map_err(|error| (6, format!("write copy summary: {error}")))?;
             Ok(u8::try_from(report.run.exit).unwrap_or(6))
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CopyDisplayMode {
+    Dashboard { color_enabled: bool },
+    Plain { quiet: bool },
+}
+
+fn copy_display_mode(
+    flags: &CopyFlags,
+    color_disabled: bool,
+    stdout_terminal: bool,
+) -> CopyDisplayMode {
+    if flags.plain || flags.quiet || !stdout_terminal {
+        CopyDisplayMode::Plain { quiet: flags.quiet }
+    } else {
+        CopyDisplayMode::Dashboard {
+            color_enabled: !color_disabled,
         }
     }
 }
@@ -442,7 +468,7 @@ fn confirm_preflight_warnings(
             .map_or("source", |volume| volume.filesystem.name());
         writeln!(
             std::io::stderr().lock(),
-            "warning: copying from {source_name} to {} requires reduced-fidelity semantics.\n  Creation and last-write times use the destination's coarser, range-limited representation;\n  only READONLY, HIDDEN, SYSTEM, and ARCHIVE attributes are representable. Named streams,\n  EAs, sparse layout, EFS state, ACLs, and reparse points cannot be preserved. Reparse\n  objects fail without being followed.{}",
+            "Preflight notice - reduced filesystem fidelity: copying from {source_name} to {}.\n  Creation and last-write times use the destination's coarser, range-limited representation;\n  only READONLY, HIDDEN, SYSTEM, and ARCHIVE attributes are representable. Named streams,\n  EAs, sparse layout, EFS state, ACLs, and reparse points cannot be preserved. Reparse\n  objects fail without being followed.{}\n  To confirm this limitation noninteractively next time, pass --accept-degraded-filesystem.",
             destination_volume.filesystem.name(),
             if destination_volume.filesystem.maximum_file_size().is_some() {
                 " FAT files larger than 4 GiB minus 1 byte fail before writing."
@@ -461,7 +487,7 @@ fn confirm_preflight_warnings(
     if remote {
         writeln!(
             std::io::stderr().lock(),
-            "warning: this copy uses a remote endpoint (source: {}; destination: {}).\n  Network or WSL disconnects can interrupt open handles, and server-side cache durability and\n  optional metadata support cannot be inferred from local disk IOCTLs. bigcp keeps bounded I/O,\n  atomic-or-rerunnable publication, verification, and no retries, but cannot make the remote\n  server durable.{}",
+            "Preflight notice - remote path: source is {}; destination is {}.\n  Network or WSL disconnects can interrupt open handles, and server-side cache durability and\n  optional metadata support cannot be inferred from local disk IOCTLs. bigcp keeps bounded I/O,\n  atomic-or-rerunnable publication, verification, and no retries, but cannot make the remote\n  server durable.{}\n  To confirm this limitation noninteractively next time, pass --accept-remote-paths.",
             source_endpoint.name(),
             destination_volume.endpoint.name(),
             if wsl {
@@ -477,8 +503,8 @@ fn confirm_preflight_warnings(
     if quick_removal {
         writeln!(
             std::io::stderr().lock(),
-            "warning: the destination drive has write caching disabled (Windows 'Quick removal' \
-         policy).\n  Copies with many small files run several times slower this way (~3.4x \
+            "Preflight notice - destination performance: write caching is disabled (Windows \
+         'Quick removal' policy).\n  Copies with many small files run several times slower this way (~3.4x \
          measured).\n  To speed it up: Device Manager > the drive > Policies > 'Better \
          performance', and check\n  'Enable write caching on the device'. Leave 'Turn off \
          Windows write-cache buffer flushing'\n  UNCHECKED — that setting risks filesystem \
@@ -552,7 +578,9 @@ fn prompt_answer_accepted(answer: &str, degradation_confirmation: bool) -> bool 
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, execute, prompt_answer_accepted};
+    use super::{
+        Cli, Command, CopyDisplayMode, copy_display_mode, execute, prompt_answer_accepted,
+    };
     use clap::Parser;
 
     #[test]
@@ -567,6 +595,42 @@ mod tests {
             verify
                 .ok()
                 .is_some_and(|value| matches!(value.command, Some(Command::Verify { .. })))
+        );
+    }
+
+    #[test]
+    fn help_shows_copy_examples_without_internal_implementation_notes() {
+        let mut command = <Cli as clap::CommandFactory>::command();
+        let mut help = Vec::new();
+        assert!(command.write_long_help(&mut help).is_ok());
+        let help = String::from_utf8_lossy(&help);
+        assert!(help.contains("Examples:"));
+        assert!(help.contains("bigcp [OPTIONS] <SOURCE> <DESTINATION>"));
+        assert!(!help.contains("subcommand rejection"));
+    }
+
+    #[test]
+    fn no_color_keeps_dashboard_while_quiet_really_is_summary_only() {
+        let no_color = Cli::try_parse_from(["bigcp", "source", "destination", "--no-color"]);
+        assert!(no_color.is_ok());
+        let Some(no_color) = no_color.ok() else {
+            return;
+        };
+        assert_eq!(
+            copy_display_mode(&no_color.flags, true, true),
+            CopyDisplayMode::Dashboard {
+                color_enabled: false
+            }
+        );
+
+        let quiet = Cli::try_parse_from(["bigcp", "source", "destination", "--quiet"]);
+        assert!(quiet.is_ok());
+        let Some(quiet) = quiet.ok() else {
+            return;
+        };
+        assert_eq!(
+            copy_display_mode(&quiet.flags, false, true),
+            CopyDisplayMode::Plain { quiet: true }
         );
     }
 

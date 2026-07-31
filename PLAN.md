@@ -324,7 +324,7 @@ Source and destination select one immutable `FilesystemPolicy` before enumeratio
 
 ### 4.7 Default exclusions (root-level OS artifacts)
 
-When the source is a volume root (only then), the following are excluded by default, each logged as `excluded{reason:system}`: `$RECYCLE.BIN`, `System Volume Information`, `pagefile.sys`, `swapfile.sys`, `hiberfil.sys`, `DumpStack.log.tmp`. Robocopy instead spews access-denied errors on these. `--include-system` restores robocopy behavior. Notification is unconditional (F17): the run banner and `--dry-run` list what *would be* excluded, every actual exclusion is logged individually, and the summary totals them — nothing is ever silently missed. There are **no user exclusion patterns** (no `--exclude` globs): VISION asks only for the system-file exclusion with a disable flag, and a glob engine is exactly the kind of surface the minimal-arguments rule exists to prevent — users who need partial copies copy the subtree they want.
+When the source is a volume root (only then), the following are excluded by default, each logged as `excluded{reason:system}`: `System Volume Information`, `pagefile.sys`, `swapfile.sys`, `hiberfil.sys`, `DumpStack.log.tmp`. `$RECYCLE.BIN` is deliberately **not** an OS-artifact exclusion: it follows ordinary copy and error-reporting semantics by default, including normal access failures for protected contents (ADR 0047). Robocopy instead spews access-denied errors on the excluded set. `--include-system` restores robocopy behavior for that set. Notification is unconditional (F17): the run banner and `--dry-run` list what *would be* excluded, every actual exclusion is logged individually, and the summary totals them — nothing is ever silently missed. There are **no user exclusion patterns** (no `--exclude` globs): VISION asks only for the system-file exclusion with a disable flag, and a glob engine is exactly the kind of surface the minimal-arguments rule exists to prevent — users who need partial copies copy the subtree they want.
 
 ### 4.8 Source and destination stability (exclusivity assumptions, F16)
 
@@ -956,7 +956,8 @@ Flags (copy):
                            without a prompt
   --state-dir <DIR> --log <FILE> --report <FILE>
   --plain                  line output instead of TUI (auto when not a TTY)
-  --no-color --quiet
+  --no-color               keep the TUI but remove color styling (also honors NO_COLOR)
+  --quiet                  suppress live progress and print only the final summary
 Exit codes: 0 ok · 2 completed-with-failures · 3 user-canceled (resumable)
             4 aborted by breaker (resumable) · 5 fatal startup ·
             6 audit, output/format, or internal invariant failure
@@ -1032,13 +1033,13 @@ Aggregated, self-contained (embeds config + device profiles so it's meaningful y
 
 ## 11. Terminal UI design
 
-Stack: `ratatui` + `crossterm`. Truecolor with graceful 256/16-color fallback (terminal capability detect); honors `NO_COLOR`; full Unicode with width-aware truncation of long paths (middle-ellipsis, keeping filename visible). The TUI renders immutable state snapshots published by the coordinator (watch channel, ≤30 fps) — **the UI can never touch run data structures or block I/O threads**.
+Stack: `ratatui` + `crossterm`. Color is optional: `--no-color` and the `NO_COLOR` convention remove color styling without disabling the dashboard. Full Unicode paths are rendered by the terminal backend. The TUI renders immutable state snapshots published by the coordinator — **the UI can never touch run data structures or block I/O threads**.
 
 The surface is deliberately **compact and truthful**: every widget renders data the engine actually produces. (An earlier revision specified sparklines, an active-transfers table with per-file progress, live governor readouts, latency percentiles, and a color-coded verdict strip; those were deleted — decoration ahead of real telemetry would be fiction, and the compact surface answers the questions users actually have: how far along, how fast, what failed, what to do.)
 
 Tabs (keys `1–6`, `Tab`/`Shift-Tab`):
 
-1. **Dashboard** — progress gauge over discovered files; state, copied/skipped/failed counts, bytes read/written; **ETA for the work discovered so far** (§6.4, VISION `/ETA`); latest status message.
+1. **Dashboard** — progress gauge over discovered files; plain-language state; new/replaced/unchanged/withheld/failed counts; human-readable bytes and rates; **ETA for the work discovered so far** (§6.4, VISION `/ETA`); currently active path and latest status message.
 2. **Errors** — live counts by category with hints; bounded samples (the log always has everything).
 3. **Devices** — application-side read/write rates; static class/profile facts land in the final report.
 4. **Performance** — rates, logical bytes, discovery counts.
@@ -1047,9 +1048,9 @@ Tabs (keys `1–6`, `Tab`/`Shift-Tab`):
 
 Global keys: `q`/`Esc` request a graceful cancel (honored between chunks even inside a huge file, §5.13). There are no recovery-interaction keys (F31): breaker trips end the run resumably on their own (§5.13), and there is no pause key — cancel-and-rerun covers the need with one fewer state to test.
 
-`bigcp report FILE` re-opens the stored JSON in the same tab layout (live-only widgets hidden). `--plain` mode prints: a status line per snapshot (log-friendly, includes the ETA), every message as it happens, and the final summary block — nothing interactive, same information.
+`bigcp report FILE` opens on an at-a-glance Summary tab, followed by Errors, Devices, Performance, Hints, and Audit. Empty error views state that no failures occurred instead of presenting a blank table. `--plain` mode prints a stable, log-friendly status line per snapshot (including the ETA), every message as it happens, and the same human final summary block. `--quiet` suppresses those live lines and messages while retaining the final summary.
 
-Summary block (always printed on exit, TUI or not): counters table (including replacements and their dest-newer count, F13), failure breakdown by category × top folder, achieved vs. observed-peak throughput + efficiency, the durability guarantee that applied (§7.5), audit status (§5.15), start/end/duration, fastest/slowest phase, top 3 hints, paths of log/report, and the exact command to resume/re-verify.
+Summary block (always printed on exit, TUI or not): plain-language outcome; source/destination and start/end/duration; human-readable data and disjoint counters (including replacements and their destination-newer count, F13); failure breakdown by category × busiest top folders; warnings; achieved vs. observed-peak throughput + efficiency; the durability guarantee that applied (§7.5); audit and counter-integrity status (§5.15/§7.3); fastest/slowest phase; top 3 hints; paths of log/report; and a context-specific next action, including a ready-to-run standalone verification command after an unverified success or same-command rerun guidance for resumable outcomes.
 
 ## 12. Test plan
 
@@ -1186,7 +1187,7 @@ The semantic contract (§4), direct-plain-small and transactional auxiliary/spar
 
 The 2026-07-29 complexity-control pass **deleted** (not deferred) everything whose payoff did not justify its complexity — each deletion is recorded inline at its former section and its user-visible consequence, where one exists, is stated plainly in LIMITATIONS.md: the IOCP overlapped ring, then (after the owner clarified that robocopy-`/J` was never a mandate, ADR 0028) the entire unbuffered engine and its `--no-unbuffered` flag — **the shipped buffered engine is the 1.0 design** — plus queue-depth knobs, the bounded governor, the free-space forecast, Restart Manager lock-owner naming, profiler vendor/hotplug/cache extras, handle-based ADS discovery, the deferred-close finalizer pool, the per-device scheduler, parallel enumerators, the decorative §11 TUI widgets, the verification-run report kind, the modeled audit-drain state (immediate abort is the design), orphan-scan/retention cleanup, and differential-copier release gates.
 
-What remains before a 1.0 claim is primarily verification/evidence for the NTFS contract, plus one product-scaling gap: a bounded single-directory enumeration fallback (§5.6). The on-request validation pass is §12.10; optional performance candidates live in BENCHMARKS.md; disposition history is in `docs/REVIEW_2026-07-29.md` and ADRs 0027–0046. **Deviation rule:** any future intentional difference from this plan is recorded before the deviating code merges — either as a normative edit here or an ADR — there is no separate deviations file. Open gate highlights:
+What remains before a 1.0 claim is primarily verification/evidence for the NTFS contract, plus one product-scaling gap: a bounded single-directory enumeration fallback (§5.6). The on-request validation pass is §12.10; optional performance candidates live in BENCHMARKS.md; disposition history is in `docs/REVIEW_2026-07-29.md` and ADRs 0027–0047. **Deviation rule:** any future intentional difference from this plan is recorded before the deviating code merges — either as a normative edit here or an ADR — there is no separate deviations file. Open gate highlights:
 
 - **Verification matrices (§12.3/§12.4/§12.8)** — fault-injection at the wrapper boundary, exhaustive deterministic kill-point simulation, the bounded chaos binary with mutator mode, the adversarial E-case suite, destination sentinel snapshots, and emitted-instance schema validation.
 - **Bounded huge-directory behavior (§5.6/E25)** — synthetic million-entry validation and an implementation that falls back without materializing an unbounded per-directory map.

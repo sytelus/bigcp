@@ -2,6 +2,70 @@
 
 Latest review: 2026-07-31
 
+## 2026-07-31 terminal UX and output-mode review
+
+This pass improved the user-facing command experience without changing copy,
+verification, scheduling, or persistence semantics. Help now presents the
+three real command forms and practical examples without leaking implementation
+comments. `--quiet` now actually suppresses the dashboard and live messages;
+`--no-color` and `NO_COLOR` now retain the dashboard while removing color.
+Preflight notices have scannable purpose labels and name the noninteractive
+acceptance flag where one exists.
+
+The live dashboard now uses plain-language lifecycle names, human-readable
+sizes, simultaneous read/write rates, disjoint unchanged/withheld counts, and
+the currently active path. Empty error views state that nothing has failed.
+Saved reports open on a new Summary tab. The always-printed final summary now
+leads with outcome; separates dry-run forecasts from real failures; groups
+repair guidance by failure category and busiest folders; reports warnings,
+assurance, phases, human units, and audit paths; and ends with a
+context-specific next action. Extended local and UNC audit paths are displayed
+in their familiar form without changing the stored path.
+
+Four new bounded regressions cover help quality, output-mode selection, human
+units/friendly paths, and the dry-run next action; the existing every-tab
+renderer now also checks the complete color-free surface.
+All 163 confined workspace tests passed serially with zero failures: 10 CLI,
+65 core unit, 18 core end-to-end, 11 testkit safety, 6 TUI, and 53
+Win32-boundary tests. Test-storage safety, formatting, warning-denied
+workspace/all-target/all-feature Clippy, warning-denied rustdoc, and the locked
+optimized workspace build passed. Frozen-input verification, JSON syntax and
+Draft 2020-12 schema identity, and all local Markdown links also passed.
+Cargo-deny passed with only the allowed `hashbrown` and `syn`
+duplicate-version warnings; cargo-audit found no known vulnerability among 146
+locked dependencies after loading 1,177 advisories.
+
+A confined `--dry-run --quiet` smoke check over `docs/evidence` confirmed the
+rendered forecast, friendly audit paths, and appropriate "re-run without
+--dry-run" next action; its audit artifacts were removed afterward. No live
+UNC/WSL write, Recycle Bin or volume-root copy, physical drive, VHDX,
+performance, stress, large-scale, endurance, chaos, forced-disconnect, reboot,
+shutdown, or machine-stability test ran. `VISION.md` was not modified and
+remains at SHA-256
+`B970F59B791A53584FB57698B26CB70A7E7E9D80982B9118F4EF5A4199BE6C28`.
+
+## 2026-07-31 Recycle Bin default-inclusion change
+
+`$RECYCLE.BIN` was removed from the volume-root OS-artifact exclusion set and
+now follows ordinary enumeration, copy, verification, accounting, and audit
+behavior by default. The five remaining exclusions and `--include-system` are
+unchanged. ADR 0047 records the decision, including that this is a raw tree
+copy rather than a Recycle Bin restore/original-path reconstruction feature.
+
+One pure case-insensitive regression proves `$RECYCLE.BIN` is not excluded and
+that `System Volume Information`, paging, swap, hibernation, and dump-stack
+artifacts remain excluded. All 159 confined workspace tests passed serially
+with zero failures: 8 CLI, 65 core unit, 18 core end-to-end, 11 testkit safety,
+4 TUI, and 53 Win32-boundary tests. Formatting, test-storage safety,
+warning-denied workspace/all-target/all-feature Clippy, warning-denied rustdoc,
+and the locked optimized workspace build passed.
+
+No live Recycle Bin, volume-root copy, remote/WSL write, physical drive, VHDX,
+performance, stress, large-scale, endurance, chaos, forced-disconnect, reboot,
+shutdown, or machine-stability test ran. `VISION.md` was not modified and
+remains at SHA-256
+`B970F59B791A53584FB57698B26CB70A7E7E9D80982B9118F4EF5A4199BE6C28`.
+
 ## 2026-07-31 terminal-audit and bounded journal-replay review
 
 This whole-repository pass fixed four persistence and observability defects.

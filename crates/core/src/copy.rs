@@ -7,7 +7,7 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
@@ -59,8 +59,7 @@ const BREAKER_THRESHOLD: u32 = 5;
 /// protocol version — never user options, whose changes must not wipe
 /// another run's checkpoints.
 const RESUME_PROTOCOL_SIGNATURE: &str = "resume-protocol-v1";
-const SYSTEM_EXCLUSIONS: [&str; 6] = [
-    "$RECYCLE.BIN",
+const SYSTEM_EXCLUSIONS: [&str; 5] = [
     "System Volume Information",
     "pagefile.sys",
     "swapfile.sys",
@@ -2319,9 +2318,7 @@ impl Runner<'_> {
     fn is_system_candidate(&self, entry: &DirectoryEntry, parent_relative: &Path) -> bool {
         self.source_is_volume_root
             && parent_relative.as_os_str().is_empty()
-            && SYSTEM_EXCLUSIONS
-                .iter()
-                .any(|name| entry.name.to_string_lossy().eq_ignore_ascii_case(name))
+            && is_default_system_exclusion(&entry.name)
     }
 
     fn exclusion_reason(
@@ -2842,6 +2839,13 @@ impl Runner<'_> {
             active_paths: Vec::new(),
         }
     }
+}
+
+fn is_default_system_exclusion(name: &OsStr) -> bool {
+    let name = name.to_string_lossy();
+    SYSTEM_EXCLUSIONS
+        .iter()
+        .any(|candidate| name.eq_ignore_ascii_case(candidate))
 }
 
 struct Preflight {
@@ -3507,11 +3511,12 @@ fn revalidate_destination(
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::path::Path;
 
     use super::{
-        WorkerDispatch, completed_exit, path_hash, summarize_phases, validate_audit_layout,
-        worker_dispatch,
+        WorkerDispatch, completed_exit, is_default_system_exclusion, path_hash, summarize_phases,
+        validate_audit_layout, worker_dispatch,
     };
     use crate::model::Counters;
     use crate::report::VerificationSummary;
@@ -3633,6 +3638,21 @@ mod tests {
         let lower = path_hash(Path::new(r"\\?\c:\copytarget"));
         assert!(upper.is_ok());
         assert_eq!(upper.ok(), lower.ok());
+    }
+
+    #[test]
+    fn recycle_bin_is_copied_by_default_while_os_artifacts_remain_excluded() {
+        assert!(!is_default_system_exclusion(OsStr::new("$RECYCLE.BIN")));
+        assert!(!is_default_system_exclusion(OsStr::new("$recycle.bin")));
+        for artifact in [
+            "System Volume Information",
+            "pagefile.sys",
+            "swapfile.sys",
+            "hiberfil.sys",
+            "DumpStack.log.tmp",
+        ] {
+            assert!(is_default_system_exclusion(OsStr::new(artifact)));
+        }
     }
 
     #[test]

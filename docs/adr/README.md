@@ -26,6 +26,8 @@ first-class reported failure instead of discarding it. ADR 0045 adds a bounded
 two-buffer redirector pipeline and safe parallel streaming below the checkpoint
 boundary while leaving both local transports unchanged. ADR 0046 supersedes
 its shared WSL defaults with a distinct Plan 9 transport identity, striped WSL
-destination creates, sequential hints, and fewer metadata round trips.
+destination creates, sequential hints, and fewer metadata round trips. ADR
+0047 removes `$RECYCLE.BIN` from the default volume-root OS-artifact exclusion
+set while preserving the remaining exclusions and `--include-system`.
 
 The index is filename ordered. `docs/MAINTENANCE.md` maps decisions to code and release checks.
