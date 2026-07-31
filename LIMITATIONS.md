@@ -1,114 +1,337 @@
-# bigcp — Known Limitations
+# bigcp limitations and important behavior
 
-This file records deliberate scope decisions, engineering trade-offs, and open
-pre-1.0 evidence gaps. Each entry says what the limitation is, why it exists,
-and what to do about it when it matters. Section references point into
-`PLAN.md`.
+This guide explains what bigcp does not guarantee, what you may notice during
+a copy, and what to do about it. For the safest default experience, use local
+NTFS source and destination volumes, keep both trees unchanged while bigcp is
+running, wait for a successful final report before using the destination, and
+run standalone verification for important copies.
 
-## Platform and environment
+## Read this first
 
-- **Windows 11 22H2 or later only.** Older Windows versions are unsupported by design; the tool assumes modern APIs unconditionally and carries no OS-version fallbacks (§2.3). *Workaround: use robocopy on older systems.*
-- **Local NTFS, ReFS, FAT/FAT32, and exFAT volumes are supported.** NTFS is the strict full-fidelity path and the only filesystem certification target. ReFS retains exact timestamp and capability-driven mechanics but is best-effort. FAT-family destinations use an isolated reduced-fidelity policy and require one explicit pre-copy acceptance (`--accept-degraded-filesystem` for scripts); UDF and third-party local filesystems are still rejected (§4.4, F15). See “Filesystem-capability degradation” below before choosing a non-NTFS filesystem for important data.
-- **Every non-NTFS filesystem or endpoint is permanently best-effort under the current project contract.** This includes ReFS, FAT/FAT32, exFAT, generic UNC/provider filesystems, and WSL. Optional bounded compatibility exercises may improve evidence for a specific provider or device, but their absence is not a release blocker and passing them does not create a filesystem-certification claim (ADR 0042). For important non-NTFS copies, use `--verify` and then standalone `bigcp verify` against the actual destination.
-- **UNC paths, mapped network drives, and WSL UNC are supported with explicit limitations.** A real copy involving a remote endpoint requires the one startup acceptance (`--accept-remote-paths` for scripts); dry-run and standalone verification do not. Server durability and optional metadata are not equivalent to local disk guarantees, while WSL has a narrower content/last-write contract. See “Remote and WSL endpoints” below (§4.5, F27/F37).
-- **x64 only at v1.** ARM64 is a stretch goal; nothing in the design precludes it, but it is not built or tested (§2.3).
-- **Elevation confers nothing.** There is no backup-privilege mode: files the current user cannot read fail with a repair hint (fix ACLs / take ownership) rather than being force-copied (§5.13, F-table). This keeps the privilege model trivial.
+| If this applies to you | What it means | What to do |
+|---|---|---|
+| You need bigcp's strongest certified path | NTFS is the only certification target. Every other filesystem or remote provider is best-effort. | Prefer NTFS. For important non-NTFS or remote copies, use `--verify` and later run `bigcp verify SRC DST`. |
+| The source contains ACLs, ownership, auditing data, compression, or hard links | Those properties are not reproduced as source properties at the destination. | Use a tool and options designed to preserve those properties if they matter. |
+| The copy is interrupted or fails | Some final-named small files may be incomplete; resumable large-file temporaries may remain. This is expected and repairable. | Do not use the destination as complete. Fix the reported cause and run the same command again. |
+| Other programs may change either tree | Concurrent mutation is outside the supported contract and can create races that are not all detectable. | Stop writers and give bigcp exclusive use of both trees for the run. |
+| You need a mirror | bigcp never removes destination-only files. | Remove extras yourself or use a carefully configured mirror tool. |
+| You are copying to FAT/FAT32/exFAT | Metadata and link fidelity are reduced, FAT has a 4 GiB-minus-one-byte file limit, and unsafe removal is riskier. | Read the FAT-family section and explicitly accept the warning. Prefer NTFS when fidelity matters. |
+| You are copying over UNC, a mapped drive, or WSL | Provider metadata, disconnect behavior, and durable storage differ from local NTFS. | Read the remote section and explicitly accept the warning. Verify important results. |
+| You need proof against power loss | Normal completion is logical completion, and even hardware flushes are not universally honest. | Use `--flush`, safely remove external media, and run standalone verification later. |
+| A single directory may contain about one million entries | The current coordinator holds one directory listing and destination name map in memory. | Treat such directories as pre-1.0 and uncertified; monitor memory or split the directory if practical. |
 
-## What is not copied or preserved
+## Supported environment
 
-- **No ACLs, owner, or auditing information copied from the source.** Per the `/COPY:DTA` contract, destination files receive default inherited security (§4.2). One exception protects *destination* data: when replacing an existing destination file that carries explicit (non-inherited) DACL protection, that protection is preserved across the replacement — owner and SACL are not (privilege-gated). If preservation fails, the replacement fails rather than silently downgrading protection (§4.3). *Use robocopy `/COPY:S` workflows if source-security copying is required.*
-- **System- and storage-managed attributes are never copied.** `TEMPORARY`, `OFFLINE`, cloud-recall/pinned flags, and `NO_SCRUB_DATA` are owned by the filesystem/HSM/cloud filters — setting them blind changes system behavior. NTFS/ReFS receive the user-copyable mask (`READONLY, HIDDEN, SYSTEM, ARCHIVE, NOT_CONTENT_INDEXED`); FAT/exFAT receive only their representable `READONLY, HIDDEN, SYSTEM, ARCHIVE` subset (§4.2).
-- **ReFS integrity streams follow destination policy, not the source.** A file copied onto ReFS gets whatever integrity setting the destination directory/volume dictates; bigcp neither replicates, overrides, nor compares the source's setting (integrity has allocate-on-write costs the destination owner should control) (§4.2).
-- **NTFS compression state is not carried over.** Content is copied (decompressed on read); the destination file is stored uncompressed even on NTFS. Re-compressing costs throughput for a storage-layout attribute, and VISION explicitly drops it (§4.2, F22). Compressed-source counts appear in the report.
-- **Hard links are not preserved, detected, or reported.** Each linked name copies as an independent full file (robocopy's default behaves the same). Consequence: a heavily hard-linked tree occupies more space at the destination than at the source (§4.2, §5.6). 
-- **EFS-encrypted files can land as plaintext content.** bigcp reads through EFS (getting plaintext) and asks a capable destination to re-encrypt; FAT/exFAT and other destinations without EFS cannot do so, so the file lands unencrypted with a per-file `efs_downgrade` warning (§4.2).
-- **Sparse preservation is best-effort.** On destinations without sparse support the file is expanded dense; a dense copy is defined as *correct* — sparseness is a storage optimization, not content (§4.1, §4.2).
-- **Unknown third-party reparse points fail by default.** Only symlinks and junctions are recreated. HSM/ProjFS/App-Exec-Link and other filter-owned tags fail as `unsupported_reparse` because a verbatim buffer without its owning filter driver is not meaningfully a copy; `--raw-reparse` opts into verbatim copying at the user's risk (§4.6, E31).
-- **Symlink and junction targets are copied verbatim, never rewritten.** Absolute targets keep pointing at their original absolute location — a link that made sense on the source machine may dangle at the destination (§4.6). Symlink creation requires Developer Mode or the symlink privilege; otherwise each symlink fails with a hint.
-- **Cloud placeholders (OneDrive etc.) hydrate by default.** Copying a dehydrated placeholder downloads it; large placeholder trees can consume significant bandwidth and disk. The count is reported prominently, and `--skip-cloud` excludes them instead (§4.6). Placeholders are never copied as raw reparse points (that corrupts them off-volume).
-- **Root-level OS artifacts are excluded by default** (`$RECYCLE.BIN`, `System Volume Information`, page/hibernation files). Every exclusion is notified (banner, log, summary); `--include-system` restores them (§4.7, F17).
+- **Windows 11 22H2 or later, x64 only.** Older Windows releases and ARM64
+  builds are not currently supported. Use another copy tool on those systems.
+- **Local NTFS, ReFS, FAT/FAT32, and exFAT are accepted.** Within bigcp's
+  documented copy contract, NTFS is the strict, highest-confidence path and
+  the only certification target. ReFS and FAT-family support remain
+  best-effort even when they reuse the same mechanics as NTFS. Other local
+  filesystems, including UDF and third-party drivers, are rejected before
+  copying starts.
+- **UNC paths, mapped network drives, and WSL UNC paths are accepted
+  best-effort.** Their providers can offer weaker metadata, availability, and
+  durability guarantees than a local NTFS volume.
+- **Running as administrator does not enable a backup mode.** bigcp never asks
+  for backup privileges or bypasses ACLs. Elevation may change what Windows
+  permits the account to open, but unreadable files still fail normally and
+  are reported. Fix access or ownership and rerun.
 
-## Copy-semantics trade-offs
+## Before starting a copy
 
-- **The skip heuristic is size + last-write time, not content.** A destination file with identical size and mtime is skipped without reading it. Content that changed while size and mtime were preserved (deliberate tampering, or a program that restores timestamps) is not detected at copy time — this is the industry-standard trade (robocopy/rsync/rclone) for zero-I/O re-runs. *Standalone `bigcp verify` catches it* (§4.1, §5.17, E-catalog).
-- **ADS/EA divergence on an otherwise-identical file is not detected at copy time.** Checking streams on every skipped file would cost a per-file query for a vanishingly rare case (F11/F21). *Standalone `bigcp verify` compares full stream sets and EA blobs* (§4.1 scope note, E43).
-- **Last-access time is set but never compared or strictly verified.** Reading a file rewrites its atime; using it as an equality key would cause perpetual re-copy churn. Verification reports it separately as informational (§4.1, §5.17).
-- **Destination files not present in the source are never touched — or removed.** bigcp has no mirror/purge capability *by design* (it structurally cannot delete user files). Consequence: re-running against an evolving source accumulates stale extra files at the destination. Extras are counted and sampled in the report (§4.1, §2.4).
-- **Names differing only by case collide on case-insensitive destinations.** Local Windows volumes and generic UNC destinations retain ordinal case-insensitive joining. WSL destinations use exact Linux name matching and may hold both names; copying that tree later to a case-insensitive destination reports the collision instead of silently overwriting either object (§4.5, E26/E48).
-- **Type conflicts are errors, not resolutions.** A destination directory where the source has a file (or vice versa, or an unexpected reparse point) fails with `type_conflict`; bigcp will not delete or write through the conflicting object — the user resolves it manually (§4.1, E27/E36).
+- **Keep the source and destination stable.** bigcp assumes exclusive access
+  to both trees. It detects many changed, vanished, or substituted objects,
+  but it cannot make arbitrary concurrent writers safe and does not create a
+  Volume Shadow Copy snapshot.
+- **Only one run may use an exact destination root on the machine.** A
+  machine-wide lock refuses a duplicate run. Nested or overlapping destination
+  roots are not detected; do not run them concurrently.
+- **There is no up-front free-space forecast.** Sparse allocation, cluster
+  rounding, and replacements make forecasts approximate. If the destination
+  fills, the circuit breaker stops the run after repeated disk-full failures.
+  Free space and rerun; completed files remain and are skipped.
+- **Differing destination files are replaced by default.** Use
+  `--replace=false` when you want them reported and left untouched. In either
+  mode, destination-only paths are never removed.
+- **Audit files must be outside both trees.** `--state-dir`, `--log`, and
+  `--report` paths inside the source or destination are rejected. They may be
+  on the same volume, just not beneath either active tree. A dry-run leaves
+  the destination tree unchanged but still writes its audit state, log, and
+  report.
+- **Cloud placeholders hydrate by default.** Reading OneDrive or another
+  provider's placeholder can download its content and consume network and
+  local storage. Use `--skip-cloud` to exclude placeholders. bigcp never copies
+  a provider-owned cloud reparse buffer as though it were a portable link.
+- **Root-level Windows artifacts are excluded by default.** This includes
+  `$RECYCLE.BIN`, `System Volume Information`, page files, and hibernation
+  files. Exclusions are reported. Use `--include-system` only when you have
+  reviewed the implications.
+- **Locked files fail immediately.** There are no retries, waits, or lock-owner
+  discovery. Close the program using the file and rerun; Task Manager or
+  Resource Monitor can help identify it.
 
-## Durability and verification caveats
+## What is and is not preserved
 
-- **Default completion is logical, not power-loss durable.** "Copied" means data and metadata were acknowledged and the applicable publication protocol completed — the same class of contract as robocopy and Explorer. Recently completed files may still sit in OS or drive caches; power loss can lose them. A normal rerun repairs size/mtime-visible damage, but the skip heuristic cannot detect every cache-loss pattern that preserves size and timestamp. After unsafe removal or power loss, run standalone `bigcp verify`; manually remove or move any reported bad destination object, then rerun. `--flush` requests per-file durable completion (§7.5). There is no volume-level flush (VISION).
-- **Even `--flush` is bounded by hardware honesty.** Some USB bridges and drives do not fully honor cache-flush semantics; bigcp reports what it did, not what the hardware guarantees (§7.5, H5).
-- **Remote completion cannot attest server-side stable storage.** An SMB/third-party server or WSL provider may acknowledge Windows writes or flushes while data is still in a remote cache. bigcp can enforce its local completion/publication protocol and later reread the namespace, but cannot force or prove the server's physical-media durability. Use the server's own backup/snapshot guarantees for that claim (§7.5, F37).
-- **Verification cannot force honest physical-media reads.** Same-run read-back may be served from the OS cache, and even a later standalone pass is bounded by the drive/controller's cache honesty. It still catches application, filesystem, and most stored-data divergence (§5.17).
-- **xxh3-128 is not cryptographic.** Digest equality is overwhelming statistical evidence against accidental corruption and omissions — the VISION threat model — but offers no protection against a deliberate adversary crafting collisions. Tamper-evidence is explicitly out of scope (§5.11, F30).
-- **An interrupted run can leave incomplete plain files at their final destination names — by design, and repaired by re-running.** Plain small files write directly to their real names for speed (this roughly halved per-file overhead versus the old always-use-a-temporary design, ADR 0030). A mid-data-write file is shorter than its source; once its one unnamed payload has landed, the logical file is already valid. Files carrying ADS/EAs, sparse files, and large files use opaque temporaries and atomic rename so their multi-part state never publishes partially (ADR 0034). The source is never modified. **Do not consume or share the destination until a run reports success** — the final report is the completion signal, not the presence of files (§4.3, §5.12, §7.2).
-- **Checkpoint watermarks are tentative.** No destination flush accompanies a checkpoint (a deliberate throughput choice); after a power loss the journal may describe more data than survived. This is safe because resume *always* re-reads and digest-verifies the partial: after process termination you resume near the checkpoint; after power/device loss you resume if the data survived verification, otherwise the file restarts safely (§5.12).
-- **Replacements assume the destination is yours during the run.** Plain small-file replacements overwrite the existing file in place (which conveniently preserves its permissions); transactional replacements revalidate the target immediately before an atomic rename, leaving only a microsecond race window. Both rest on the stated assumption that nothing else is modifying the destination tree while bigcp runs (F16, §4.3). Note that an interrupted direct replacement means the old destination content is already gone and the new content is incomplete — the re-run completes it from the source, which is why the source-is-never-touched rule matters.
+| Property | Behavior |
+|---|---|
+| Regular file content | Preserved. This is always part of a successful file outcome. |
+| Creation and last-write times | Exact on NTFS/ReFS; projected to the destination representation on FAT/exFAT and provider-dependent remote filesystems. |
+| Last-access time | Set best-effort, but never used for skip equality and reported only as informational during verification. |
+| Basic attributes | NTFS/ReFS receive `READONLY`, `HIDDEN`, `SYSTEM`, `ARCHIVE`, and `NOT_CONTENT_INDEXED`; FAT/exFAT receive only the subset they can represent. Storage-managed and cloud attributes are not copied. |
+| Alternate data streams and extended attributes | Preserved when both endpoints advertise support. Otherwise they are dropped with per-file warnings and report counts. |
+| Source ACLs, owner, and auditing data | Not copied. New destination objects inherit destination security. |
+| Protected destination DACL | Preserved when replacing an existing protected object. If it cannot be preserved, the replacement fails instead of silently weakening protection. |
+| NTFS compression | Not reproduced. The content is read normally and stored uncompressed; compressed-source counts appear in the report. |
+| ReFS integrity streams | Follow the destination directory or volume policy. bigcp neither copies nor overrides the source setting. |
+| Hard links | Not detected or preserved. Each linked name becomes an independent file and may consume additional space. |
+| Sparse allocation | Preserved when supported; otherwise the logical content is copied densely and the expansion is reported. |
+| EFS encryption | Content is read as plaintext. bigcp asks a capable destination to encrypt it, but an incapable destination receives plaintext with an `efs_downgrade` warning. |
+| Symlinks and junctions | Recreated without following them when supported. Their target text is copied verbatim, so an absolute target may be wrong or dangling at the destination. Creating symlinks requires Developer Mode or the appropriate privilege. |
+| Unknown reparse types | Fail as `unsupported_reparse` by default. `--raw-reparse` opts into verbatim copying at your risk; the destination may not have the filter driver needed to interpret the data. |
+| Destination-only objects | Reported as extras and never deleted. |
 
-## Concurrency and stability assumptions
+Type conflicts are errors. If the source has a file where the destination has
+a directory, link, or other incompatible object, bigcp reports
+`type_conflict` and leaves the destination object untouched. Resolve the
+conflict yourself and rerun.
 
-- **Both trees are assumed exclusive and stable during a run.** Concurrent writers are the user's rule violation, not a supported mode (no VSS). Violations are cheaply detected where possible — vanished/changed sources, changed destination targets, reparse swaps at examination time — and fail those files; mid-run races inside the detection gaps are not guaranteed caught (§4.8, §4.5, F16).
-- **In-use files fail immediately.** There are no retries or waiting, and bigcp does not query Restart Manager for the lock owner. Close the program using the file (Task Manager or Resource Monitor can help), then rerun (§5.13).
-- **One run per exact destination root per machine.** A second run on the same root is refused (machine-wide lock). Nested or overlapping destination roots are *not* detected — that situation falls under the exclusivity assumption (§5.12, F26/E33).
-- **Abort-and-rerun is the only recovery model.** On device/share disconnect, stopped WSL distribution, or fatal conditions the run stops resumably; there is no in-run reconnect flow. Common redirector disconnect errors feed the same five-failure breaker as local device removal. Resume is cheap by design (skip heuristic + verified checkpoints), which is what makes this acceptable (§5.13, F31/F37).
-- **Graceful cancel responds quickly, even inside a huge file.** Pressing `q` or Ctrl+C stops the current large file between chunks rather than waiting for it to finish; its in-progress temporary either deletes itself or, once checkpointed, is kept and safely resumed by the next run. Small files that are already in flight finish first — they take only moments — so a cancel leaves no small-file partials behind; only a hard kill can do that, and the re-run repairs it.
+Names that differ only by case collide on ordinary case-insensitive Windows
+destinations. WSL destinations use exact Linux name matching and may contain
+both names. Copying such a WSL tree back to a case-insensitive destination
+reports the collision instead of overwriting one name.
+
+## Skipping, replacement, and interrupted runs
+
+- **The fast skip test is size plus last-write time, not a content hash.** On
+  NTFS/ReFS, time comparison is exact. FAT-family comparison uses its coarser
+  representation. A file whose content changed while both size and timestamp
+  were deliberately preserved can be skipped. Run `bigcp verify SRC DST` to
+  detect that case.
+- **ADS or EA-only changes can be missed by the copy-time skip test.** Querying
+  them on every apparently identical file would add a per-file I/O operation.
+  Standalone verification compares stream sets and EA data.
+- **Plain small files are written directly to their final names for speed.** A
+  hard kill can leave one or more in-flight files incomplete. A replacement's
+  previous content is already gone once the direct overwrite begins. The next
+  stable rerun sees the mismatch and repairs it from the untouched source.
+- **Large, sparse, ADS-bearing, and EA-bearing files publish transactionally.**
+  They use opaque sibling temporaries and an atomic rename so their multi-part
+  state is not exposed as a completed file.
+- **A kill can rarely strand an opaque ADS temporary.** Opening a named stream
+  requires a short interval in which delete-pending disposition is cleared.
+  A process kill in that window may leave one reported `.part` object, but not
+  a partially published logical file or damaged previous destination.
+- **Checkpoint watermarks are tentative.** Checkpoints are not individually
+  flushed. Resume always rereads and hashes the temporary prefix before
+  trusting it, so a valid prefix continues and a damaged or missing prefix
+  restarts safely.
+- **Abort and rerun is the recovery model.** A disconnected device/share,
+  stopped WSL distribution, disk-full breaker, or other fatal condition stops
+  the run. bigcp does not wait for reconnection. Fix the cause and rerun.
+- **Graceful cancellation finishes already-running small files.** Large files
+  stop between chunks and retain only verified resumable state. A hard process
+  kill has the weaker direct-small-file behavior described above.
+
+Until the run reports success, treat the destination as in progress. The
+presence of a file is not the completion signal.
+
+## Durability and verification
+
+- **Normal completion is logical, not guaranteed power-loss durability.** Data
+  and metadata were accepted by Windows and publication completed, but recent
+  writes may remain in an OS, bridge, controller, or drive cache.
+- **`--flush` requests per-file durable completion.** Some hardware and USB
+  bridges do not fully honor cache-flush commands, so bigcp can report the
+  request but cannot certify the hardware's behavior. There is no volume-level
+  flush option.
+- **Always use Safely Remove for external media.** This matters especially for
+  FAT/exFAT, which lack an NTFS-style metadata journal. After unsafe removal or
+  power loss, run standalone verification; move or remove any reported bad
+  destination object and rerun the copy.
+- **Same-run `--verify` can read from cache.** It catches application and
+  filesystem mistakes, including wrong bytes, truncation, streams, EAs,
+  attributes, and timestamps for files written in that run. It cannot prove
+  that a physical platter or flash cell was reread.
+- **Standalone verification is the authoritative tree comparison.** Run
+  `bigcp verify SRC DST` later, after caches have naturally moved on, when the
+  result is important. It compares both complete trees; post-copy `--verify`
+  covers copied files only, not directories and reparse objects.
+- **xxh3-128 is an accidental-corruption check, not a cryptographic proof.** It
+  is not designed to resist a deliberate attacker constructing collisions.
+- **Remote durability belongs to the server.** SMB, third-party providers, and
+  WSL may acknowledge writes or flushes while data remains in a remote cache.
+  Use the server's snapshot or backup guarantees when physical durability is
+  required.
+
+## FAT, FAT32, and exFAT
+
+A real copy to a FAT-family destination requires one default-no startup
+confirmation. Scripts and other noninteractive runs must pass
+`--accept-degraded-filesystem`. Dry-run and standalone verification do not
+need acceptance because they do not change the destination tree.
+
+- **FAT files cannot exceed 4,294,967,295 bytes.** An oversized source fails
+  before its destination is opened. exFAT supports the 64-bit file sizes used
+  by bigcp.
+- **Timestamps are coarser and range-limited.** FAT creation time has 10 ms
+  precision and last-write time 2 s; exFAT creation and last-write use 10 ms.
+  Drivers generally support calendar years 1980–2107. A value the driver
+  cannot encode fails instead of being invented. FAT local-time/DST conversion
+  may cause a safe extra copy after a seasonal clock change.
+- **ADS, EAs, source ACLs, EFS state, sparse layout, and links cannot be fully
+  represented.** Streams and EAs are dropped with warnings, encrypted content
+  may land as plaintext, sparse files expand, and symlinks/junctions fail
+  rather than being followed or flattened.
+- **Only `READONLY`, `HIDDEN`, `SYSTEM`, and `ARCHIVE` attributes transfer.**
+  Last-access time is informational and especially coarse.
+- **The destination driver decides which names it accepts.** bigcp reports
+  illegal characters, component-length limits, and directory-entry failures;
+  it never sanitizes or renames source paths.
+- **There is no metadata journal.** Process interruption remains rerunnable,
+  but power loss or unsafe removal can damage filesystem structures beyond the
+  current file. `--flush` cannot add journaling.
+- **Older driver operations are used when necessary.** FAT-family identity and
+  rename fallbacks remain handle-bound and rerunnable, but they do not create
+  NTFS semantics.
+- **Verification is destination-projected.** A successful result proves the
+  unnamed content and representable fields, not that unsupported NTFS
+  metadata survived. Reports mark this as `projected: true`.
+
+FAT-family behavior is best-effort regardless of optional compatibility-test
+results. For important data, test the actual drive/enclosure and use both
+verification forms.
+
+## ReFS
+
+- ReFS is accepted best-effort and uses exact timestamps plus its advertised
+  capabilities, but it is not a certification target.
+- If a ReFS volume reports no ADS or EA support, those properties are dropped
+  with warnings and report counts. ReFS does not support EFS, so encrypted
+  source content lands decrypted with a warning.
+- Same-volume ReFS block cloning is not implemented. bigcp always streams the
+  content. Explorer or robocopy may be dramatically faster for a same-volume
+  clone-capable copy, and bigcp reports a hint rather than making a false
+  performance claim.
+
+## UNC, mapped drives, and WSL
+
+A real remote copy requires one default-no startup confirmation. Scripts and
+other noninteractive runs must pass `--accept-remote-paths`. When FAT-family,
+remote, and removal-policy notices overlap, bigcp combines them into one
+prompt. Dry-run and standalone verification remain read-only and need no
+acceptance.
+
+- **Remote topology is opaque.** bigcp does not send local disk, bus, extent,
+  or cache-policy IOCTLs to a remote root and cannot know whether two shares
+  use the same server disk. It therefore never selects the local same-spindle
+  transport for remote paths.
+- **Remote tuning uses conservative static defaults.** Generic UNC uses an
+  8 MiB request/16-worker profile and WSL uses 4 MiB/8 workers in Auto mode.
+  These settings are bounded and correctness-tested, not certified as optimal
+  for every network or provider. `--profile` and `--tune` remain available.
+- **Generic UNC fidelity depends on the provider.** Known filesystem names use
+  their corresponding policy and reported capabilities. Unknown providers
+  require regular content and last-write time but do not claim Windows
+  creation/access times or attributes. Provider timestamp limitations may
+  cause a conservative recopy or verification failure.
+- **Credentials, quotas, DFS, Offline Files, snapshots, and share availability
+  remain administrator concerns.** bigcp reports the resulting Windows errors
+  and does not retry in the same run.
+- **WSL has a deliberately narrower contract.** Current and legacy WSL UNC
+  aliases share one identity. Regular-file bytes and last-write time are
+  preserved, destination names are matched case-sensitively, and unsupported
+  reparse objects fail. Linux uid/gid/mode/xattrs and special-file semantics,
+  Windows creation/access times and attributes, ADS/EAs, ACLs, EFS, and sparse
+  layout are not reproduced through this Win32 engine.
+- **WSL UNC is not the fastest Linux-to-Linux path.** Windows access crosses
+  WSL's translation boundary and may start the distribution. Prefer native
+  Linux tools inside WSL for sustained copies entirely within Linux.
+
+Important remote copies should use same-run verification and a later
+standalone verification against the actual provider.
 
 ## Performance boundaries
 
-- **Performance settings never change during a run.** Everything comes from the drive-class profile chosen at startup (`--profile` and `--tune` override it manually). bigcp deliberately has no self-tuning: if a drive or USB enclosure starts misbehaving mid-copy, bigcp does not slow itself down and press on — it stops safely after repeated device errors (the circuit breaker, exit code 4) so you can fix the cause and re-run, resuming where it left off. What this costs you: a drive that is merely *slow* in an unusual way will not be automatically adapted to; the fix is a manual `--tune` (for example a different chunk size), and the log records the settings used so you can see what to change.
-- **Same-volume ReFS copies do not block-clone.** bigcp always streams; on Dev-Drive-style same-volume duplication the OS copy engines (Explorer/robocopy) are dramatically faster and bigcp says so in a hint rather than competing (§5.9, F28).
-- **Single-directory enumeration is not memory-bounded yet.** The coordinator materializes each source listing and destination name map, so peak memory is proportional to the largest single directory. The planned bounded fallback and million-entry synthetic validation have not landed; do not treat million-entry directories as certified in this pre-1.0 build (§5.6, F33).
-- **The report's ceiling figure is "best observed sustained throughput".** It is the best sustained window measured during the run — a labeled, honest measurement, not a theoretical device limit; no device probing exists (§5.14, VISION's own terminology).
-- **Bottleneck verdicts are confidence-rated hypotheses.** They derive from application-side I/O occupancy, which approximates but does not equal physical device utilization (§5.14).
-- **Some hardware behavior is invisible.** DM-SMR drives cannot be reliably detected in software (their write-collapse is inferred from throughput signatures); USB bridges frequently fail or misreport capability IOCTLs (profiles fall back conservatively); removal-policy readings are inferences (§3.4, §5.5).
-- **There is no up-front "will it fit?" check.** bigcp does not estimate whether the destination has enough free space before it starts; any such estimate would be approximate at best (cluster rounding, in-flight replacements, sparse files), and a warning would not change what you have to do. What happens instead: if the destination fills up, the run stops safely after a few disk-full failures (exit code 4) with a clear message; free some space and re-run — everything already copied is kept and skipped, and the run continues from where it stopped. If you want certainty before a huge copy, compare the source size against the destination's free space yourself first.
-- **Same-spindle HDD copies remain mechanically limited and are not yet hardware-benchmark certified.** bigcp now intersects physical-disk extents and, when either effective profile is rotational, selects one isolated phased transport: plain small files are read in bounded batches before their destination-write phase; large, sparse, and named streams stage up to 256 MiB before switching direction. This reduces avoidable source↔destination head seeks but cannot make one spindle read and write at the simultaneous rate of two drives. Same-device SSDs and all independent-device copies retain the standard transport. If Windows cannot report physical extents or seek penalty, bigcp does not guess; the standard path is used (an explicit `--profile hdd` supplies media class but cannot manufacture missing topology). `--tune same-spindle-burst=` can adjust the 1 MiB–1 GiB burst, and `mem=` caps it. Routine correctness/cancellation tests pass, but no bounded real-HDD comparison has been run in this change because performance tests require separate owner approval under `docs/TESTING.md`; treat the default as implemented and correctness-tested, not universally optimal, until the `[HW]` result is archived (§8.3, ADR 0036).
+- **Profiles are selected once at startup.** bigcp does not continuously
+  retune itself. A merely unusual slow drive is not automatically retuned;
+  inspect the recorded profile and use bounded `--tune` overrides when you
+  have measurement evidence. Repeated device failures stop the run instead of
+  causing aggressive retries.
+- **Same-drive HDD optimization is implemented but not hardware-certified.**
+  When both roots map to one rotational disk, bigcp batches small-file reads
+  before writes and stages large/sparse/ADS data in bursts of up to 256 MiB.
+  This avoids needless head switching but cannot make one spindle perform like
+  two independent drives. The 1 MiB–1 GiB `same-spindle-burst` setting is
+  capped by `mem=`. If Windows cannot prove shared physical extents and seek
+  penalty, bigcp safely retains the standard path rather than guessing.
+- **Same-drive SSDs retain the normal parallel transport.** SSDs have no seek
+  penalty, so serial HDD phasing would normally reduce useful concurrency.
+- **Large files use Windows buffered I/O.** There is no robocopy-style `/J`
+  unbuffered mode. Windows read-ahead and write-behind are simple and fast on
+  the primary external-drive scenarios, but a huge copy can temporarily evict
+  other applications' cached data. That is harmless and self-correcting.
+  Large files are also hashed while being read to protect checkpoint/resume
+  integrity; there is no switch to disable that integrity check.
+- **One directory is currently materialized in memory.** Total tree size is
+  streamed and bounded elsewhere, but peak memory grows with the largest
+  single directory. The synthetic million-entry fallback remains a pre-1.0
+  evidence and implementation gap.
+- **Reported ceilings are observations, not device specifications.** “Best
+  observed sustained throughput” is the best window seen during the actual
+  copy. Bottleneck explanations are confidence-rated hypotheses based on
+  application-side I/O, not physical-device telemetry.
+- **Some device behavior cannot be identified reliably.** USB bridges often
+  omit or misreport capabilities, and drive-managed SMR behavior is inferred
+  only from throughput. Unknown devices receive conservative defaults.
 
-## Remote and WSL endpoints
+## Logs, reports, and command output
 
-- **Remote copying is explicit and noninteractive-safe.** Before a real UNC, mapped-drive, or WSL copy, the interactive CLI prints the complete remote warning once and defaults to “no.” `--accept-remote-paths` is required for `--plain`, `--quiet`, and other noninteractive use. If FAT/exFAT acceptance or a Quick-removal notice also applies, all known notices share one prompt. Dry-run and standalone verification remain read-only and need no acceptance (§10.1, F19/F37).
-- **Remote topology is opaque.** bigcp deliberately does not issue local disk, bus, cache-policy, or extent IOCTLs to remote roots and cannot infer whether two UNC names ultimately use the same server disk. Remote copies therefore never select same-spindle transport. Auto mode uses a bounded static redirector profile (8 MiB/16 workers for generic UNC; 4 MiB/8 workers for WSL), with a remote source capping the composed worker count. These defaults are correctness-tested but not network/hardware benchmark-certified; `--profile`/`--tune` remain bounded manual overrides (ADR 0037).
-- **Generic UNC fidelity is provider-dependent.** Known NTFS/ReFS/FAT/exFAT shares use the corresponding destination policy plus the capabilities returned by the server. An unknown remote filesystem receives the conservative projected policy: regular content and exact last-write time are required, while creation/access times and Windows attributes are not claimed. A provider that cannot round-trip last-write time exactly can cause conservative recopy or verification failure rather than an unsafe skip. Authentication, share availability, quotas, Offline Files, DFS referrals, and server snapshots remain administrator concerns; bigcp reports their Win32 failures and never retries in-run.
-- **WSL UNC preserves a deliberately narrow contract.** `\\wsl.localhost\DISTRO\...` and legacy `\\wsl$\DISTRO\...` normalize to one identity. Regular-file bytes and last-write time are preserved, destination names are matched case-sensitively, and all I/O stays bounded. Linux uid/gid/mode/xattrs and special files, Windows creation/access times and attributes, ADS/EAs, ACLs, EFS state, and sparse layout are not representable by this Win32 engine. Reparse objects fail rather than being followed or flattened. A successful projected verification does not claim those fields survived (ADR 0037).
-- **WSL UNC is an interoperability path, not the fastest way to copy within Linux.** Windows access crosses WSL's 9P translation boundary and can start the distribution. Native Linux tools inside the distribution remain preferable for sustained Linux-filesystem-to-Linux-filesystem work. bigcp's WSL profile reduces call frequency and retains Windows-side safety/audit behavior, but no WSL/network throughput claim is made until bounded approved benchmarks are archived.
-- **Live remote compatibility evidence is necessarily provider-specific.** A bounded read-only WSL-source dry-run verifies the implemented provider queries, case-aware enumeration, classification, and projected reporting without mutating either tree. Approved scratch endpoints may optionally exercise generic SMB publication, mapped aliases, or WSL destinations, but these best-effort paths are not certification targets. Use `--verify` and then standalone `bigcp verify` for important remote copies (§12.5, ADRs 0037/0042).
+- **A run that loses both audit-log paths aborts.** bigcp tries to reopen the
+  configured log and then fails over to the state directory. If both fail, it
+  exits with code 6 without a normal final report or `run_end`. One operation
+  already executing may finish while workers unwind, but no unaudited
+  completion is claimed. Rerun to reclassify the destination.
+- **Report error samples are bounded.** Reports retain counts plus a limited
+  sample per category. The JSONL log contains every emitted event.
+- **Standalone verification writes JSON to stdout only.** Redirect it when you
+  need a saved artifact: `bigcp verify SRC DST > result.json`.
+- **Logs and reports are not automatically expired.** Delete old audit files
+  yourself if they accumulate.
+- **The dashboard is intentionally focused.** It shows progress, rates, ETA,
+  errors, and hints, but not per-file progress bars or historical sparklines.
 
-## Filesystem-capability degradation
+## Pre-1.0 evidence gaps
 
-- **ReFS support is best-effort, not a certification target.** bigcp accepts ReFS volumes (for example a Windows Dev Drive) on both sides, and its capability detection, exact timestamp policy, atomic publication, and degrade-with-warning behavior remain implemented and routinely code-reviewed. A disposable ReFS matrix may be run as optional compatibility evidence, but is neither required for release nor grounds for a certification claim. For maximum assurance on an actual ReFS copy, run with `--verify` and follow up with `bigcp verify SRC DST`.
-- **ReFS versions vary in capability.** Where a destination volume reports no support for named streams or EAs (capability flags, not FS names), those items are dropped with per-file warnings and counted — never silently; the file still counts as copied-with-warnings (§4.4). EFS files land decrypted on ReFS (`efs_downgrade` warning) since ReFS has no EFS.
-- **FAT/exFAT copying is deliberately reduced-fidelity and opt-in.** Before a real copy to either filesystem, the interactive CLI shows the complete degradation summary once and defaults to “no.” `--accept-degraded-filesystem` records explicit acceptance and is required for non-interactive, `--plain`, or `--quiet` use. Dry-run does not need acceptance because it makes no destination-tree changes; its audit log/report are still written (§4.4, F19).
-- **FAT has a hard 4,294,967,295-byte per-file ceiling.** An oversize file fails with `fs_limit` before its destination is opened or modified. exFAT supports the 64-bit sizes used by bigcp (§4.4, E24).
-- **FAT-family timestamps are coarse, range-limited, and lossy.** Classification and verification use the destination representation: FAT creation time has 10 ms precision and last-write time 2 s; exFAT creation and last-write use 10 ms. Their on-disk calendar range is nominally 1980–2107; a source value the mounted driver cannot encode fails rather than being silently invented. Last-access remains informational (FAT stores only a date; exFAT has a coarser access representation). FAT local-time/DST conversion can trigger a conservative extra copy after a seasonal clock change; bigcp does not use a broad one-hour tolerance that could falsely skip changed data (§4.1, §4.4).
-- **FAT/exFAT cannot preserve named streams, extended attributes, ACLs, EFS state, or sparse layout.** Named streams and EAs are dropped with per-file warnings and report counts; protected destination DACL preservation is inapplicable; encrypted content lands plaintext with a warning; sparse data is copied densely with a `sparse_expanded` warning. Only `READONLY`, `HIDDEN`, `SYSTEM`, and `ARCHIVE` attributes transfer. The unnamed file bytes remain the success criterion (§4.2, §4.4).
-- **Reparse objects cannot be represented on FAT/exFAT.** Symlinks and junctions fail with `fs_limit` rather than being followed, flattened, or silently omitted. This is intentionally a hard failure because changing a link into copied target content changes tree meaning (§4.4, E23).
-- **FAT/exFAT names and metadata may reject objects that NTFS accepts.** The destination driver remains authoritative for component length, illegal characters, and directory-entry limits; such failures are reported per object. bigcp does not sanitize or rename source paths.
-- **FAT/exFAT have no metadata journal.** Process interruption remains rerunnable, but unsafe removal or power loss can damage filesystem structures—not merely the current file—and `--flush` cannot add journaling. Always use Safely Remove, rerun after interruption, and use standalone `bigcp verify` after a suspected power/device fault (§7.5).
-- **FAT-family identity and publication use driver fallbacks.** When 128-bit `FileIdInfo` or `FileIdExtdDirectoryInfo` is unavailable, bigcp uses the documented legacy 64-bit FAT file ID and one-pass `FileIdBothDirectoryInfo` enumeration. A rename can change a FAT file ID, so it is never treated as a durable cross-rename identity. If extended POSIX rename is unavailable, publication falls back to legacy handle-bound rename; it remains process-atomic, but it does not create NTFS journaling semantics (§4.4, §5.6).
-- **Verification is destination-projected on reduced-capability filesystems.** Same-run and standalone verification compare unnamed content plus every field the destination can represent, and reports set `projected: true`. A successful FAT/exFAT verification therefore does not claim that unsupported source ADS, EAs, ACLs, links, encryption, or sparse layout survived; their loss is established separately by warnings and counters (§5.17).
-- **FAT/exFAT remain best-effort regardless of matrix coverage.** Their policy, capability fallbacks, and boundary behavior have unit/integration coverage. A disposable-VHDX exercise may add compatibility evidence on a particular Windows build, but it is optional and cannot certify the filesystem path. Use `--verify` and a later standalone `bigcp verify` for important copies, and test the actual enclosure/drive before relying on production throughput.
+These are not silent passes. They remain open in
+[`docs/PRODUCTION_READINESS.md`](docs/PRODUCTION_READINESS.md):
 
-## Pre-1.0 implementation status (temporary, tracked in PLAN §13.2)
+- deterministic fault and kill-point coverage for every completion boundary;
+- bounded real-process chaos and the final adversarial validation set;
+- synthetic million-entry single-directory validation and its bounded-memory
+  fallback;
+- topology-matched NTFS performance evidence, including same-spindle HDD;
+- emitted-instance schema validation and the final production checklist.
 
-- **Large files copy through Windows' file cache — by design.** bigcp deliberately does not use direct (unbuffered) disk I/O like robocopy's `/J`: the buffered path is simpler, and Windows' own read-ahead and write-behind keep the drive busy (ADR 0028). What you may notice: while a very large copy (say 40 GB) is running, Windows temporarily fills memory with that file's data, which can push other programs' cached data out — this is harmless, corrects itself after the copy, and matters less the more RAM the machine has. If broader real-world measurements show this design losing meaningful speed on huge files, unbuffered I/O is the documented remedy, to be adopted only with benchmark evidence. `BENCHMARKS.md` records the current bounded hardware results; they are workload-specific evidence, not universal throughput certification.
-- **Same-run `--verify` may read recently written data from memory, not the disk.** This is permanent behavior, not a gap to be filled (ADR 0028): the read-back still catches copying mistakes (wrong bytes, truncation, missed streams), but a file that was written moments ago can be served from Windows' cache rather than the physical drive. When you want proof the bytes are really on the disk — for example before archiving the source — run `bigcp verify SRC DST` later, after the cache has moved on; that standalone check reads both trees fresh and is the authoritative comparison.
-- **Post-copy `--verify` covers files only** (all streams, EAs, masked attributes, timestamps); directories and reparse objects are verified by the standalone form.
-- **One crash micro-window can strand a single opaque temp (transactional named-stream path):** opening a named stream on a temporary requires briefly clearing its pending-delete disposition; a kill inside that syscall window leaves one reported `.part` artifact (never a partially published logical file, never damaged old data). This can apply to an ADS-bearing file of any size (ADR 0034).
-- **Small conveniences that were deliberately left out** (each traded for simplicity; none affects what gets copied or how safely):
-  - When a file can't be replaced because another program has it open, the error tells you the file is in use but does not name which program — use Task Manager or Resource Monitor if you need to find it.
-  - `bigcp verify SRC DST` prints its complete machine-readable result to the terminal and sets the exit code; it does not additionally save a report file. Redirect its output (`bigcp verify … > result.json`) if you want to keep it.
-  - Each run leaves its log and report files in the state directory and bigcp never deletes old ones; delete aged files yourself if they accumulate.
-  - The dashboard shows progress, rates, ETA, errors, and hints — it does not show per-file progress bars or historical sparkline charts.
+Project safety rules prohibit endurance-scale writes, real million-file test
+trees, forced disconnects, crashes, reboots, and other machine-stability risks.
+Those scenarios cannot be reclassified as passed; safe simulation or bounded
+evidence must be used instead. See [`docs/TESTING.md`](docs/TESTING.md).
 
-## Verification limits (what testing can never prove here)
+## When another tool is a better fit
 
-- **Million-scale and endurance behavior is not empirically reproduced.** VISION prohibits tests that create ~100 k+ files, run very long, reduce drive lifespan, or impact machine stability — with no exceptions. Million-entry behavior therefore requires a synthetic enumeration harness, which is still a release-evidence gap; TB-class behavior is extrapolated from bounded workloads; and real surprise removal is never reproduced by cable pull or forced detach. Device-loss behavior must be validated through fault injection (PLAN §12.0, §12.5).
+Use another tool or workflow when you need:
 
-## Reporting and audit
+- Windows versions before 11 22H2 or an ARM64 build;
+- source ACL, owner, auditing, hard-link, or compression preservation;
+- backup-privilege access to unreadable files;
+- automatic deletion of destination extras;
+- ReFS block cloning or guaranteed best performance for same-volume ReFS;
+- protocol-specific SMB acceleration, server-side copy, delta transfer, or
+  reconnect-and-retry behavior;
+- native preservation of Linux ownership, modes, xattrs, or special files;
+- cryptographic tamper evidence rather than accidental-corruption detection.
 
-- **A run that can no longer write either log aborts without a normal final report.** After one reopen and state-directory failover both fail, bigcp returns the audit-failure exit code immediately. An operation already executing may finish while worker resources unwind, but no unaudited completion is claimed; a missing `run_end` is the signal, and rerunning safely reclassifies the destination. The older modeled drain-and-report state was deliberately removed as disproportionate complexity (ADR 0027, §5.15, I7).
-- **Audit artifacts may never live inside either tree.** `--state-dir`, `--log`, and `--report` paths under the source or destination root are rejected pre-flight (same volume is fine) — a log inside SRC would mutate the "stable" source and be copied by its own run (§5.12, E46).
-- **Error samples in the report are capped** (first N per category, plus counts); the JSONL log always holds every event (§10.3).
+For implementation rationale and invariant identifiers, see
+[`PLAN.md`](PLAN.md), [`docs/DESIGN.md`](docs/DESIGN.md), and the
+[`docs/adr`](docs/adr) directory.

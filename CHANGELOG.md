@@ -36,6 +36,11 @@ versioning once its 1.0 release gates are complete.
 
 ### Changed
 
+- Reorganized `LIMITATIONS.md` as a user-facing decision guide: critical
+  pre-copy choices and recovery actions now appear first, repeated engineering
+  detail is consolidated into task-oriented sections, and permanent behavior
+  is separated from the remaining pre-1.0 evidence gaps. The product contract
+  and `VISION.md` are unchanged.
 - 2026-07-31 safety and consistency review: made live progress and audit
   failover diagnostics best-effort so a closed output pipe cannot abort an
   active release copy; made final summary, report, and standalone-verify
