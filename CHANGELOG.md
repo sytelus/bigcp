@@ -36,6 +36,11 @@ versioning once its 1.0 release gates are complete.
 
 ### Changed
 
+- 2026-07-31 persistence review: kept report and compacted-journal temporaries
+  bound to their creating, delete-pending handles through synchronized
+  handle-based publication; removed duplicate core UUID/open/path-cleanup code
+  and the path-based audit rename wrapper; centralized full-UUID safe sibling
+  naming; and rejected unsafe temporary run IDs before path construction.
 - 2026-07-31 second review: rejected provider child names and directory records
   that cross structural boundaries; made path-sizing wrappers and handle rename
   inputs fail closed; prohibited collisions among resolved log, report, state,

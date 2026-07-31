@@ -7,7 +7,7 @@
 | `crates/win/src/endpoint.rs`, `path.rs`, `metadata.rs`, `volume.rs`, `device.rs`, `extents.rs`, `lock.rs`, `util.rs` | Local/UNC/WSL classification, lossless paths, 128/64-bit handle identity, fast/fallback 256 KiB enumeration, local/handle-bound-remote volume facts, query-only local device/extent facts, run lock, shared fail-closed helpers. |
 | `crates/win/src/file.rs`, `streams.rs`, `ea.rs`, `sparse.rs`, `reparse.rs`, `security.rs` | Read-only source and capability-bearing destination primitives; the only unsafe boundary. Native/provider lengths, ranges, and stream suffixes are validated here before core sees them. |
 | `crates/core/src/model.rs`, `options.rs`, `filesystem.rs`, `classify.rs`, `copy.rs`, `transport.rs`, `worker.rs`, `engine.rs` | Work model, validated options, immutable source/destination semantic policy, endpoint-aware join, terminal outcomes, topology-selected standard/same-spindle transport, bounded scheduling, direct-plain-small and transactional auxiliary/sparse/large copy. |
-| `crates/core/src/artifact.rs`, `journal.rs`, `audit.rs`, `report.rs`, `stats.rs`, `devprofile.rs` | Shared atomic artifact publication, one-record-lookahead resume replay, disjoint public artifact roles, throughput windows, and exact static-profile buffer budgets. |
+| `crates/core/src/artifact.rs`, `journal.rs`, `audit.rs`, `report.rs`, `stats.rs`, `devprofile.rs` | Shared exact-handle artifact publication, one-record-lookahead resume replay, disjoint public artifact roles, throughput windows, and exact static-profile buffer budgets. |
 | `crates/core/src/verify.rs` | Post-copy and standalone verification. |
 | `crates/tui` | Immutable-snapshot live UI and saved report browser. |
 | `crates/cli` | Grammar, option validation, exit mapping. |
@@ -18,13 +18,13 @@
 | ID | Rule | Mechanical enforcement/evidence |
 |---|---|---|
 | I1 | Source handles are read-only. | `SourceFile`/`SourceStream` choke points; unsafe denied outside `win`. |
-| I2 | Never delete an unowned destination. | Delete-on-close is bound to the created handle; resumed temps require journaled file identity; no path-delete fallback or mirror/purge command. |
+| I2 | Never delete an unowned destination. | Payload and state-artifact delete-on-close is bound to the created handle; resumed temps require journaled file identity; temporary identifiers are one safe component; no path-delete fallback or mirror/purge command. |
 | I3 | Every replacement preserves the old destination until safe commitment, except the documented direct-plain-small rerun window. | ADS/EA, sparse, and large files use sibling temps; plain small files validate the destination snapshot on the exact opened handle before truncation. |
 | I4 | `copied` only follows data, metadata, optional flush, and close/publication. | Both engines return `EngineResult` only after their completion protocol succeeds. |
 | I5 | Multi-part logical files and large-file final names never contain partial data; interrupted direct plain-file work is repairable by rerun. | Transactional ADS/EA/sparse/large coverage plus direct-plain-small interruption/rerun tests. |
 | I6 | Counters reconcile. | `Counters::reconcile` at run end and unit tests. |
 | I7 | Every per-object failure is auditable. | Typed `OperationError`, coordinator-only outcome/audit ownership, and preflight rejection of colliding log/report/state/journal roles. |
-| I8 | Journal never creates a skip. | Journal API exposes checkpoints only; one-record-lookahead replay, every-byte torn-tail/interior-record tests, and atomic compaction preserving only the job plus live hints. |
+| I8 | Journal never creates a skip. | Journal API exposes checkpoints only; one-record-lookahead replay, every-byte torn-tail/interior-record tests, and exact-handle atomic compaction preserving only the job plus live hints. |
 | I9 | Memory/work queues are bounded. | `crossbeam_channel::bounded`; standard transport reserves its concurrent coordinator chunk before capping threshold-sized workers; same-spindle coordinator/worker activity is serialized under one burst cap. |
 | I10 | No source-tree writes. | All write constructors accept destination/audit paths; preflight audit containment. |
 | I11 | Destination mutations revalidate targets. | Identity/kind/size/mtime/attributes/reparse-tag snapshot before repair/replacement; directory stream, EA, and metadata updates recheck identity on their write handle. |
@@ -87,7 +87,8 @@ watermark, and prefix digest. Older identity-less records load but cannot
 authorize resume. Never repair a journal manually or infer completion from
 `part_done`; rerun normal copy. Clean-end compaction atomically retains the
 current job header plus live checkpoints; audit artifact retention is operator
-managed.
+managed. Report and compaction siblings retain the creating handle, deny delete
+sharing, and carry delete-on-close until handle-bound publication (ADR 0041).
 
 Reports are versioned aggregate JSON. `bigcp report FILE --plain` provides a
 stable terminal summary; the full document contains devices, timeline,

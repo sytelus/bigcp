@@ -36,7 +36,7 @@ pub use extents::extent_count;
 pub use file::{
     COPYABLE_ATTRIBUTES, DestinationFinal, DestinationTemp, FAT_COPYABLE_ATTRIBUTES, SourceFile,
     create_directory, is_cloud_placeholder, is_compressed, is_encrypted, is_readonly, is_sparse,
-    publish_audit_temporary, set_basic_at, set_basic_at_checked, without_readonly,
+    set_basic_at, set_basic_at_checked, without_readonly,
 };
 pub use lock::DestinationLock;
 pub use metadata::{

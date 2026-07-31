@@ -10,7 +10,6 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 
-use uuid::Uuid;
 use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
 use windows_sys::Win32::Storage::FileSystem::{
     CreateSymbolicLinkW, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS,
@@ -25,7 +24,10 @@ use windows_sys::Win32::System::SystemServices::{
 };
 
 use crate::ea::{read_extended_attributes_checked, write_to_file};
-use crate::file::{close_file, rename_by_handle, set_basic_by_handle, set_delete_on_close};
+use crate::file::{
+    close_file, opaque_temp_candidate, rename_by_handle, set_basic_by_handle, set_delete_on_close,
+    valid_temp_run_id,
+};
 use crate::metadata::{BasicMetadata, FileIdentity, ObjectMetadata, metadata_at};
 use crate::security::ProtectedDacl;
 use crate::streams::{DestinationStream, SourceStream, StreamInfo, list_streams};
@@ -133,6 +135,13 @@ pub fn copy_reparse(
     destination_metadata: BasicMetadata,
     posix_unlink_rename: bool,
 ) -> Result<ReparseCopyResult, ReparseCopyError> {
+    if !valid_temp_run_id(run_id) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "temporary run ID must contain only ASCII letters, digits, or hyphens",
+        )
+        .into());
+    }
     let source_before = source_result(metadata_at(source))?;
     if !same_reparse_snapshot(&source_before, expected_source) {
         return Err(ReparseCopyError::SourceChanged);
@@ -273,8 +282,7 @@ struct ReparseTemp {
 impl ReparseTemp {
     fn create(parent: &Path, run_id: &str, directory: bool) -> io::Result<Self> {
         for _ in 0..128 {
-            let nonce = Uuid::new_v4().simple().to_string();
-            let path = parent.join(format!(".bigcp-{run_id}-{}.part", &nonce[..12]));
+            let path = opaque_temp_candidate(parent, run_id)?;
             let created = if directory {
                 fs::create_dir(&path).and_then(|()| Self::open_created(path.clone()))
             } else {
@@ -326,8 +334,7 @@ impl ReparseTemp {
         let mut target_wide = target.to_vec();
         target_wide.push(0);
         for _ in 0..128 {
-            let nonce = Uuid::new_v4().simple().to_string();
-            let path = parent.join(format!(".bigcp-{run_id}-{}.part", &nonce[..12]));
+            let path = opaque_temp_candidate(parent, run_id)?;
             let path_wide = wide_null(path.as_os_str())?;
             let flags = SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE
                 | if directory {

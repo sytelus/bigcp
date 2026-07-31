@@ -78,14 +78,17 @@ the path it names.
 
 Clean-end compaction retains the current job header and live checkpoints. It
 shares the report's artifact publisher: a unique exclusive sibling is
-synchronized and atomically replaces the old path, so no predictable neighbor
-is overwritten and no remove/rename gap is exposed.
+synchronized and atomically replaces the old path through its creating handle.
+That handle denies delete sharing and carries delete-on-close until publication,
+so neither replacement nor cleanup can be redirected to a new occupant of the
+temporary name (ADR 0041).
 
 The versioned JSONL audit is lossless and rolls back partial line writes. It
 reopens once, then fails over to the state directory. The final JSON report is
-serialized to a sibling temp, flushed, and atomically replaced before the
-terminal audit event is emitted and durably synchronized. This ordering keeps
-report-fallback status consistent with `run_end`.
+serialized to the same handle-owned sibling primitive, synchronized, renamed
+by handle, synchronized again, and closed before the terminal audit event is
+emitted and durably synchronized. This ordering keeps report-fallback status
+consistent with `run_end`.
 
 ## Extension seams
 

@@ -2,6 +2,45 @@
 
 Latest review: 2026-07-31
 
+## 2026-07-31 persistence-ownership review
+
+The latest whole-tree pass found and fixed a state-artifact ownership race.
+Report and compacted-journal writers previously closed their exclusive UUID
+temporary before replacing the final path and deleted a failed temporary by
+path. Another actor could therefore substitute a different object in either
+close-to-rename/delete interval. Both artifacts now reuse the payload engine's
+delete-pending `DestinationTemp`: the creating handle denies delete sharing,
+stays live through synchronized handle-based replacement, and is the only
+cleanup authority. The duplicate core UUID/open/drop implementation and the
+path-based audit rename wrapper were removed. Temporary naming is shared,
+uses the full UUID, and rejects empty, separator-bearing, alternate-stream, or
+otherwise non-ASCII-safe run IDs before path construction. ADR 0041 records
+the superseding persistence decision; PLAN, DESIGN, MAINTENANCE, production
+readiness, and the changelog now match it. VISION and LIMITATIONS remain current
+and were intentionally unchanged because neither the project goals nor the
+user-visible copy contract changed.
+
+All 129 bounded workspace tests passed with zero failures: 8 CLI, 46 core unit,
+16 core end-to-end, 9 testkit safety, 3 TUI, and 47 Windows-boundary tests. The
+final serial run used this newly created system-temporary root:
+
+`C:\Users\shitals\AppData\Local\Temp\bigcp-persistence-review-80b5246472ab4547a34403f44cc76fbe`
+
+Three new regression cases prove that a live artifact temporary cannot be
+removed/replaced by path, dropping it removes the exact owned object,
+publication replaces the final bytes without residue, and unsafe run IDs
+create nothing. Existing report fallback, terminal audit, journal compaction,
+end-to-end copy, verification, same-spindle, FAT policy, and UNC/WSL policy
+coverage all passed against the refactored primitive.
+
+Formatting, warning-denied workspace/all-target Clippy, warning-denied rustdoc,
+the locked optimized workspace build, and the test-storage safety backstop all
+passed. Cargo-deny passed advisory, ban, license, and source policy with only
+the allowed duplicate-version warnings for `hashbrown` and `syn`; Cargo-audit
+found no vulnerability among 146 locked dependencies. No physical-drive,
+remote-write, VHDX, performance, stress, large-scale, endurance, or
+forced-disconnect test ran.
+
 ## 2026-07-31 second repository review and structural-boundary hardening
 
 The follow-up whole-tree review fixed four correctness/resource issues and one

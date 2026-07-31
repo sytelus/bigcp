@@ -12,7 +12,8 @@ by the governing plan.
 - Direct, rerun-recoverable publication for plain small files; opaque-temp plus
   atomic-rename publication for ADS/EA, sparse, large, and reparse objects.
 - Checkpoint source/temp identity binding, non-following resume opens, and
-  exact-handle delete-on-close ownership; unique atomic journal compaction.
+  exact-handle delete-on-close ownership; report and journal-compaction
+  siblings remain handle-owned through synchronized atomic publication.
 - Destination snapshot revalidation before replacement and metadata repair.
 - Handle-bound source/destination identity checks for named streams, EAs, and
   post-order directory metadata finalization.
@@ -45,6 +46,8 @@ by the governing plan.
   embedded-NUL path input.
 - Disjoint resolved log/report/state/journal roles, streaming journal replay,
   and exact standard-path concurrent-buffer accounting for `mem` overrides.
+- Safe one-component temporary identifiers shared across payload, reparse, and
+  state paths, with full-UUID candidate names and no path-based artifact cleanup.
 
 ## Release-blocking evidence still required
 
@@ -89,4 +92,4 @@ release pass.
 
 No release process may reinterpret an unrun gate as a pass.
 `TESTING_SUMMARY.md` records dated evidence; intentional differences from
-the governing plan are recorded inline in PLAN.md and in ADRs 0027–0040.
+the governing plan are recorded inline in PLAN.md and in ADRs 0027–0041.

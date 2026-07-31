@@ -29,8 +29,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_SEQUENTIAL_SCAN,
     FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     FILE_WRITE_ATTRIBUTES, FileAllocationInfo, FileBasicInfo, FileDispositionInfo, FileRenameInfo,
-    FileRenameInfoEx, FlushFileBuffers, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    MoveFileExW, SetFileInformationByHandle,
+    FileRenameInfoEx, FlushFileBuffers, SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::WindowsProgramming::{
     FILE_RENAME_FLAG_POSIX_SEMANTICS, FILE_RENAME_FLAG_REPLACE_IF_EXISTS,
@@ -43,7 +42,7 @@ use crate::metadata::{
 use crate::security::ProtectedDacl;
 use crate::sparse::{AllocatedRange, mark_sparse, query_allocated_ranges};
 use crate::streams::{DestinationStream, StreamInfo};
-use crate::util::{bool_result, wide_null};
+use crate::util::bool_result;
 
 /// Attributes that are user-copyable under the PLAN.md section 4.2 contract.
 pub const COPYABLE_ATTRIBUTES: u32 = FILE_ATTRIBUTE_READONLY
@@ -179,8 +178,7 @@ impl DestinationTemp {
     /// never succeed on a live temp.
     pub fn create(parent: &Path, run_id: &str, encrypted: bool) -> io::Result<Self> {
         for _ in 0..128 {
-            let nonce = Uuid::new_v4().simple().to_string();
-            let path = parent.join(format!(".bigcp-{run_id}-{}.part", &nonce[..12]));
+            let path = opaque_temp_candidate(parent, run_id)?;
             let mut options = OpenOptions::new();
             options
                 // Keep std's creation validation in sync with the explicit
@@ -236,10 +234,7 @@ impl DestinationTemp {
                 let mut parts = body.rsplitn(2, '-');
                 let nonce = parts.next().unwrap_or_default();
                 let run_id = parts.next().unwrap_or_default();
-                !run_id.is_empty()
-                    && run_id
-                        .chars()
-                        .all(|value| value.is_ascii_alphanumeric() || value == '-')
+                valid_temp_run_id(run_id)
                     && (1..=32).contains(&nonce.len())
                     && nonce.chars().all(|value| value.is_ascii_hexdigit())
             });
@@ -415,6 +410,35 @@ impl DestinationTemp {
                 bool_result(FlushFileBuffers(file.as_raw_handle().cast()))?;
             }
         }
+        close_file(file)
+    }
+
+    /// Synchronizes and atomically replaces a bounded state or report file.
+    ///
+    /// The creating handle stays open and denies delete sharing until the
+    /// rename. Consequently neither publication nor failed-publication cleanup
+    /// can be redirected to a different object by replacing the temporary
+    /// path between close and a path-based operation.
+    pub fn publish_artifact(mut self, final_path: &Path) -> io::Result<()> {
+        self.file_ref()?.sync_all()?;
+        let file = self
+            .file
+            .take()
+            .ok_or_else(|| io::Error::other("temporary handle already consumed"))?;
+        set_delete_on_close(&file, false)?;
+        if let Err(error) = rename_by_handle(&file, final_path, true, false) {
+            if !self.persistent {
+                let _ = set_delete_on_close(&file, true);
+            }
+            self.file = Some(file);
+            return Err(error);
+        }
+        // From this instant the handle names the final artifact; Drop must
+        // never arm deletion against that published user-visible path.
+        self.path = final_path.to_path_buf();
+        // Request persistence again after the namespace update so both the
+        // synchronized contents and their final name precede success.
+        file.sync_all()?;
         close_file(file)
     }
 
@@ -616,24 +640,6 @@ pub fn set_basic_at_checked(
     set_basic_by_handle(&file, metadata)
 }
 
-/// Atomically replaces one audit artifact with a sibling temporary.
-///
-/// This wrapper is intentionally path-based because JSON report publication
-/// is outside the destination tree and `MoveFileExW` supplies atomic replace
-/// semantics for an existing report. The caller must own `temporary`.
-pub fn publish_audit_temporary(temporary: &Path, final_path: &Path) -> io::Result<()> {
-    let temporary = wide_null(temporary.as_os_str())?;
-    let final_path = wide_null(final_path.as_os_str())?;
-    // SAFETY: both paths are nul-terminated and live for the synchronous call.
-    unsafe {
-        bool_result(MoveFileExW(
-            temporary.as_ptr(),
-            final_path.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        ))
-    }
-}
-
 pub(crate) fn set_delete_on_close(file: &File, enabled: bool) -> io::Result<()> {
     // The legacy information class is deliberate: it provides the exact
     // delete-on-close lifecycle bigcp needs on both NTFS and ReFS, while the
@@ -652,6 +658,29 @@ pub(crate) fn set_delete_on_close(file: &File, enabled: bool) -> io::Result<()> 
             size_u32::<FILE_DISPOSITION_INFO>()?,
         ))
     }
+}
+
+pub(crate) fn valid_temp_run_id(run_id: &str) -> bool {
+    !run_id.is_empty()
+        && run_id
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || value == '-')
+}
+
+/// Returns one non-authoritative candidate name for exclusive creation.
+///
+/// Validation lives here so every temporary implementation constructs exactly
+/// one safe child component. Ownership still begins only after `create_new` or
+/// an equivalent exclusive Win32 create succeeds.
+pub(crate) fn opaque_temp_candidate(parent: &Path, run_id: &str) -> io::Result<PathBuf> {
+    if !valid_temp_run_id(run_id) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "temporary run ID must contain only ASCII letters, digits, or hyphens",
+        ));
+    }
+    let nonce = Uuid::new_v4().simple();
+    Ok(parent.join(format!(".bigcp-{run_id}-{nonce}.part")))
 }
 
 pub(crate) fn rename_by_handle(
@@ -831,6 +860,28 @@ mod tests {
         assert!(path.exists());
         drop(temp);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn temporary_creation_rejects_unsafe_run_ids_before_access() {
+        let sandbox = tempfile::tempdir();
+        assert!(sandbox.is_ok());
+        let Some(sandbox) = sandbox.ok() else {
+            return;
+        };
+        for run_id in [
+            "",
+            "x/../../escape",
+            r"x\..\..\escape",
+            "host:stream",
+            "with space",
+        ] {
+            assert!(DestinationTemp::create(sandbox.path(), run_id, false).is_err());
+        }
+        assert_eq!(
+            fs::read_dir(sandbox.path()).ok().map(Iterator::count),
+            Some(0)
+        );
     }
 
     #[test]

@@ -16,6 +16,7 @@ synchronized, atomic siblings. ADR 0039 makes native/provider parsing and the
 testkit path boundary explicitly fail closed on malformed or rooted input.
 ADR 0040 extends those guarantees to record-local directory names, disjoint
 audit-artifact roles, exact concurrent-buffer accounting, and streaming
-journal replay.
+journal replay. ADR 0041 supersedes ADR 0038's close-then-path-rename mechanics
+with exact-handle state-artifact publication and shared safe temporary naming.
 
 The index is filename ordered. `docs/MAINTENANCE.md` maps decisions to code and release checks.
