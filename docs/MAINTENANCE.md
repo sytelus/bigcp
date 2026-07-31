@@ -67,30 +67,35 @@ declared write budget. Update `docs/TESTING.md` and a bounded example YAML.
 ### Change copy semantics
 
 Update `docs/SEMANTICS.md`, add an ADR, review `LIMITATIONS.md` (governing-file
-edits require explicit owner authorization and refreshed frozen hashes), update schemas, and run the
-independent oracle. A finalizer or journal change also requires future chaos
-coverage before release.
+edits require explicit owner authorization and refreshed frozen hashes),
+update schemas, and run the independent oracle. A completion/publication or
+journal change also requires future chaos coverage before release.
 
 ## Artifact debugging
 
 JSONL records contain `ts` and `ev`. Find `run_start`, then follow `file` and
 `error` events; file and link failures carry their error inline, while other
 non-file failures use the dedicated event. Each contains category, operation,
-relative path, raw Win32 code, message, and hint. `run_end` is the authoritative
-counters/audit/integrity closure. A missing `run_end` means interruption or
-audit failure, not failure of already committed files.
+relative path, raw Win32 code, message, and hint. A requested same-run read-back
+adds one bounded `verification` event before `run_end`, including every retained
+mismatch detail. `run_end` is the authoritative counters/audit/integrity
+closure. A missing `run_end` means interruption or audit failure, not failure
+of already committed files.
 
 Journal records are not user reports. Each line contains version, tagged event,
-and CRC. Replay retains only one line of lookahead. A torn/invalid last line is truncated; an invalid interior line is
-skipped without trusting it or deleting later valid records; an unsupported
-version is left untouched and disables checkpointing for that run. A new checkpoint records a temp
-sibling, source and temp filesystem identities, stream key, source size/mtime,
-watermark, and prefix digest. Older identity-less records load but cannot
-authorize resume. Never repair a journal manually or infer completion from
-`part_done`; rerun normal copy. Clean-end compaction atomically retains the
-current job header plus live checkpoints; audit artifact retention is operator
-managed. Report and compaction siblings retain the creating handle, deny delete
-sharing, and carry delete-on-close until handle-bound publication (ADR 0041).
+and CRC. Replay retains one line of lookahead and at most one MiB of any one
+record; it streams past an oversized record without allocating its full size.
+A torn/invalid last line is truncated; an invalid interior line is skipped
+without trusting it or deleting later valid records; an unsupported version is
+left untouched and disables checkpointing for that run. A new checkpoint
+records a temp sibling, source and temp filesystem identities, stream key,
+source size/mtime, watermark, and prefix digest. Older identity-less records
+load but cannot authorize resume. Never repair a journal manually or infer
+completion from `part_done`; rerun normal copy. Clean-end compaction atomically
+retains the current job header plus live checkpoints; audit artifact retention
+is operator managed. Report and compaction siblings retain the creating handle,
+deny delete sharing, and carry delete-on-close until handle-bound publication
+(ADR 0041).
 
 Reports are versioned aggregate JSON. `bigcp report FILE --plain` provides a
 stable terminal summary; the full document contains devices, timeline,

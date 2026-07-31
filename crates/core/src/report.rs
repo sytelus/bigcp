@@ -120,9 +120,11 @@ pub struct FolderSummary {
     pub excluded: u64,
     /// Files not attempted.
     pub not_attempted: u64,
-    /// Source unnamed-stream bytes represented by all outcomes.
+    /// Source logical bytes represented by all outcomes; named streams join
+    /// the total for files whose stream set was opened.
     pub logical_bytes_discovered: u64,
-    /// Source unnamed-stream bytes represented by successful copies.
+    /// Source logical bytes represented by successful copies, including
+    /// copied named streams.
     pub logical_bytes_copied: u64,
 }
 

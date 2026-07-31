@@ -219,9 +219,11 @@ pub struct Counters {
     /// only once a file is opened, so this can trail the logical figures).
     #[serde(default)]
     pub bytes_enumerated: u64,
-    /// Source logical bytes discovered.
+    /// Source logical bytes represented by terminal outcomes; named streams
+    /// join the total for files whose stream set was opened.
     pub bytes_logical_discovered: u64,
-    /// Logical bytes represented by copied outcomes.
+    /// Logical bytes represented by copied outcomes, including copied named
+    /// streams.
     pub bytes_logical_copied: u64,
     /// Actual source bytes read by the copy engine.
     pub bytes_read_source: u64,

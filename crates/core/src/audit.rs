@@ -11,6 +11,7 @@ use time::OffsetDateTime;
 
 use crate::error::{BigcpError, OperationError};
 use crate::model::Counters;
+use crate::report::VerificationSummary;
 use crate::stats::AnalysisSummary;
 use crate::{LOG_SCHEMA_VERSION, options::CopyOptions};
 
@@ -147,6 +148,11 @@ pub enum AuditEvent {
     Analysis {
         /// Size-class aggregates plus slowest-copy samples.
         analysis: AnalysisSummary,
+    },
+    /// Same-run verification closure.
+    Verification {
+        /// Complete bounded verification result also stored in the report.
+        verification: VerificationSummary,
     },
     /// Run terminal record.
     RunEnd {
@@ -292,11 +298,12 @@ impl AuditWriter {
         self.file = open_log(&self.fallback_path)?;
         self.current_path.clone_from(&self.fallback_path);
         self.degraded = true;
-        write_atomic_line(&mut self.file, line).map_err(|failure| failure.error)?;
         // The switch must be visible in both channels (PLAN section 5.15):
-        // note it inside the new log stream and on stderr. A rolled-back
-        // notice failure gets one reopen retry; an unrepairable partial or a
-        // failed retry closes the run so later events never follow torn JSON.
+        // note it inside the new log stream and on stderr. The notice precedes
+        // the retried event so `run_end` remains the terminal record even when
+        // that exact append triggers failover. A rolled-back notice failure
+        // gets one reopen retry; an unrepairable partial or failed retry closes
+        // the run so later events never follow torn JSON.
         let notice = encode_event(&failover_notice(&self.primary_path, &self.fallback_path))
             .map_err(io::Error::other)?;
         if let Err(first) = write_atomic_line(&mut self.file, &notice) {
@@ -306,6 +313,7 @@ impl AuditWriter {
             self.file = open_log(&self.fallback_path)?;
             write_atomic_line(&mut self.file, &notice).map_err(|failure| failure.error)?;
         }
+        write_atomic_line(&mut self.file, line).map_err(|failure| failure.error)?;
         // A closed stderr pipe must not panic and abort an otherwise viable
         // failover. The same notice is already durable in the fallback log.
         let _ = writeln!(
@@ -411,9 +419,11 @@ fn format_timestamp(timestamp: OffsetDateTime) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::Path;
 
-    use super::{encode_event, failover_notice};
+    use super::{AuditEvent, AuditWriter, encode_event, failover_notice};
+    use crate::model::Counters;
 
     #[test]
     fn failover_notice_is_a_complete_escaped_event() {
@@ -441,8 +451,51 @@ mod tests {
     }
 
     #[test]
+    fn failover_notice_precedes_the_retried_terminal_event() {
+        let directory = tempfile::tempdir();
+        assert!(directory.is_ok());
+        let Some(directory) = directory.ok() else {
+            return;
+        };
+        let primary = directory.path().join("primary.jsonl");
+        let fallback = directory.path().join("fallback.jsonl");
+        let writer = AuditWriter::create(primary, fallback.clone());
+        assert!(writer.is_ok());
+        let Some(mut writer) = writer.ok() else {
+            return;
+        };
+        let terminal = encode_event(&AuditEvent::RunEnd {
+            counters: Counters::default(),
+            durability: "logical".to_owned(),
+            audit: "degraded".to_owned(),
+            integrity: "ok".to_owned(),
+            exit: 0,
+        });
+        assert!(terminal.is_ok());
+        let Some(terminal) = terminal.ok() else {
+            return;
+        };
+        assert!(writer.failover_and_retry(&terminal).is_ok());
+        drop(writer);
+
+        let contents = fs::read_to_string(fallback);
+        assert!(contents.is_ok());
+        let Some(contents) = contents.ok() else {
+            return;
+        };
+        let events = contents
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["ev"], "warning");
+        assert_eq!(events[0]["kind"], "log_failover");
+        assert_eq!(events[1]["ev"], "run_end");
+    }
+
+    #[test]
     fn profile_event_contains_only_effective_execution_settings() {
-        let encoded = encode_event(&super::AuditEvent::Profile {
+        let encoded = encode_event(&AuditEvent::Profile {
             source_class: "Nvme".to_owned(),
             destination_class: "Unknown".to_owned(),
             source_endpoint: bigcp_win::EndpointKind::Local,
@@ -467,7 +520,7 @@ mod tests {
 
     #[test]
     fn wsl_transport_has_a_distinct_stable_audit_value() {
-        let encoded = encode_event(&super::AuditEvent::Profile {
+        let encoded = encode_event(&AuditEvent::Profile {
             source_class: "Unknown".to_owned(),
             destination_class: "Unknown".to_owned(),
             source_endpoint: bigcp_win::EndpointKind::Wsl,

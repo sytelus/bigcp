@@ -178,7 +178,7 @@ Findings from a structured survey (July 2026) of Microsoft documentation, OS-int
 | **rclone** [rclone-local][rclone-docs] | size+modtime skip with per-backend `--modify-window`; `name.XXXXXX.partial` + rename; preallocation via `NtSetInformationFile`; multi-thread single-file chunks ≥256 MiB (sparse-marking to dodge VDL); **no partial-content resume** (restarts file). bigcp adopts: partial suffix + rename, preallocation. bigcp improves: verified checkpoint resume, in-order writes instead of sparse-marking, and a fixed filesystem policy rather than a user-tuned modify window (F15). |
 | **rsync** [rsync-man] | `--whole-file` is default for local↔local (delta transfer is a *loss* locally — CPU for absent network savings; validates our no-delta non-goal). Temp-file + atomic rename; postorder directory-mtime fixup; `--modify-window` for FAT. All adopted (independently arrived at, now confirmed as the convergent design). |
 | **TeraCopy** [TeraCopy-doc] | Hash-during-copy then read-back verify phase; per-file skip-and-continue with "retry failed only"; persisted job list = resume. Confirms our verify shape. Caution: no evidence its read-back defeats the OS cache — bigcp's unbuffered read-back closes that hole. |
-| **Explorer / Vista SP1 engine** [Russinovich-SP1] | The canonical study in copy-engine tuning: cached I/O below 256 KiB, pipelined 1–2 MiB async I/O above, read-ahead at 2× I/O size; essentially serial per file. Validates the two-engine split and the size threshold's existence (exact crossover re-benchmarked on current hardware, §13 gates). |
+| **Explorer / Vista SP1 engine** [Russinovich-SP1] | The canonical study in copy-engine tuning: cached I/O below 256 KiB, pipelined 1–2 MiB async I/O above, read-ahead at 2× I/O size; essentially serial per file. Validates the size-based strategy split and the threshold's existence (exact crossover re-benchmarked on current hardware, §13 gates). |
 | **fcp / xcp (Rust, Linux)** [fcp][xcp] | Work-stealing parallel tree walk feeding per-file parallel copies; block-level parallelism reserved for large files; explicit "not tuned for HDDs" (parallelism inverts to a penalty there — confirming our HDD clamps). Same convergent structure as bigcp's enumeration/scheduler split. |
 
 **Skip-heuristic convergence:** every serious tool lands on size + mtime with a filesystem-granularity tolerance (robocopy `/FFT` 2 s, rsync/rclone `--modify-window`), with optional hash mode. FAT stores local time and has 2 s write-time granularity; exFAT has 10 ms create/write increments [MS-filetimes][MS-exfat]. bigcp keeps exact 100 ns equality for NTFS/ReFS and selects the documented FAT/exFAT comparison quantum once per destination — never a blanket tolerance on the strict path. Seasonal FAT DST conversion can cause a conservative recopy rather than a false Same result; there is no broad one-hour skip tolerance.
@@ -974,6 +974,9 @@ Exit codes: 0 ok · 2 completed-with-failures · 3 user-canceled (resumable)
 {"ev":"run_start","v":1,"run_id":"…","argv":[…],"src":"…","dst":"…","options":{…},
  "devices":[{"role":"src","model":"…","bus":"usb","kind":"ssd","fs":"NTFS","sector":4096,
              "mtl":1048576,"free":…,"confidence":"high","profile":"usb-ssd"}…]}
+{"ev":"profile","source_endpoint":"local","destination_endpoint":"unc",
+ "source_class":"UsbSsd","destination_class":"Unknown","chunk_bytes":4194304,
+ "workers":32,"same_physical_disk":false}                         // static, once at start (§6.5)
 {"ev":"dir","action":"created|exists","rel":"…"}
 {"ev":"file","action":"copied","rel":"a/b.bin","size":123,"ms":4,"hash":"xxh3:9f…","streams":2}
 {"ev":"file","action":"copied","rel":"c/d.docx","size":…,"ms":…,"hash":"…",          // F13: every overwrite
@@ -987,11 +990,9 @@ Exit codes: 0 ok · 2 completed-with-failures · 3 user-canceled (resumable)
 {"ev":"file","action":"excluded|not_attempted","why":"…","rel":"…"}
 {"ev":"warning","kind":"streams_dropped|efs_downgrade|ea_dropped|cloud_hydrated|…","rel":"…"}
 {"ev":"extra","rel":"…"}                                          // dest-only entry (never touched)
-{"ev":"watermark","rel":"…","off":268435456}
 {"ev":"stat","counters":{…},"read_mbps":…,"write_mbps":…}         // every 30 s
-{"ev":"profile","source_endpoint":"local","destination_endpoint":"unc",
- "source_class":"UsbSsd","destination_class":"Unknown","chunk_bytes":4194304,
- "workers":32,"same_physical_disk":false}                         // static, once at start (§6.5)
+{"ev":"verification","verification":{"mode":"copied","projected":false,
+ "passed":…,"failed":…,"mismatches":[…],"last_access_differences":…}}
 {"ev":"run_end","counters":{"files_discovered":…,"copied_new":…,"copied_replaced":…,"skipped_same":…,
  "skipped_diff":…,"meta_fixed":…,"failed":…,"excluded":…,"not_attempted":…,"extra":…,
  "dirs_discovered":…,"dirs_created":…,"links_copied":…,
@@ -1185,7 +1186,7 @@ The semantic contract (§4), direct-plain-small and transactional auxiliary/spar
 
 The 2026-07-29 complexity-control pass **deleted** (not deferred) everything whose payoff did not justify its complexity — each deletion is recorded inline at its former section and its user-visible consequence, where one exists, is stated plainly in LIMITATIONS.md: the IOCP overlapped ring, then (after the owner clarified that robocopy-`/J` was never a mandate, ADR 0028) the entire unbuffered engine and its `--no-unbuffered` flag — **the shipped buffered engine is the 1.0 design** — plus queue-depth knobs, the bounded governor, the free-space forecast, Restart Manager lock-owner naming, profiler vendor/hotplug/cache extras, handle-based ADS discovery, the deferred-close finalizer pool, the per-device scheduler, parallel enumerators, the decorative §11 TUI widgets, the verification-run report kind, the modeled audit-drain state (immediate abort is the design), orphan-scan/retention cleanup, and differential-copier release gates.
 
-What remains before a 1.0 claim is primarily verification/evidence for the NTFS contract, plus one product-scaling gap: a bounded single-directory enumeration fallback (§5.6). The on-request validation pass is §12.10; optional performance candidates live in BENCHMARKS.md; disposition history is in `docs/REVIEW_2026-07-29.md` and ADRs 0027–0045. **Deviation rule:** any future intentional difference from this plan is recorded before the deviating code merges — either as a normative edit here or an ADR — there is no separate deviations file. Open gate highlights:
+What remains before a 1.0 claim is primarily verification/evidence for the NTFS contract, plus one product-scaling gap: a bounded single-directory enumeration fallback (§5.6). The on-request validation pass is §12.10; optional performance candidates live in BENCHMARKS.md; disposition history is in `docs/REVIEW_2026-07-29.md` and ADRs 0027–0046. **Deviation rule:** any future intentional difference from this plan is recorded before the deviating code merges — either as a normative edit here or an ADR — there is no separate deviations file. Open gate highlights:
 
 - **Verification matrices (§12.3/§12.4/§12.8)** — fault-injection at the wrapper boundary, exhaustive deterministic kill-point simulation, the bounded chaos binary with mutator mode, the adversarial E-case suite, destination sentinel snapshots, and emitted-instance schema validation.
 - **Bounded huge-directory behavior (§5.6/E25)** — synthetic million-entry validation and an implementation that falls back without materializing an unbounded per-directory map.
@@ -1318,7 +1319,7 @@ JSONL, one record per line, each with `crc` (CRC-32C of the line minus the crc f
 {"j":1,"ev":"end","run_id":"…","crc":"…"}
 ```
 
-Loader rules: one-record lookahead keeps replay memory independent of journal history; an invalid/unknown final record is treated as a torn tail and truncated; an invalid/unknown interior record is skipped without trust or destruction of later records; an unsupported `j` version is rejected without truncation; a checkpoint without matching current source/temp identities, source size/mtime, and verified prefix digest is ignored (I8/I13). On clean run end the journal is atomically compacted to the current job header plus live checkpoints through an exact-handle-owned sibling. Historical log/report retention is operator-managed; bigcp performs no automatic pruning (§5.12, ADRs 0038/0040/0041).
+Loader rules: one-record lookahead keeps replay memory independent of journal history, and at most 1 MiB of any record is retained while an oversized record is streamed past and treated as invalid; an invalid/unknown final record is treated as a torn tail and truncated; an invalid/unknown interior record is skipped without trust or destruction of later records; an unsupported `j` version is rejected without truncation; a checkpoint without matching current source/temp identities, source size/mtime, and verified prefix digest is ignored (I8/I13). On clean run end the journal is atomically compacted to the current job header plus live checkpoints through an exact-handle-owned sibling. Historical log/report retention is operator-managed; bigcp performs no automatic pruning (§5.12, ADRs 0038/0040/0041).
 
 ### Appendix D — Research references
 

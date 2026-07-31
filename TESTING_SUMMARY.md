@@ -2,6 +2,48 @@
 
 Latest review: 2026-07-31
 
+## 2026-07-31 terminal-audit and bounded journal-replay review
+
+This whole-repository pass fixed four persistence and observability defects.
+The observer no longer receives a `Complete` snapshot before the atomic report,
+terminal `run_end`, and durable audit synchronization succeed; an invariant
+failure instead publishes `Failed` only after those artifacts are finalized.
+Requested same-run verification now has a structured JSONL event and public
+schema, so an exit caused by a read-back mismatch is explained by the audit
+narrative rather than only by the report. A log failover notice now precedes
+the event being retried, preserving `run_end` as the last record even when its
+own append triggers failover.
+
+Journal replay now reads raw bytes rather than requiring UTF-8 framing, retains
+at most one MiB from any record, and streams past the remainder. Invalid
+non-UTF-8 or oversized interior records are counted and preserved without
+discarding later valid checkpoints; an invalid final record still truncates as
+a torn tail. Logical-byte API comments now include named streams accurately.
+The terminal UI distinguishes identical and policy-withheld skips and shows
+verification plus both durable artifact paths. PLAN's deleted watermark event,
+old strategy wording, and active ADR ranges were reconciled with the code and
+maintainer documentation.
+
+Six new bounded regressions cover terminal publication ordering, verification
+audit detail, terminal-event failover ordering, non-UTF-8 journal corruption,
+oversized journal-record confinement, and terminal verification formatting.
+All 158 confined workspace tests passed serially with zero failures: 8 CLI, 64
+core unit, 18 core end-to-end, 11 testkit safety, 4 TUI, and 53 Win32-boundary
+tests. Formatting, test-storage safety enforcement, warning-denied
+workspace/all-target/all-feature Clippy, warning-denied rustdoc, the locked
+optimized workspace build, JSON syntax and Draft 2020-12 schema checks, local
+Markdown-link validation, cargo-deny, and cargo-audit passed. Cargo-deny
+reported only the allowed `hashbrown` and `syn` duplicate-version warnings;
+RustSec found no vulnerability among 146 locked dependencies after loading
+1,177 advisories.
+
+`VISION.md` was not modified and remains at SHA-256
+`B970F59B791A53584FB57698B26CB70A7E7E9D80982B9118F4EF5A4199BE6C28`.
+No live UNC/WSL write, physical-drive, VHDX, performance, stress, large-scale,
+endurance, chaos, forced-disconnect, reboot, shutdown, or machine-stability
+test ran. Existing pre-1.0 evidence gaps remain open rather than being claimed
+from these routine tests.
+
 ## 2026-07-31 whole-repository robustness review
 
 This pass reviewed the workspace architecture, copy/verification engines,

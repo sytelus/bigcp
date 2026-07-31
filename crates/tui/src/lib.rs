@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::Duration;
 
+use bigcp_core::report::VerificationSummary;
 use bigcp_core::{BigcpError, CopyOptions, RunObserver, RunReport, RunSnapshot, run_copy};
 use crossterm::event::{self, Event, KeyCode};
 use crossterm::execute;
@@ -208,13 +209,17 @@ fn write_report_summary(output: &mut impl Write, report: &RunReport) -> io::Resu
         report.bottleneck.average_mbps,
         report.bottleneck.observed_peak_mbps
     )?;
+    if let Some(verification) = &report.verify {
+        writeln!(output, "{}", verification_counts(verification))?;
+    }
     writeln!(
         output,
-        "durability={} audit={} integrity={} log={}",
+        "durability={} audit={} integrity={} log={} report={}",
         report.run.durability,
         report.run.audit,
         report.integrity,
-        report.run.log_path.display()
+        report.run.log_path.display(),
+        report.run.report_path.display()
     )
 }
 
@@ -222,6 +227,17 @@ fn skipped_counts(counters: &bigcp_core::Counters) -> String {
     format!(
         "skipped-same={} skipped-different={}",
         counters.skipped_same, counters.skipped_diff
+    )
+}
+
+fn verification_counts(summary: &VerificationSummary) -> String {
+    format!(
+        "verification={} passed={} failed={} projected={} last-access-differences={}",
+        summary.mode,
+        summary.passed,
+        summary.failed,
+        summary.projected,
+        summary.last_access_differences
     )
 }
 
@@ -366,7 +382,7 @@ fn draw_live(frame: &mut ratatui::Frame<'_>, state: &Arc<Mutex<LiveState>>, tab:
                         "Copied: {} new + {} replaced  Skipped: {}  Failed: {}",
                         snapshot.counters.copied_new,
                         snapshot.counters.copied_replaced,
-                        snapshot.counters.skipped_same,
+                        skipped_counts(&snapshot.counters),
                         snapshot.counters.failed
                     )),
                     Line::from(format!(
@@ -536,8 +552,13 @@ fn draw_report(frame: &mut ratatui::Frame<'_>, report: &RunReport, tab: usize) {
         ),
         _ => frame.render_widget(
             Paragraph::new(format!(
-                "Log: {}\nIntegrity: {}\nExit: {}",
+                "Log: {}\nReport: {}\n{}\nIntegrity: {}\nExit: {}",
                 report.run.log_path.display(),
+                report.run.report_path.display(),
+                report.verify.as_ref().map_or_else(
+                    || "verification=not-requested".to_owned(),
+                    verification_counts
+                ),
                 report.integrity,
                 report.run.exit
             ))
@@ -611,7 +632,8 @@ pub const fn product_name() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{LIVE_TABS, LiveState, draw_live, skipped_counts};
+    use super::{LIVE_TABS, LiveState, draw_live, skipped_counts, verification_counts};
+    use bigcp_core::report::VerificationSummary;
     use bigcp_core::{Counters, RunSnapshot, RunState};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -688,6 +710,22 @@ mod tests {
         assert_eq!(
             skipped_counts(&counters),
             "skipped-same=2 skipped-different=3"
+        );
+    }
+
+    #[test]
+    fn plain_summary_reports_verification_projection_and_counts() {
+        let summary = VerificationSummary {
+            mode: "copied".to_owned(),
+            projected: true,
+            passed: 7,
+            failed: 2,
+            last_access_differences: 3,
+            ..VerificationSummary::default()
+        };
+        assert_eq!(
+            verification_counts(&summary),
+            "verification=copied passed=7 failed=2 projected=true last-access-differences=3"
         );
     }
 }

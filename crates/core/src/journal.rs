@@ -14,6 +14,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::BigcpError;
 
+// A serialized record contains at most a handful of Windows extended-length
+// paths plus fixed metadata. One MiB is comfortably above that legitimate
+// ceiling while preventing a corrupt journal without a newline from growing
+// replay memory until allocation aborts.
+const MAX_JOURNAL_RECORD_BYTES: usize = 1024 * 1024;
+
 /// Stable identity of the bigcp-owned temporary named by a checkpoint.
 ///
 /// The name alone is not proof of ownership: an old temporary can be removed
@@ -170,14 +176,14 @@ impl Journal {
             // invalid interior record without retaining the complete journal
             // in memory. Clean-run compaction bounds history in normal use;
             // this also keeps interrupted-run replay O(one record).
-            let mut pending: Option<(String, u64)> = None;
+            let mut pending: Option<(Vec<u8>, u64, bool)> = None;
             loop {
-                let mut line = String::new();
-                match reader.read_line(&mut line) {
-                    Ok(0) => {
-                        if let Some((raw, bytes)) = pending.take() {
+                match read_bounded_record(&mut reader) {
+                    Ok(None) => {
+                        if let Some((raw, bytes, oversized)) = pending.take() {
                             if apply_loaded_line(
                                 &raw,
+                                oversized,
                                 true,
                                 &mut resumable,
                                 &mut active_job,
@@ -190,15 +196,13 @@ impl Journal {
                         }
                         break;
                     }
-                    Ok(bytes) => {
-                        let bytes = u64::try_from(bytes).map_err(|_| {
-                            BigcpError::Format(
-                                "journal record length exceeds address space".to_owned(),
-                            )
-                        })?;
-                        if let Some((raw, previous_bytes)) = pending.replace((line, bytes)) {
+                    Ok(Some((line, bytes, oversized))) => {
+                        if let Some((raw, previous_bytes, previous_oversized)) =
+                            pending.replace((line, bytes, oversized))
+                        {
                             let retained = apply_loaded_line(
                                 &raw,
+                                previous_oversized,
                                 false,
                                 &mut resumable,
                                 &mut active_job,
@@ -211,9 +215,10 @@ impl Journal {
                     Err(_) => {
                         // A read error makes the prior complete line interior;
                         // only unread bytes after it are discarded.
-                        if let Some((raw, bytes)) = pending.take() {
+                        if let Some((raw, bytes, oversized)) = pending.take() {
                             let retained = apply_loaded_line(
                                 &raw,
+                                oversized,
                                 false,
                                 &mut resumable,
                                 &mut active_job,
@@ -404,20 +409,60 @@ impl Journal {
     }
 }
 
+/// Reads through one complete record while retaining at most the configured
+/// parse budget. `consumed` includes bytes discarded after the budget so an
+/// invalid interior record can remain byte-for-byte untouched on disk.
+fn read_bounded_record(reader: &mut impl BufRead) -> std::io::Result<Option<(Vec<u8>, u64, bool)>> {
+    let mut retained = Vec::new();
+    let mut consumed = 0_u64;
+    let mut oversized = false;
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return Ok((consumed != 0).then_some((retained, consumed, oversized)));
+        }
+        let end = buffer
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(buffer.len(), |index| index.saturating_add(1));
+        consumed = consumed
+            .checked_add(u64::try_from(end).map_err(std::io::Error::other)?)
+            .ok_or_else(|| std::io::Error::other("journal record length overflowed"))?;
+        let available = MAX_JOURNAL_RECORD_BYTES.saturating_sub(retained.len());
+        let keep = end.min(available);
+        if keep > 0 {
+            retained.try_reserve(keep).map_err(std::io::Error::other)?;
+            retained.extend_from_slice(&buffer[..keep]);
+        }
+        oversized |= keep < end;
+        let record_complete = buffer[..end].last() == Some(&b'\n');
+        reader.consume(end);
+        if record_complete {
+            return Ok(Some((retained, consumed, oversized)));
+        }
+    }
+}
+
 /// Applies one complete record. `false` means the final record was invalid and
 /// must be truncated; invalid interior records are counted and retained so a
 /// newer additive format cannot destroy later valid checkpoints.
 fn apply_loaded_line(
-    raw: &str,
+    raw: &[u8],
+    oversized: bool,
     is_last: bool,
     resumable: &mut BTreeMap<(String, String), Checkpoint>,
     active_job: &mut Option<JobSignature>,
     skipped_records: &mut u64,
 ) -> Result<bool, BigcpError> {
-    let line = raw.trim_end_matches(['\r', '\n']);
-    let parsed = serde_json::from_str::<StoredRecord>(line)
-        .ok()
-        .filter(|stored| crc_matches(stored).unwrap_or(false));
+    let line = raw.strip_suffix(b"\n").unwrap_or(raw);
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let parsed = if oversized {
+        None
+    } else {
+        serde_json::from_slice::<StoredRecord>(line)
+            .ok()
+            .filter(|stored| crc_matches(stored).unwrap_or(false))
+    };
     let Some(stored) = parsed else {
         if is_last {
             return Ok(false);
@@ -516,7 +561,9 @@ pub fn stream_key(stream: &std::ffi::OsStr) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Checkpoint, CheckpointFileIdentity, Journal, JournalEvent};
+    use super::{
+        Checkpoint, CheckpointFileIdentity, Journal, JournalEvent, MAX_JOURNAL_RECORD_BYTES,
+    };
     use bigcp_win::FileIdentity;
     use std::fs;
 
@@ -821,5 +868,94 @@ mod tests {
         drop(reloaded);
         let after = fs::read_to_string(&path).unwrap_or_default();
         assert_eq!(after, rewritten, "interior skip must not rewrite the file");
+    }
+
+    #[test]
+    fn non_utf8_interior_record_preserves_later_valid_checkpoints() {
+        let directory = tempfile::tempdir();
+        assert!(directory.is_ok());
+        let Some(directory) = directory.ok() else {
+            return;
+        };
+        let path = directory.path().join("journal.jsonl");
+        let Some(mut journal) = open_job_journal(&path) else {
+            return;
+        };
+        assert!(
+            journal
+                .append(JournalEvent::Checkpoint(sample_checkpoint("u16:kept")))
+                .is_ok()
+        );
+        drop(journal);
+
+        let original = fs::read(&path).unwrap_or_default();
+        let Some(first_line_end) = original.iter().position(|byte| *byte == b'\n') else {
+            return;
+        };
+        let split = first_line_end.saturating_add(1);
+        let mut rewritten = Vec::with_capacity(original.len().saturating_add(2));
+        rewritten.extend_from_slice(&original[..split]);
+        rewritten.extend_from_slice(&[0xff, b'\n']);
+        rewritten.extend_from_slice(&original[split..]);
+        assert!(fs::write(&path, &rewritten).is_ok());
+
+        let reloaded = Journal::open(path.clone(), false);
+        assert!(reloaded.is_ok());
+        let Some(reloaded) = reloaded.ok() else {
+            return;
+        };
+        assert_eq!(reloaded.skipped_records(), 1);
+        assert!(!reloaded.had_torn_tail());
+        assert!(reloaded.checkpoint("u16:kept", "").is_some());
+        drop(reloaded);
+        assert_eq!(fs::read(path).ok(), Some(rewritten));
+    }
+
+    #[test]
+    fn oversized_interior_record_is_bounded_and_preserves_later_checkpoints() {
+        let directory = tempfile::tempdir();
+        assert!(directory.is_ok());
+        let Some(directory) = directory.ok() else {
+            return;
+        };
+        let path = directory.path().join("journal.jsonl");
+        let Some(mut journal) = open_job_journal(&path) else {
+            return;
+        };
+        assert!(
+            journal
+                .append(JournalEvent::Checkpoint(sample_checkpoint("u16:later")))
+                .is_ok()
+        );
+        drop(journal);
+
+        let original = fs::read(&path).unwrap_or_default();
+        let Some(first_line_end) = original.iter().position(|byte| *byte == b'\n') else {
+            return;
+        };
+        let split = first_line_end.saturating_add(1);
+        let oversized = vec![b'x'; MAX_JOURNAL_RECORD_BYTES.saturating_add(1)];
+        let mut rewritten = Vec::with_capacity(
+            original
+                .len()
+                .saturating_add(oversized.len())
+                .saturating_add(1),
+        );
+        rewritten.extend_from_slice(&original[..split]);
+        rewritten.extend_from_slice(&oversized);
+        rewritten.push(b'\n');
+        rewritten.extend_from_slice(&original[split..]);
+        assert!(fs::write(&path, &rewritten).is_ok());
+
+        let reloaded = Journal::open(path.clone(), false);
+        assert!(reloaded.is_ok());
+        let Some(reloaded) = reloaded.ok() else {
+            return;
+        };
+        assert_eq!(reloaded.skipped_records(), 1);
+        assert!(!reloaded.had_torn_tail());
+        assert!(reloaded.checkpoint("u16:later", "").is_some());
+        drop(reloaded);
+        assert_eq!(fs::read(path).ok(), Some(rewritten));
     }
 }

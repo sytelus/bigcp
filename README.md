@@ -58,8 +58,8 @@ certification-gated. Current evidence and status are summarized in
   copying.
 - A machine-wide exact-destination lock prevents two writers from targeting
   the same root.
-- Every terminal outcome is written to versioned JSONL and reconciled in the
-  final report.
+- Every terminal outcome and requested same-run verification result is written
+  to versioned JSONL and reconciled in the final report.
 
 The skip heuristic is unnamed-stream size plus last-write time at the
 destination filesystem's representation: exact `FILETIME` on NTFS/ReFS,

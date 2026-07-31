@@ -22,6 +22,7 @@
         "extra",
         "warning",
         "stat",
+        "verification",
         "run_end",
         "analysis"
       ]
@@ -110,9 +111,68 @@
           }
         }
       }
+    },
+    "verification": {
+      "type": "object",
+      "description": "Complete bounded result of same-run verification.",
+      "required": [
+        "mode",
+        "projected",
+        "passed",
+        "failed",
+        "mismatches",
+        "last_access_differences"
+      ],
+      "properties": {
+        "mode": {
+          "const": "copied"
+        },
+        "destination_filesystem": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "projected": {
+          "type": "boolean"
+        },
+        "passed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "mismatches": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "last_access_differences": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": true
     }
   },
   "allOf": [
+    {
+      "if": {
+        "properties": {
+          "ev": {
+            "const": "verification"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "verification"
+        ]
+      }
+    },
     {
       "if": {
         "properties": {

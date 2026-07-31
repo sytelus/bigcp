@@ -200,5 +200,5 @@ knowable; this endpoint branch does not alter local allocation behavior.
   suffixes and NUL-terminated Win32 strings cannot redirect a validated path.
 
 Known intentional differences from the governing plan are recorded inline at
-their PLAN.md sections and in the ADRs (0027–0039); there is no separate
+their PLAN.md sections and in the ADRs (0027–0046); there is no separate
 deviations file.

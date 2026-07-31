@@ -323,11 +323,15 @@ pub fn run_copy(
 
     let verify = if options.verify && !options.dry_run {
         runner.publish(RunState::Verifying);
-        Some(verify_written_targets(
+        let summary = verify_written_targets(
             &runner.verification_targets,
             &mut runner.counters,
             destination_policy,
-        ))
+        );
+        runner.audit.emit(&AuditEvent::Verification {
+            verification: summary.clone(),
+        })?;
+        Some(summary)
     } else {
         None
     };
@@ -434,8 +438,15 @@ pub fn run_copy(
     };
     let hints = derive_hints(&runner, &preflight);
     let phases = summarize_phases(runner.stats.timeline());
-    runner.observer.on_message("copy run complete");
-    runner.publish(RunState::Complete);
+    // Capture the terminal UI state before moving aggregate collections into
+    // the report, but do not publish it until both artifacts are complete.
+    // A `Complete` snapshot is a claim about finalization, not just copy I/O.
+    let terminal_state = if invariant_failure.is_some() {
+        RunState::Failed
+    } else {
+        RunState::Complete
+    };
+    let terminal_snapshot = runner.snapshot(terminal_state);
     let mut report = RunReport {
         v: REPORT_SCHEMA_VERSION,
         run: RunInfo {
@@ -520,6 +531,14 @@ pub fn run_copy(
         exit: report.run.exit,
     })?;
     runner.audit.finish()?;
+    if invariant_failure.is_some() {
+        runner
+            .observer
+            .on_message("copy run finalized with an integrity failure");
+    } else {
+        runner.observer.on_message("copy run complete");
+    }
+    runner.observer.on_snapshot(&terminal_snapshot);
     if let Some(message) = invariant_failure {
         return Err(BigcpError::Invariant(message));
     }
@@ -2804,20 +2823,24 @@ impl Runner<'_> {
     }
 
     fn publish(&self, state: RunState) {
+        self.observer.on_snapshot(&self.snapshot(state));
+    }
+
+    fn snapshot(&self, state: RunState) -> RunSnapshot {
         let (read_bytes_per_second, write_bytes_per_second) = self.stats.current_rates();
         let failures_by_category = self
             .errors
             .iter()
             .map(|(category, summary)| (*category, summary.count))
             .collect();
-        self.observer.on_snapshot(&RunSnapshot {
+        RunSnapshot {
             state,
             counters: self.counters.clone(),
             read_bytes_per_second,
             write_bytes_per_second,
             failures_by_category,
             active_paths: Vec::new(),
-        });
+        }
     }
 }
 

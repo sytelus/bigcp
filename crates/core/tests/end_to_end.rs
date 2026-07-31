@@ -4,9 +4,12 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::windows::fs::symlink_file;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use bigcp_core::{CopyOptions, DeviceClass, RunObserver, RunSnapshot, VerifyOptions, run_copy};
+use bigcp_core::{
+    CopyOptions, DeviceClass, RunObserver, RunSnapshot, RunState, VerifyOptions, run_copy,
+};
 use bigcp_testkit::sandbox::{initialize_empty, validated_system_temp};
 use bigcp_testkit::{SandboxRoot, check_trees};
 use bigcp_win::{
@@ -35,6 +38,51 @@ impl RunObserver for ImmediateCancel {
     fn cancellation_requested(&self) -> bool {
         true
     }
+}
+
+struct TerminalArtifactObserver {
+    report_path: PathBuf,
+    log_path: PathBuf,
+    saw_final_artifacts: AtomicBool,
+}
+
+impl RunObserver for TerminalArtifactObserver {
+    fn on_snapshot(&self, snapshot: &RunSnapshot) {
+        if snapshot.state != RunState::Complete {
+            return;
+        }
+        let report_ready = self.report_path.is_file();
+        let log_ready = fs::read_to_string(&self.log_path)
+            .ok()
+            .and_then(|contents| contents.lines().last().map(str::to_owned))
+            .and_then(|line| serde_json::from_str::<serde_json::Value>(&line).ok())
+            .is_some_and(|event| {
+                event.get("ev").and_then(serde_json::Value::as_str) == Some("run_end")
+            });
+        self.saw_final_artifacts
+            .store(report_ready && log_ready, Ordering::SeqCst);
+    }
+
+    fn on_message(&self, _message: &str) {}
+}
+
+struct CorruptOnVerify {
+    destination_file: PathBuf,
+    attempted: AtomicBool,
+    succeeded: AtomicBool,
+}
+
+impl RunObserver for CorruptOnVerify {
+    fn on_snapshot(&self, snapshot: &RunSnapshot) {
+        if snapshot.state == RunState::Verifying && !self.attempted.swap(true, Ordering::SeqCst) {
+            self.succeeded.store(
+                fs::write(&self.destination_file, b"evil").is_ok(),
+                Ordering::SeqCst,
+            );
+        }
+    }
+
+    fn on_message(&self, _message: &str) {}
 }
 
 #[test]
@@ -448,6 +496,79 @@ fn report_fallback_and_terminal_audit_record_agree() -> Result<(), Box<dyn std::
 }
 
 #[test]
+fn complete_snapshot_is_published_after_final_artifacts() -> Result<(), Box<dyn std::error::Error>>
+{
+    let sandbox = SandboxRoot::create_system_temp("terminal-artifacts")?;
+    let source = sandbox.child(Path::new("source"))?;
+    let destination = sandbox.child(Path::new("destination"))?;
+    let state = sandbox.child(Path::new("state"))?;
+    let log_path = sandbox.child(Path::new("audit.jsonl"))?;
+    let report_path = sandbox.child(Path::new("report.json"))?;
+    fs::create_dir(&source)?;
+    fs::write(source.join("fixture.txt"), b"bounded fixture")?;
+
+    let mut options = CopyOptions::new(source, destination);
+    options.state_dir = Some(state);
+    options.log_path = Some(log_path.clone());
+    options.report_path = Some(report_path.clone());
+    let observer = TerminalArtifactObserver {
+        report_path,
+        log_path,
+        saw_final_artifacts: AtomicBool::new(false),
+    };
+    let report = run_copy(&options, &observer)?;
+
+    assert_eq!(report.run.exit, 0);
+    assert!(observer.saw_final_artifacts.load(Ordering::SeqCst));
+    Ok(())
+}
+
+#[test]
+fn same_run_verification_mismatch_is_audited() -> Result<(), Box<dyn std::error::Error>> {
+    let sandbox = SandboxRoot::create_system_temp("verification-audit")?;
+    let source = sandbox.child(Path::new("source"))?;
+    let destination = sandbox.child(Path::new("destination"))?;
+    fs::create_dir(&source)?;
+    fs::write(source.join("fixture.txt"), b"good")?;
+
+    let mut options = CopyOptions::new(source, destination.clone());
+    options.state_dir = Some(sandbox.child(Path::new("state"))?);
+    options.verify = true;
+    let observer = CorruptOnVerify {
+        destination_file: destination.join("fixture.txt"),
+        attempted: AtomicBool::new(false),
+        succeeded: AtomicBool::new(false),
+    };
+    let report = run_copy(&options, &observer)?;
+
+    assert!(observer.succeeded.load(Ordering::SeqCst));
+    assert_eq!(report.run.exit, 2);
+    assert_eq!(
+        report.verify.as_ref().map(|summary| summary.failed),
+        Some(1)
+    );
+    let audit = fs::read_to_string(&report.run.log_path)?;
+    let verification = audit
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|event| event.get("ev").and_then(serde_json::Value::as_str) == Some("verification"))
+        .ok_or("verification event was missing")?;
+    assert_eq!(
+        verification
+            .pointer("/verification/failed")
+            .and_then(serde_json::Value::as_u64),
+        Some(1)
+    );
+    assert!(
+        verification
+            .pointer("/verification/mismatches")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|mismatches| !mismatches.is_empty())
+    );
+    Ok(())
+}
+
+#[test]
 fn existing_file_is_rejected_as_a_destination_root() -> Result<(), Box<dyn std::error::Error>> {
     let sandbox = SandboxRoot::create_system_temp("destination-file")?;
     let source = sandbox.child(Path::new("source"))?;
@@ -720,9 +841,7 @@ impl RunObserver for CancelAfterFirstPoll {
     fn on_message(&self, _message: &str) {}
 
     fn cancellation_requested(&self) -> bool {
-        let seen = self
-            .polls
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let seen = self.polls.fetch_add(1, Ordering::Relaxed);
         seen >= 1
     }
 }

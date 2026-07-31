@@ -36,6 +36,16 @@ versioning once its 1.0 release gates are complete.
 
 ### Changed
 
+- 2026-07-31 terminal-audit and journal-replay review: publish `Complete` only
+  after the report and durably synchronized terminal JSONL record exist; emit
+  same-run verification as a structured, schema-documented audit event; keep
+  `run_end` last when that append triggers log failover; and bound journal
+  replay to one MiB per retained record while safely skipping arbitrary
+  non-UTF-8 or oversized interior corruption without discarding later valid
+  checkpoints. Added bounded regressions, corrected logical-byte comments,
+  exposed verification and both artifact paths in terminal summaries, and
+  reconciled current design/maintenance references. `VISION.md` remains
+  unchanged.
 - 2026-07-31 whole-repository robustness review: retry non-terminal
   `Interrupted` reads consistently across file/stream wrappers and both
   specialized transports; replace the redirector pipeline's last production
