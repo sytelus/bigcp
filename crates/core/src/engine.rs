@@ -46,7 +46,7 @@ pub struct EngineResult {
     pub checkpoint_used: bool,
 }
 
-/// Parameters shared by the two size strategies.
+/// Parameters shared by the product engine's direct and transactional strategies.
 pub struct EngineRequest<'a> {
     /// Absolute source path.
     pub source_path: &'a Path,
@@ -802,16 +802,26 @@ fn create_final(request: &EngineRequest<'_>) -> Result<DestinationFinal, Operati
                 stamp,
             ) {
                 Ok(value) => Ok(value),
-                Err(error) => {
+                Err(create_error) => {
                     // The retry did not take ownership of the file. Restore
                     // the exact object we cleared so a failed copy does not
                     // silently weaken an existing destination attribute.
-                    let _ = set_basic_at_checked(
+                    if let Err(restore_error) = set_basic_at_checked(
                         request.destination_path,
                         snapshot.metadata.identity,
                         snapshot.metadata.basic,
-                    );
-                    Err(operation_error("create_dst", request.relative_path, &error))
+                    ) {
+                        return Err(readonly_restore_error(
+                            request.relative_path,
+                            &create_error,
+                            &restore_error,
+                        ));
+                    }
+                    Err(operation_error(
+                        "create_dst",
+                        request.relative_path,
+                        &create_error,
+                    ))
                 }
             }
         }
@@ -1818,6 +1828,34 @@ fn operation_error(
     OperationError::from_io(operation, PathBuf::from(relative_path), error)
 }
 
+/// Reports the rollback failure as the primary error because it may have left
+/// an existing destination with READONLY cleared. The failed create remains in
+/// the message so the operator can diagnose both halves of the operation.
+fn readonly_restore_error(
+    relative_path: &Path,
+    create_error: &std::io::Error,
+    restore_error: &std::io::Error,
+) -> OperationError {
+    let mut error = if restore_error.kind() == std::io::ErrorKind::InvalidData {
+        OperationError::from_io_as(
+            ErrorCategory::DestinationChanged,
+            "restore_dst_metadata",
+            relative_path.to_path_buf(),
+            restore_error,
+        )
+    } else {
+        OperationError::from_io(
+            "restore_dst_metadata",
+            relative_path.to_path_buf(),
+            restore_error,
+        )
+    };
+    error.message = format!(
+        "destination create retry failed after READONLY was cleared ({create_error}); restoring the original metadata also failed: {restore_error}"
+    );
+    error
+}
+
 /// Operation name marking a graceful mid-file cancellation. The coordinator
 /// converts errors carrying it into a not-attempted outcome instead of a
 /// failure: a clean cancel is not an error condition.
@@ -1871,7 +1909,46 @@ mod tests {
 
     use bigcp_win::StreamInfo;
 
-    use super::{StreamRouting, route_streams};
+    use super::{StreamRouting, readonly_restore_error, route_streams};
+
+    #[test]
+    fn readonly_rollback_failure_preserves_both_failure_contexts() {
+        let create_error = std::io::Error::from_raw_os_error(5);
+        let restore_error = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "object identity changed before metadata update",
+        );
+        let error = readonly_restore_error(
+            std::path::Path::new("existing.txt"),
+            &create_error,
+            &restore_error,
+        );
+
+        assert_eq!(
+            error.category,
+            crate::error::ErrorCategory::DestinationChanged
+        );
+        assert_eq!(error.operation, "restore_dst_metadata");
+        assert!(error.message.contains("READONLY was cleared"));
+        assert!(error.message.contains(&create_error.to_string()));
+        assert!(error.message.contains("object identity changed"));
+    }
+
+    #[test]
+    fn readonly_rollback_io_failure_is_the_primary_error() {
+        let create_error = std::io::Error::from_raw_os_error(32);
+        let restore_error = std::io::Error::from_raw_os_error(5);
+        let error = readonly_restore_error(
+            std::path::Path::new("existing.txt"),
+            &create_error,
+            &restore_error,
+        );
+
+        assert_eq!(error.category, crate::error::ErrorCategory::Permissions);
+        assert_eq!(error.code, Some(5));
+        assert!(error.message.contains(&create_error.to_string()));
+        assert!(error.message.contains(&restore_error.to_string()));
+    }
 
     #[test]
     fn dropped_large_ads_does_not_promote_or_checkpoint_plain_data() {

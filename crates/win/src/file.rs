@@ -1047,7 +1047,7 @@ mod destination_final_tests {
     /// 2026-07-29): an explicit timestamp set right after create must
     /// survive subsequent data writes on the same handle — Windows stops
     /// auto-updating the last-write time once it is explicitly set. If this
-    /// ever fails, the small-file engine must return to finish-time
+    /// ever fails, the plain-small strategy must return to finish-time
     /// stamping before shipping.
     #[test]
     fn create_time_stamp_survives_writes_in_sandbox() {

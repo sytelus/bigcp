@@ -1,13 +1,14 @@
 # Verifies that the implementation task's three governing inputs remain
 # byte-identical to their last owner-approved revision. Re-pinned 2026-07-31
-# after the owner-authorized persistence review documented exact-handle state
-# artifact publication; VISION and LIMITATIONS remained byte-identical.
+# after the owner-authored NTFS-only certification revision and comprehensive
+# review documented the boundary and failure-reporting fixes. The review did
+# not edit VISION.
 # Re-pin only as the final step of an owner-approved documentation change.
 $ErrorActionPreference = 'Stop'
 $Expected = @{
-    'PLAN.md' = 'D7E808DB8B1DF688D96E59DBED4BF62452156A06416141053CC1A9AD54754B4A'
-    'VISION.md' = 'D8FAD02510CD02192D7D17571C96FAFF9C7673BA4FFC6312705731E91D93EC6B'
-    'LIMITATIONS.md' = '6860A8AF1DC21C3E6E825C2B75210234CD811E8D5BB007F532EA5F266ED7215D'
+    'PLAN.md' = '84B35BE07CD21FACA16393B8D6F7E1119EEE92D742883D7E0B0BFAA6BE363C66'
+    'VISION.md' = 'B970F59B791A53584FB57698B26CB70A7E7E9D80982B9118F4EF5A4199BE6C28'
+    'LIMITATIONS.md' = '312F3176202B0EB4A6187F564CC35F8395109D2C07F11D8BE386D1E1480D68F4'
 }
 
 foreach ($entry in $Expected.GetEnumerator()) {

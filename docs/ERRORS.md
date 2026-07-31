@@ -20,7 +20,7 @@ use `fs_limit` before destination mutation.
 | `unsupported_reparse` | Unknown link/filter tag. | Use `--raw-reparse` only with the owning filter and understood risk. |
 | `parent_dir_failed` | Parent could not be prepared. | Resolve the parent error first. |
 | `type_conflict` | File/directory/link types disagree. | Resolve manually; bigcp never deletes it. |
-| `cloud` | Placeholder hydration failed. | Restore connectivity or use `--skip-cloud`. |
+| `cloud` | A Win32 `ERROR_CLOUD_FILE_*` operation failed (for example provider not running 362, authentication 386, network unavailable 388, provider terminated 404, request timeout 426, or provider message timeout 475). | Restore cloud connectivity/provider health or use `--skip-cloud`. |
 | `internal` | Unexpected API/state invariant. | Retain log/report and file a bug. |
 
 Each per-object log failure carries all of: category, operation, relative path,

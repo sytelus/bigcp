@@ -18,5 +18,10 @@ ADR 0040 extends those guarantees to record-local directory names, disjoint
 audit-artifact roles, exact concurrent-buffer accounting, and streaming
 journal replay. ADR 0041 supersedes ADR 0038's close-then-path-rename mechanics
 with exact-handle state-artifact publication and shared safe temporary naming.
+ADR 0042 makes NTFS the sole filesystem-certification target and all other
+filesystem/provider paths best-effort. ADR 0043 standardizes the implemented
+architecture as one product copy engine with two completion strategies and
+two topology transports. ADR 0044 makes a failed READONLY metadata rollback a
+first-class reported failure instead of discarding it.
 
 The index is filename ordered. `docs/MAINTENANCE.md` maps decisions to code and release checks.

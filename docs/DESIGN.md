@@ -28,18 +28,18 @@ pass; stream, EA, and metadata handles must match those identities before any
 destination update.
 
 Plain files are classified from the joined snapshots under one immutable
-destination `FilesystemPolicy`. Stream discovery can
-promote a nominally small file with a large ADS. Plain small work enters a
-bounded fixed worker pool; auxiliary-data and sparse work uses the
-transactional engine, while large/checkpoint-capable work stays on the
-coordinator path. Workers receive immutable snapshots and distinct
+destination `FilesystemPolicy`. Stream discovery can promote a nominally small
+file with a large ADS. The single product engine routes plain small work to a
+bounded fixed worker pool and routes auxiliary-data, sparse, and
+large/checkpoint-capable work through its transactional completion strategy on
+the coordinator path. Workers receive immutable snapshots and distinct
 destinations. Only the coordinator mutates counters, audit, report aggregates,
 and journal state.
 
 Plain small files use `DestinationFinal`: workers read and revalidate the
 source, then create or identity-check-and-truncate the final destination before
 one whole-buffer unnamed-stream write. FAT-family and remote files are
-restamped on that same handle after data I/O; the strict local NTFS/ReFS path
+restamped on that same handle after data I/O; the exact local NTFS/ReFS policy
 incurs no extra restamp. Files
 with destination-representable ADS/EAs, sparse files, and large/resumable files
 use `DestinationTemp` and atomic publication. Unsupported source ADS/EAs are

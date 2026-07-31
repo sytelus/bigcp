@@ -1,10 +1,12 @@
 # Production readiness
 
 `bigcp` is an operational pre-1.0 implementation, not a certified 1.0 release.
-This distinction is intentional: routine tests provide strong evidence for the
+The certification target is the NTFS product contract only. ReFS, FAT/FAT32,
+exFAT, generic UNC/provider filesystems, and WSL are supported best-effort and
+are not certification-gated. Routine tests provide strong evidence for the
 implemented semantic core without substituting a developer workstation or an
-existing drive for the disposable fault and endurance infrastructure required
-by the governing plan.
+existing drive for the bounded fault-simulation and performance evidence
+required by the governing plan.
 
 ## Implemented and routinely gated
 
@@ -19,7 +21,7 @@ by the governing plan.
   post-order directory metadata finalization.
 - File, directory, ADS, EA, sparse-data, symlink, junction, rerun, dry-run,
   cancellation, report-fallback, and both verification paths.
-- Isolated NTFS/ReFS and FAT/exFAT destination policies: exact strict-volume
+- Isolated NTFS/ReFS and FAT/exFAT destination policies: exact NTFS/ReFS
   comparison, FAT-family timestamp/attribute projection and file-size limit,
   capability-gated ADS/EA/sparse/EFS/ACL behavior, explicit degradation
   acceptance, and projected verification reporting.
@@ -48,6 +50,9 @@ by the governing plan.
   and exact standard-path concurrent-buffer accounting for `mem` overrides.
 - Safe one-component temporary identifiers shared across payload, reparse, and
   state paths, with full-UUID candidate names and no path-based artifact cleanup.
+- Complete official Win32 Cloud Files error-family classification and explicit
+  reporting when a failed READONLY replacement also fails to restore the
+  destination's original metadata.
 
 ## Release-blocking evidence still required
 
@@ -62,13 +67,9 @@ lifespan-reducing writes, no machine-stability impact — see PLAN §12.0):
   million-entry behavior via synthetic enumeration simulation, never real trees.
 - The same-spindle HDD `[HW]` cell remains required before claiming a measured
   speedup or universal optimality for the new 256 MiB default.
-- Generic SMB/mapped-drive source and destination cells plus a WSL destination
-  cell remain required before claiming remote matrix certification. A bounded
-  WSL-source-to-local smoke supplies correctness evidence only; no network/WSL
-  throughput improvement is claimed without separately approved benchmarks.
 - The final production-validation pass (PLAN §12.10), executed only on
   explicit owner request: chaos/kill-convergence, the adversarial set,
-  sentinel/schema checks, and the certified benchmark protocol.
+  sentinel/schema checks, and the bounded NTFS benchmark protocol.
 
 ## Product gap before 1.0
 
@@ -78,18 +79,18 @@ lifespan-reducing writes, no machine-stability impact — see PLAN §12.0):
   remains suitable for ordinary trees, but million-entry directories are not
   certified.
 
-## Additional filesystem-certification evidence
+## Optional non-NTFS compatibility evidence
 
-Disposable VHDX coverage for NTFS, ReFS, FAT32, and exFAT uses **graceful
+Disposable VHDX coverage for NTFS, ReFS, FAT32, and exFAT may use **graceful
 operations only** (create, mount, test, clean dismount of test-owned virtual
 disks), including elevated publication, low-space, capability probes,
 FAT-family fallbacks, degradation accounting, and projected verification.
 Device-loss behavior is validated by fault injection only—never by forced
-detach of any kind. ADRs 0029/0035 permit these filesystems to remain explicitly
-best-effort and not matrix-certified at v1; this evidence is required before
-making a matrix-certification claim, but it is not silently treated as a v1
-release pass.
+detach of any kind. The NTFS cells may contribute to the NTFS release gate.
+ReFS/FAT/exFAT and approved remote/WSL cells are optional compatibility
+evidence: their absence is not a release blocker, and their success does not
+create a certification claim (ADR 0042).
 
 No release process may reinterpret an unrun gate as a pass.
 `TESTING_SUMMARY.md` records dated evidence; intentional differences from
-the governing plan are recorded inline in PLAN.md and in ADRs 0027–0041.
+the governing plan are recorded inline in PLAN.md and in ADRs 0027–0044.

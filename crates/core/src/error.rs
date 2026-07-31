@@ -6,6 +6,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use bigcp_win::is_cloud_file_error;
+
 /// Stable public error taxonomy used by logs, reports, and the TUI.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -157,7 +159,7 @@ fn category_for(code: Option<i32>, kind: io::ErrorKind) -> ErrorCategory {
         }
         Some(80 | 183) => ErrorCategory::DestinationChanged,
         Some(206) => ErrorCategory::Path,
-        Some(code) if code == i32::from(0x16A_u16) => ErrorCategory::Cloud,
+        Some(code) if is_cloud_file_error(code) => ErrorCategory::Cloud,
         _ => match kind {
             io::ErrorKind::NotFound | io::ErrorKind::InvalidInput => ErrorCategory::Path,
             io::ErrorKind::AlreadyExists => ErrorCategory::DestinationChanged,
@@ -189,7 +191,7 @@ fn hint_for(category: ErrorCategory) -> &'static str {
         ErrorCategory::TypeConflict => {
             "Resolve the conflicting destination object manually; bigcp never deletes it"
         }
-        ErrorCategory::Cloud => "Restore cloud connectivity or use --skip-cloud",
+        ErrorCategory::Cloud => "Restore cloud provider connectivity/health or use --skip-cloud",
         ErrorCategory::Internal => "Retain the log and report and file a bigcp bug",
     }
 }
@@ -213,6 +215,12 @@ mod tests {
             (1231, ErrorCategory::DeviceGone),
             (206, ErrorCategory::Path),
             (183, ErrorCategory::DestinationChanged),
+            (362, ErrorCategory::Cloud),
+            (386, ErrorCategory::Cloud),
+            (388, ErrorCategory::Cloud),
+            (404, ErrorCategory::Cloud),
+            (426, ErrorCategory::Cloud),
+            (475, ErrorCategory::Cloud),
         ] {
             let error = io::Error::from_raw_os_error(code);
             let classified = OperationError::from_io("test", PathBuf::from("file"), &error);

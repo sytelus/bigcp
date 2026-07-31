@@ -2,6 +2,55 @@
 
 Latest review: 2026-07-31
 
+## 2026-07-31 certification-boundary and failure-reporting review
+
+The latest whole-repository review fixed two concrete error-path defects. Raw
+Win32 failures now classify the complete official `ERROR_CLOUD_FILE_*` family
+as `cloud`, rather than recognizing only provider-not-running. Direct
+replacement no longer discards a failure to restore READONLY metadata after a
+failed create retry: `restore_dst_metadata` becomes the primary reported
+operation, retains the rollback error category/code, and includes both failure
+contexts. Three focused unit tests cover the official constant family,
+representative public classification, identity-change rollback, and ordinary
+rollback I/O failure.
+
+Active documentation now consistently describes one product copy engine with
+direct and transactional completion strategies plus standard and same-spindle
+transports. By owner decision, NTFS is the sole filesystem-certification
+target; ReFS, FAT/FAT32, exFAT, generic UNC/provider filesystems, and WSL remain
+supported best-effort. Their bounded VHDX/remote exercises are optional
+compatibility evidence, not release gates or certification debt. ADRs
+0042–0044 record these decisions and the rollback invariant. Stale references
+to required endurance infrastructure and soak runs were removed; the VISION
+prohibitions remain controlling and `VISION.md` was not modified.
+The frozen-input guard now pins PLAN `84B35BE...3C66`, VISION
+`B970F59B...6C28`, and LIMITATIONS `312F3176...68F4`.
+GitHub Actions run `30650581584` was inspected: it stopped at the frozen-input
+step because the prior VISION hash was still pinned. The current guard passes
+locally against the owner-authored VISION revision; no later workflow step ran
+in that failed job.
+
+All 132 bounded workspace tests passed with zero failures: 8 CLI, 48 core unit,
+16 core end-to-end, 9 testkit safety, 3 TUI, and 48 Windows-boundary tests. The
+serial run used this newly created system-temporary root:
+
+`C:\Users\shitals\AppData\Local\Temp\bigcp-review-13949c13493d4807ac8db2634c9b9557`
+
+Formatting, warning-denied workspace/all-target Clippy, warning-denied rustdoc,
+the locked optimized workspace build, the test-storage safety backstop,
+Markdown local-link validation, cargo-deny, and cargo-audit passed. Cargo-deny
+reported only the allowed duplicate-version warnings for `hashbrown` and
+`syn`; RustSec found no vulnerability among 146 locked dependencies.
+
+The release binary then passed `--help`, both subcommand help surfaces, a
+two-file local NTFS copy with same-run verification, a zero-write rerun, full
+standalone verification, and plain report reopening under:
+
+`C:\Users\shitals\AppData\Local\Temp\bigcp-review-smoke-a3d782db2f0149a9af3ba104e5c5c0a5`
+
+No heavy, physical-drive, remote-write, VHDX, performance, stress,
+large-scale, endurance, or forced-disconnect test ran.
+
 ## 2026-07-31 persistence-ownership review
 
 The latest whole-tree pass found and fixed a state-artifact ownership race.

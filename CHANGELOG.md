@@ -36,6 +36,15 @@ versioning once its 1.0 release gates are complete.
 
 ### Changed
 
+- 2026-07-31 comprehensive review: classify the complete official Win32 Cloud
+  Files error family as `cloud`; report a failed READONLY metadata rollback
+  with both failure contexts instead of discarding it; document the existing
+  architecture as one product copy engine with isolated completion strategies
+  and topology transports; and make NTFS the sole filesystem-certification
+  target while retaining all non-NTFS support as best-effort. Added focused
+  regression tests and ADRs 0042–0044; re-pinned the frozen-input guard to the
+  owner-authored VISION revision that had caused the latest CI failure;
+  `VISION.md` remains untouched by this review.
 - 2026-07-31 persistence review: kept report and compacted-journal temporaries
   bound to their creating, delete-pending handles through synchronized
   handle-based publication; removed duplicate core UUID/open/path-cleanup code

@@ -411,7 +411,7 @@ fn run_same_spindle_batch(batch: Vec<FileCopyJob>, results: &Sender<CompletedCop
         }
     }
 
-    // Representable ADS/EA files keep the existing transactional engine.
+    // Representable ADS/EA files keep the engine's transactional strategy.
     // They are rare and are deliberately processed after the ordinary batch
     // so they cannot break its source-only/destination-only phases.
     for job in regular {

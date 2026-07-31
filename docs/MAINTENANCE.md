@@ -20,14 +20,14 @@
 | I1 | Source handles are read-only. | `SourceFile`/`SourceStream` choke points; unsafe denied outside `win`. |
 | I2 | Never delete an unowned destination. | Payload and state-artifact delete-on-close is bound to the created handle; resumed temps require journaled file identity; temporary identifiers are one safe component; no path-delete fallback or mirror/purge command. |
 | I3 | Every replacement preserves the old destination until safe commitment, except the documented direct-plain-small rerun window. | ADS/EA, sparse, and large files use sibling temps; plain small files validate the destination snapshot on the exact opened handle before truncation. |
-| I4 | `copied` only follows data, metadata, optional flush, and close/publication. | Both engines return `EngineResult` only after their completion protocol succeeds. |
+| I4 | `copied` only follows data, metadata, optional flush, and close/publication. | Both completion strategies in the one product engine return `EngineResult` only after their protocol succeeds. |
 | I5 | Multi-part logical files and large-file final names never contain partial data; interrupted direct plain-file work is repairable by rerun. | Transactional ADS/EA/sparse/large coverage plus direct-plain-small interruption/rerun tests. |
 | I6 | Counters reconcile. | `Counters::reconcile` at run end and unit tests. |
 | I7 | Every per-object failure is auditable. | Typed `OperationError`, coordinator-only outcome/audit ownership, and preflight rejection of colliding log/report/state/journal roles. |
 | I8 | Journal never creates a skip. | Journal API exposes checkpoints only; one-record-lookahead replay, every-byte torn-tail/interior-record tests, and exact-handle atomic compaction preserving only the job plus live hints. |
 | I9 | Memory/work queues are bounded. | `crossbeam_channel::bounded`; standard transport reserves its concurrent coordinator chunk before capping threshold-sized workers; same-spindle coordinator/worker activity is serialized under one burst cap. |
 | I10 | No source-tree writes. | All write constructors accept destination/audit paths; preflight audit containment. |
-| I11 | Destination mutations revalidate targets. | Identity/kind/size/mtime/attributes/reparse-tag snapshot before repair/replacement; directory stream, EA, and metadata updates recheck identity on their write handle. |
+| I11 | Destination mutations revalidate targets. | Identity/kind/size/mtime/attributes/reparse-tag snapshot before repair/replacement; directory stream, EA, and metadata updates recheck identity on their write handle; direct READONLY clear/retry restores through that identity and reports rollback failure (ADR 0044). |
 | I12 | One writer per exact destination. | Global mutex with exact-root hash. |
 | I13 | Resume verifies the prefix. | Source/temp identities (128-bit or driver-backed legacy 64-bit), source size/mtime, prefix reread, and exact xxh3 boundary digest must all match. |
 
@@ -51,7 +51,9 @@ of MSVC/SDK. Do not bake an installed minor version into project files.
 ### Add an error category
 
 1. Add the serialized variant in `ErrorCategory`.
-2. Map relevant raw Win32 codes in `category_for`; preserve the original code.
+2. Map relevant raw Win32 codes in `category_for`; keep official constant
+   families such as `ERROR_CLOUD_FILE_*` in `bigcp-win`; preserve the original
+   code.
 3. Add an actionable sentence in `hint_for`.
 4. Update `docs/ERRORS.md` and report/log schemas if their enum is closed.
 5. Test raw-code classification and grouping by top-level folder.
@@ -101,8 +103,9 @@ replacements, warnings, grouped failures, extras, hints, and verification.
 - **Join:** destination-aware exact (WSL) or Windows-ordinal case-insensitive
   matching of one source and destination directory listing without
   per-source-item destination stats.
-- **Engine:** a bounded file transfer strategy; both paths share result and
-  accounting contracts but have distinct completion protocols.
+- **Engine:** the single product-owned `copy_file` execution path. Its direct
+  plain-small and transactional auxiliary/sparse/large strategies share result
+  and accounting contracts but have distinct completion protocols.
 - **Watermark:** contiguous temp prefix eligible for a checkpoint.
 - **QD:** queue depth — in-flight I/O count per device side; the shipped
   large-file loop issues one synchronous request at a time. Small-file
@@ -138,7 +141,7 @@ replacements, warnings, grouped failures, extras, hints, and verification.
   file's ordinary data.
 - **Ring:** a historical term from two deleted streaming designs (the IOCP
   overlapped ring, ADR 0027, and the unbuffered reader/writer pair, ADR
-  0028). No ring exists: the standard engine is a sequential buffered chunk
+  0028). No ring exists: the standard transport is a sequential buffered chunk
   loop, while ADR 0036 adds only bounded synchronous same-spindle phases
   (PLAN §5.9).
 
@@ -152,15 +155,17 @@ replacements, warnings, grouped failures, extras, hints, and verification.
    (the in-repo test); full emitted-instance-vs-schema validation tooling is
    release work — do not claim it before it exists.
 4. Run the final production-validation pass (PLAN §12.10 — chaos/kill
-   convergence, adversarial set, sentinel/schema checks, certified benchmark
-   protocol); it executes only on explicit owner request.
+   convergence, adversarial set, sentinel/schema checks, and the bounded NTFS
+   benchmark protocol); it executes only on explicit owner request.
 5. Build `--release --locked`, smoke `--help`, local copy/rerun, both
    verification forms, report reopening, and any available bounded UNC/WSL
    scratch endpoint. Never substitute an unapproved production share.
 6. Update `CHANGELOG.md`, `BENCHMARKS.md`, and version; tag only a clean commit.
 
 Until step 4 exists and passes, label binaries pre-1.0 and do not make v1.0
-reliability/performance certification claims.
+NTFS reliability/performance certification claims. ReFS, FAT/exFAT, generic
+UNC/provider filesystems, and WSL are permanently best-effort under ADR 0042;
+optional compatibility evidence does not certify them.
 
 The live gate status and the difference between routine confidence and release
 certification are maintained in `docs/PRODUCTION_READINESS.md`.

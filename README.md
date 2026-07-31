@@ -2,9 +2,11 @@
 
 `bigcp` is a reliability-first, high-throughput tree copier for local volumes,
 generic UNC shares, mapped network drives, and WSL UNC paths on Windows 11
-22H2 or later. Local NTFS/ReFS use the strict full-fidelity path; FAT-family
-destinations use an explicit reduced-fidelity policy, while remote endpoints
-use isolated capability and transport policies. It is optimized for both large-file
+22H2 or later. Local NTFS is the strict full-fidelity path and the only
+filesystem certification target. ReFS, FAT-family, generic UNC, and WSL paths
+remain supported on a documented best-effort basis; FAT-family destinations
+use an explicit reduced-fidelity policy, while remote endpoints use isolated
+capability and transport policies. It is optimized for both large-file
 streaming and directories containing many small files. Its reliability
 promise is the one that matters: **when a run completes, every reported
 success and failure is exactly true.** If a run is interrupted, re-running it
@@ -28,7 +30,9 @@ contract, and measured performance work are implemented (bigcp leads robocopy
 on every measured small-file cell with default settings; see `BENCHMARKS.md`).
 A bounded fallback for exceptionally large single directories and the final
 production-validation pass in PLAN §12.10 remain before a 1.0 claim. Do not
-treat this build as v1.0 certified until those gates pass. Current evidence and status are summarized in
+treat this build as v1.0 certified for its NTFS contract until those gates
+pass. Non-NTFS filesystems are intentionally best-effort rather than
+certification-gated. Current evidence and status are summarized in
 [docs/PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md).
 
 ## Safety contract
@@ -260,8 +264,9 @@ or remove that destination object and rerun so bigcp can recreate it.
 - **Why does FAT/exFAT require acceptance?** Those filesystems cannot preserve
   NTFS streams, EAs, ACLs, sparse layout, EFS state, or links, and FAT has a
   4 GiB-minus-1-byte file limit. The one-time startup warning makes that loss a
-  deliberate choice. NTFS/ReFS retain exact timestamps and their existing
-  capability-based fast path.
+  deliberate choice. NTFS retains the certified strict path; ReFS retains its
+  exact capability-based mechanics but, like every non-NTFS path, is
+  best-effort.
 - **Why does UNC/WSL require acceptance?** A disconnected share can invalidate
   open handles, optional metadata depends on the server, and a local process
   cannot attest the server's durable cache state. WSL additionally translates

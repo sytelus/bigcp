@@ -53,4 +53,5 @@ pub use reparse::{
 pub use security::{ProtectedDacl, read_protected_dacl_checked};
 pub use sparse::AllocatedRange;
 pub use streams::{DestinationStream, SourceStream, StreamInfo, list_streams};
+pub use util::is_cloud_file_error;
 pub use volume::{FileSystem, VolumeCapabilities, VolumeInfo, probe_volume};

@@ -128,25 +128,27 @@ They use Developer Mode when available and skip link creation on hosts that do
 not authorize the source fixture; they never target an existing file outside
 the sandbox.
 
-## Elevated filesystem matrix
+## Optional elevated filesystem compatibility matrix
 
-FAT32/exFAT and ReFS certification uses only newly created, uniquely named
-VHDX files in a separately approved scratch directory. The operator must be
-an administrator and must validate the VHD path and the mounted disk identity
-before initializing or formatting it. Existing disks, partitions, drive
-letters, and user data are never matrix targets. Each virtual disk is mounted,
-tested, cleanly dismounted, and then the test-owned VHDX may be removed.
+Optional FAT32/exFAT and ReFS compatibility exercises use only newly created,
+uniquely named VHDX files in a separately approved scratch directory. The
+operator must be an administrator and must validate the VHD path and the
+mounted disk identity before initializing or formatting it. Existing disks,
+partitions, drive letters, and user data are never targets. Each virtual disk
+is mounted, tested, cleanly dismounted, and then the test-owned VHDX may be
+removed.
 
 The FAT-family cells cover acceptance bypass, direct-small and transactional
 large paths, timestamp comparison boundaries, `READONLY`/`HIDDEN`/`SYSTEM`/
 `ARCHIVE`, ADS/EA drops, dense sparse expansion, link rejection, FAT's
 4,294,967,295-byte limit (primarily through a synthetic boundary test), rerun
 convergence, projected verification, and the identity/enumeration/rename
-fallbacks selected by the mounted driver. This matrix is not routine CI and
-must be recorded in `TESTING_SUMMARY.md`; absence of that evidence means the
-filesystem is implemented but not matrix-certified.
+fallbacks selected by the mounted driver. This matrix is not routine CI; when
+run, it must be recorded in `TESTING_SUMMARY.md`. ReFS/FAT/exFAT are
+best-effort regardless of coverage, so missing cells are not release blockers
+and passing cells do not certify those filesystems (ADR 0042).
 
-## Remote endpoint matrix
+## Optional remote endpoint compatibility matrix
 
 Routine `cargo test` and `bigcp-testkit` remain local-only by construction; UNC
 support does not weaken the sandbox whitelist above. Pure tests cover ordinary
@@ -159,16 +161,17 @@ operator-approved scratch endpoint whose exact share/distribution path is named
 in advance. They may create only a unique test-owned subtree, must use the same
 small routine write budget unless separately approved as heavy, and must never
 reuse an existing user-data tree. A read-only WSL source dry-run may establish
-provider query/enumeration compatibility but is not a write-path or performance
-certification. Remote performance measurements are heavy-tier and require the
+provider query/enumeration compatibility but does not establish write-path or
+performance coverage. Remote performance measurements are heavy-tier and require the
 full approval record (paths, files, bytes, duration, and storage impact).
 
 Disconnect behavior is fault-injection-only: do not stop WSL, disconnect a
 share, remove a mapping, or manipulate a server during a test. The approved
 matrix covers direct/extended/legacy aliases, `--accept-remote-paths`, projected
 metadata, WSL exact-case names, unsupported link failure, rerun, and both
-verification forms. Record every executed cell in `TESTING_SUMMARY.md`; missing
-cells remain explicit limitations.
+verification forms. Record every executed cell in `TESTING_SUMMARY.md`.
+Missing cells are provider-specific evidence gaps, not release blockers or
+certification debt.
 
 ## Adding a test
 
@@ -204,11 +207,12 @@ synthetic-enumeration scale simulation, and real-hardware throughput gates
 within bounded write budgets require dedicated work and hardware. They are
 release-blocking before a 1.0 claim and run only on explicit owner request.
 
-By owner decision, the elevated NTFS/ReFS/FAT32/exFAT VHDX matrix, approved
-generic-UNC/mapped-drive/WSL destination matrix, and differential OS-copy
-comparisons are post-v1 or matrix-certification evidence under ADRs
-0029/0035/0037; they are not silently promoted back into the v1 gate. See PLAN
-§12.10, §13.2, and `BENCHMARKS.md`.
+By owner decision, NTFS is the only filesystem certification target. Approved
+ReFS/FAT32/exFAT VHDX exercises and generic-UNC/mapped-drive/WSL endpoint
+exercises are optional compatibility evidence under ADR 0042; they are not
+silently promoted into the v1 gate and cannot certify those best-effort paths.
+Differential OS-copy comparisons likewise remain optional. See PLAN §12.10,
+§13.2, and `BENCHMARKS.md`.
 
 Hours-long soaks, million-entry real trees, and forced-disconnect tests are not
 deferred: they are prohibited by VISION and will never run.

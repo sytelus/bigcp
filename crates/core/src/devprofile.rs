@@ -33,7 +33,7 @@ pub struct SideProfile {
     pub workers: usize,
 }
 
-/// Composed source/destination profile used by engines.
+/// Composed source/destination profile used by the copy engine.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CopyProfile {
     /// Source-side settings.

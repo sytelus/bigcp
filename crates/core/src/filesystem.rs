@@ -1,4 +1,4 @@
-//! Endpoint/filesystem policy without weakening the strict local NTFS/ReFS path.
+//! Endpoint/filesystem policy without weakening the strict local NTFS path.
 //!
 //! Windows exposes one common API surface, but filesystems do not represent
 //! the same metadata. This module is the only place where the core projects

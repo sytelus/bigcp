@@ -223,9 +223,9 @@ pub struct Counters {
     pub bytes_logical_discovered: u64,
     /// Logical bytes represented by copied outcomes.
     pub bytes_logical_copied: u64,
-    /// Actual source bytes read by copy engines.
+    /// Actual source bytes read by the copy engine.
     pub bytes_read_source: u64,
-    /// Actual destination bytes written by copy engines.
+    /// Actual destination bytes written by the copy engine.
     pub bytes_written_destination: u64,
     /// Bytes read during verification.
     pub bytes_verified: u64,
