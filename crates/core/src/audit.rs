@@ -77,6 +77,10 @@ pub enum AuditEvent {
         workers: usize,
         /// Whether volume extents intersect.
         same_physical_disk: bool,
+        /// Effective transport strategy.
+        transport: crate::transport::TransportKind,
+        /// Maximum bytes staged per transport phase.
+        burst_bytes: usize,
     },
     /// Directory discovery or completion.
     Directory {
@@ -436,6 +440,8 @@ mod tests {
             chunk_bytes: 8 * 1024 * 1024,
             workers: 32,
             same_physical_disk: false,
+            transport: crate::transport::TransportKind::Standard,
+            burst_bytes: 8 * 1024 * 1024,
         });
         assert!(encoded.is_ok());
         let parsed = encoded

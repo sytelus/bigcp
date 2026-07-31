@@ -358,7 +358,7 @@ fn draw_live(frame: &mut ratatui::Frame<'_>, state: &Arc<Mutex<LiveState>>, tab:
         1 => draw_live_errors(frame, chunks[1], snapshot),
         2 => frame.render_widget(
             Paragraph::new(format!(
-                "Current application read: {:.1} MiB/s\nCurrent application write: {:.1} MiB/s\n\nStatic device classes, chunk size, stream and worker counts, and confidence are persisted in the final report.",
+                "Current application read: {:.1} MiB/s\nCurrent application write: {:.1} MiB/s\n\nStatic device classes, topology-selected transport, chunk/burst sizes, worker count, and confidence are persisted in the final report.",
                 snapshot.read_bytes_per_second / (1024.0 * 1024.0),
                 snapshot.write_bytes_per_second / (1024.0 * 1024.0)
             ))
@@ -462,8 +462,18 @@ fn draw_report(frame: &mut ratatui::Frame<'_>, report: &RunReport, tab: usize) {
         }
         1 => frame.render_widget(
             Paragraph::new(format!(
-                "Source: {}\nDestination: {}\nDurability: {}\nAudit: {}",
-                report.run.source, report.run.destination, report.run.durability, report.run.audit
+                "Source: {} ({:?})\nDestination: {} ({:?})\nTransport: {:?}  Same physical disk: {}\nChunk: {} bytes  Burst: {} bytes  Workers: {}\nDurability: {}  Audit: {}",
+                report.run.source,
+                report.devices.source.class,
+                report.run.destination,
+                report.devices.destination.class,
+                report.devices.transport.kind,
+                report.devices.same_physical_disk,
+                report.devices.chunk_bytes,
+                report.devices.transport.burst_bytes,
+                report.devices.workers,
+                report.run.durability,
+                report.run.audit
             ))
             .block(
                 Block::default()

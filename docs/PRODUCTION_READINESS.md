@@ -31,6 +31,9 @@ by the governing plan.
   release work), dependency policy, and vulnerability audit.
 - Run-owned phase instrumentation, so multiple library runs in one process do
   not contaminate one another's analysis.
+- Topology-gated same-spindle scheduling: bounded plain-small read/write phases,
+  dense/sparse/ADS burst transport, cancellation accounting, and verified
+  same-volume integration coverage without changing the SSD/independent path.
 
 ## Release-blocking evidence still required
 
@@ -43,6 +46,8 @@ lifespan-reducing writes, no machine-stability impact — see PLAN §12.0):
 - **Bounded** workloads (W1s/W2s-class), differential OS-copy comparison, and
   topology-matched performance runs on scratch-designated storage;
   million-entry behavior via synthetic enumeration simulation, never real trees.
+- The same-spindle HDD `[HW]` cell remains required before claiming a measured
+  speedup or universal optimality for the new 256 MiB default.
 - The final production-validation pass (PLAN §12.10), executed only on
   explicit owner request: chaos/kill-convergence, the adversarial set,
   sentinel/schema checks, and the certified benchmark protocol.
@@ -69,4 +74,4 @@ release pass.
 
 No release process may reinterpret an unrun gate as a pass.
 `TESTING_SUMMARY.md` records dated evidence; intentional differences from
-the governing plan are recorded inline in PLAN.md and in ADRs 0027–0035.
+the governing plan are recorded inline in PLAN.md and in ADRs 0027–0036.

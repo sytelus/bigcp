@@ -6,6 +6,7 @@
 //! auxiliary streams or EAs and all large files use an opaque temporary so one
 //! logical file is published atomically (ADRs 0034/0035).
 
+use std::borrow::Cow;
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
@@ -21,6 +22,7 @@ use crate::error::{ErrorCategory, OperationError};
 use crate::journal::{Checkpoint, CheckpointFileIdentity, Journal, JournalEvent};
 use crate::model::{Counters, EntrySnapshot};
 use crate::phase::PhaseTracker;
+use crate::transport::{BurstBuffer, TransferFailureKind, TransportProfile};
 
 /// Successful engine result consumed by the common outcome path.
 pub struct EngineResult {
@@ -74,6 +76,8 @@ pub struct EngineRequest<'a> {
     pub destination_supports_eas: bool,
     /// Composed profile chunk bytes.
     pub chunk_bytes: usize,
+    /// Preflight-selected buffered transport policy.
+    pub transport: TransportProfile,
     /// Whether sparse layout can and should be preserved.
     pub preserve_sparse: bool,
     /// Minimum per-stream size eligible for partial resume checkpoints.
@@ -112,8 +116,68 @@ pub fn copy_file(
     counters: &mut Counters,
     mut journal: Option<&mut Journal>,
 ) -> Result<EngineResult, OperationError> {
+    let OpenedFile {
+        mut source,
+        streams,
+        extended_attributes,
+        routing,
+        eas_dropped,
+        should_hash,
+        has_representable_auxiliary_data,
+    } = open_file(request, journal.is_some())?;
+    if request.preserve_sparse && is_sparse(request.source_snapshot.metadata.basic.attributes) {
+        copy_sparse(
+            request,
+            counters,
+            &mut source,
+            streams.as_ref(),
+            extended_attributes.as_ref(),
+            eas_dropped,
+            should_hash,
+            journal.as_deref_mut(),
+        )
+    } else if routing.largest_representable < request.large_threshold
+        && !routing.checkpoint_eligible
+        && !has_representable_auxiliary_data
+    {
+        copy_plain_small(
+            request,
+            counters,
+            source,
+            should_hash,
+            routing.named_streams_dropped,
+            eas_dropped,
+        )
+    } else {
+        copy_streamed(
+            request,
+            counters,
+            &mut source,
+            streams.as_ref(),
+            extended_attributes.as_ref(),
+            eas_dropped,
+            should_hash,
+            journal.as_deref_mut(),
+        )
+    }
+}
+
+struct OpenedFile<'a> {
+    source: SourceFile,
+    streams: Cow<'a, [StreamInfo]>,
+    extended_attributes: Option<bigcp_win::ExtendedAttributes>,
+    routing: StreamRouting,
+    eas_dropped: bool,
+    should_hash: bool,
+    has_representable_auxiliary_data: bool,
+}
+
+fn open_file<'a>(
+    request: &EngineRequest<'a>,
+    journal_available: bool,
+) -> Result<OpenedFile<'a>, OperationError> {
     let timer = std::time::Instant::now();
-    let mut source = SourceFile::open(request.source_path)
+    let source = SourceFile::open(request.source_path)
         .map_err(|error| source_open_error("open_src", request.relative_path, &error))?;
     ensure_source_unchanged(
         request.source_snapshot,
@@ -123,25 +187,24 @@ pub fn copy_file(
     )?;
     request.phases.record(0, timer.elapsed());
 
-    let discovered_streams;
-    let synthetic_streams;
     let streams = if let Some(streams) = request.known_streams {
-        streams
+        Cow::Borrowed(streams)
     } else if !request.source_supports_streams {
-        synthetic_streams = vec![StreamInfo::unnamed(request.source_snapshot.metadata.size)];
-        &synthetic_streams
+        Cow::Owned(vec![StreamInfo::unnamed(
+            request.source_snapshot.metadata.size,
+        )])
     } else {
         let timer = std::time::Instant::now();
-        discovered_streams = list_streams(request.source_path)
+        let streams = list_streams(request.source_path)
             .map_err(|error| source_open_error("list_streams", request.relative_path, &error))?;
         request.phases.record(1, timer.elapsed());
-        &discovered_streams
+        Cow::Owned(streams)
     };
     let routing = route_streams(
-        streams,
+        streams.as_ref(),
         request.source_snapshot.metadata.size,
         request.destination_supports_streams,
-        journal.is_some(),
+        journal_available,
         request.checkpoint_threshold,
     );
     let largest_stream = routing.largest_representable;
@@ -173,44 +236,17 @@ pub fn copy_file(
         .transpose()
         .map_err(|error| source_open_error("read_ea", request.relative_path, &error))?;
     let named_streams = routing.named_streams;
-    let named_streams_dropped = routing.named_streams_dropped;
     let has_representable_auxiliary_data = extended_attributes.is_some()
         || (request.destination_supports_streams && named_streams > 0);
-    if request.preserve_sparse && is_sparse(request.source_snapshot.metadata.basic.attributes) {
-        copy_sparse(
-            request,
-            counters,
-            &mut source,
-            streams,
-            extended_attributes.as_ref(),
-            eas_dropped,
-            should_hash,
-            journal.as_deref_mut(),
-        )
-    } else if largest_stream < request.large_threshold
-        && !checkpoint_eligible
-        && !has_representable_auxiliary_data
-    {
-        copy_plain_small(
-            request,
-            counters,
-            &mut source,
-            should_hash,
-            named_streams_dropped,
-            eas_dropped,
-        )
-    } else {
-        copy_streamed(
-            request,
-            counters,
-            &mut source,
-            streams,
-            extended_attributes.as_ref(),
-            eas_dropped,
-            should_hash,
-            journal.as_deref_mut(),
-        )
-    }
+    Ok(OpenedFile {
+        source,
+        streams,
+        extended_attributes,
+        routing,
+        eas_dropped,
+        should_hash,
+        has_representable_auxiliary_data,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -298,13 +334,14 @@ fn copy_sparse(
 
     let mut buffer = vec![0_u8; request.chunk_bytes];
     if buffer.is_empty() {
-        return Err(OperationError::semantic(
-            ErrorCategory::Internal,
-            "allocate_buffer",
-            request.relative_path.to_path_buf(),
-            "the composed copy profile selected a zero-byte chunk",
-        ));
+        return Err(zero_chunk_error(request));
     }
+    let largest_range = ranges.iter().map(|range| range.length).max().unwrap_or(0);
+    let mut burst_buffer = request
+        .transport
+        .is_same_spindle()
+        .then(|| allocate_burst_buffer(request, largest_range))
+        .transpose()?;
     let checkpoint_eligible = logical_size >= request.checkpoint_threshold && journal.is_some();
     let interval = checkpoint_interval(logical_size);
     let mut next_checkpoint =
@@ -362,37 +399,49 @@ fn copy_sparse(
             check_cancel(request)?;
             let until_checkpoint =
                 next_checkpoint.map_or(remaining, |boundary| boundary - hash_offset);
-            let requested = usize::try_from(
-                remaining.min(until_checkpoint).min(buffer.len() as u64),
-            )
-            .map_err(|_| {
-                OperationError::semantic(
-                    ErrorCategory::Internal,
+            let capacity = burst_buffer
+                .as_ref()
+                .map_or(buffer.len(), BurstBuffer::capacity);
+            let requested = usize::try_from(remaining.min(until_checkpoint).min(capacity as u64))
+                .map_err(|_| address_space_error(request, "read_sparse", "sparse"))?;
+            let count = if let Some(staging) = &mut burst_buffer {
+                transfer_same_spindle_burst(
+                    request,
+                    counters,
+                    source,
+                    &mut temp,
+                    staging,
+                    requested,
                     "read_sparse",
-                    request.relative_path.to_path_buf(),
-                    "sparse request does not fit address space",
-                )
-            })?;
-            let count = source
-                .read(&mut buffer[..requested])
-                .map_err(|error| operation_error("read_sparse", request.relative_path, &error))?;
-            if count == 0 {
-                return Err(OperationError::semantic(
-                    ErrorCategory::SourceChanged,
-                    "read_sparse",
-                    request.relative_path.to_path_buf(),
+                    "write_sparse",
                     "source ended inside an allocated range",
-                ));
-            }
-            if let Some(hasher) = &mut hasher {
-                hasher.update(&buffer[..count]);
-            }
-            temp.write_all(&buffer[..count])
-                .map_err(|error| operation_error("write_sparse", request.relative_path, &error))?;
-            counters.bytes_read_source = counters.bytes_read_source.saturating_add(count as u64);
-            counters.bytes_written_destination = counters
-                .bytes_written_destination
-                .saturating_add(count as u64);
+                    &mut hasher,
+                )?
+            } else {
+                let count = source.read(&mut buffer[..requested]).map_err(|error| {
+                    operation_error("read_sparse", request.relative_path, &error)
+                })?;
+                if count == 0 {
+                    return Err(OperationError::semantic(
+                        ErrorCategory::SourceChanged,
+                        "read_sparse",
+                        request.relative_path.to_path_buf(),
+                        "source ended inside an allocated range",
+                    ));
+                }
+                if let Some(hasher) = &mut hasher {
+                    hasher.update(&buffer[..count]);
+                }
+                temp.write_all(&buffer[..count]).map_err(|error| {
+                    operation_error("write_sparse", request.relative_path, &error)
+                })?;
+                counters.bytes_read_source =
+                    counters.bytes_read_source.saturating_add(count as u64);
+                counters.bytes_written_destination = counters
+                    .bytes_written_destination
+                    .saturating_add(count as u64);
+                count
+            };
             remaining -= count as u64;
             hash_offset += count as u64;
             maybe_checkpoint_boundary(
@@ -491,11 +540,84 @@ fn hash_zero_count(hasher: &mut Option<Xxh3>, mut length: u64) {
 fn copy_plain_small(
     request: &EngineRequest<'_>,
     counters: &mut Counters,
-    source: &mut SourceFile,
+    source: SourceFile,
     should_hash: bool,
     streams_dropped: u32,
     eas_dropped: bool,
 ) -> Result<EngineResult, OperationError> {
+    let prepared = read_plain_small(
+        request,
+        counters,
+        source,
+        should_hash,
+        streams_dropped,
+        eas_dropped,
+    )?;
+    let written = write_plain_small(request, counters, prepared, false)?;
+    finish_plain_small(request, written)
+}
+
+/// Result of the read-only phase used by the same-spindle small-file batcher.
+pub(crate) enum SmallPreparation {
+    /// A plain unnamed stream is fully buffered and source-validated.
+    Ready(PreparedPlainSmall),
+    /// The file needs the regular transactional or sparse engine.
+    RequiresRegular,
+}
+
+/// Performs only source-side work for a worker-routable small file.
+pub(crate) fn prepare_plain_small(
+    request: &EngineRequest<'_>,
+    counters: &mut Counters,
+) -> Result<SmallPreparation, OperationError> {
+    let OpenedFile {
+        source,
+        routing,
+        eas_dropped,
+        should_hash,
+        has_representable_auxiliary_data,
+        ..
+    } = open_file(request, false)?;
+    if (request.preserve_sparse && is_sparse(request.source_snapshot.metadata.basic.attributes))
+        || routing.largest_representable >= request.large_threshold
+        || routing.checkpoint_eligible
+        || has_representable_auxiliary_data
+    {
+        return Ok(SmallPreparation::RequiresRegular);
+    }
+    read_plain_small(
+        request,
+        counters,
+        source,
+        should_hash,
+        routing.named_streams_dropped,
+        eas_dropped,
+    )
+    .map(SmallPreparation::Ready)
+}
+
+pub(crate) struct PreparedPlainSmall {
+    source: SourceFile,
+    bytes: Vec<u8>,
+    digest: Option<String>,
+    streams_dropped: u32,
+    eas_dropped: bool,
+    ea_digest: Option<String>,
+}
+
+pub(crate) struct WrittenPlainSmall {
+    source_to_revalidate: Option<SourceFile>,
+    result: EngineResult,
+}
+
+fn read_plain_small(
+    request: &EngineRequest<'_>,
+    counters: &mut Counters,
+    mut source: SourceFile,
+    should_hash: bool,
+    streams_dropped: u32,
+    eas_dropped: bool,
+) -> Result<PreparedPlainSmall, OperationError> {
     let expected = usize::try_from(request.source_snapshot.metadata.size).map_err(|_| {
         OperationError::semantic(
             ErrorCategory::Internal,
@@ -542,8 +664,26 @@ fn copy_plain_small(
             format!("expected {expected} bytes but read {}", bytes.len()),
         ));
     }
-    post_read_validate(request, source)?;
+    post_read_validate(request, &source)?;
 
+    let digest = should_hash.then(|| digest_bytes(&bytes));
+    let ea_digest = (request.verify && !eas_dropped).then(|| digest_bytes(&[]));
+    Ok(PreparedPlainSmall {
+        source,
+        bytes,
+        digest,
+        streams_dropped,
+        eas_dropped,
+        ea_digest,
+    })
+}
+
+pub(crate) fn write_plain_small(
+    request: &EngineRequest<'_>,
+    counters: &mut Counters,
+    prepared: PreparedPlainSmall,
+    defer_source_revalidation: bool,
+) -> Result<WrittenPlainSmall, OperationError> {
     // ADR 0030: plain small files write directly to their final name. Atomic
     // publication measured at ~2× the AV-filter cost of a direct write on
     // small-file floods, and VISION's rerun contract makes the
@@ -570,13 +710,22 @@ fn copy_plain_small(
     let mut destination = destination;
     let timer = std::time::Instant::now();
     destination
-        .write_all(&bytes)
+        .write_all(&prepared.bytes)
         .map_err(|error| operation_error("write", request.relative_path, &error))?;
     request.phases.record(4, timer.elapsed());
     counters.bytes_written_destination = counters
         .bytes_written_destination
-        .saturating_add(bytes.len() as u64);
-    post_read_validate(request, source)?;
+        .saturating_add(prepared.bytes.len() as u64);
+    // Standard workers preserve the original write→source-check→finish order.
+    // The same-spindle batch defers only this metadata check until every
+    // destination in the batch is finished, avoiding one mechanical return to
+    // the source region per file. No success is returned before that check.
+    let source_to_revalidate = if defer_source_revalidation {
+        Some(prepared.source)
+    } else {
+        post_read_validate(request, &prepared.source)?;
+        None
+    };
     let timer = std::time::Instant::now();
     destination
         .finish(
@@ -587,17 +736,31 @@ fn copy_plain_small(
         )
         .map_err(|error| operation_error("flush", request.relative_path, &error))?;
     request.phases.record(5, timer.elapsed());
-    Ok(EngineResult {
-        bytes: bytes.len() as u64,
-        digest: should_hash.then(|| digest_bytes(&bytes)),
-        stream_digests: Vec::new(),
-        ea_digest: (request.verify && !eas_dropped).then(|| digest_bytes(&[])),
-        streams_dropped,
-        eas_dropped,
-        journal_degraded: false,
-        efs_downgraded,
-        checkpoint_used: false,
+    Ok(WrittenPlainSmall {
+        source_to_revalidate,
+        result: EngineResult {
+            bytes: prepared.bytes.len() as u64,
+            digest: prepared.digest,
+            stream_digests: Vec::new(),
+            ea_digest: prepared.ea_digest,
+            streams_dropped: prepared.streams_dropped,
+            eas_dropped: prepared.eas_dropped,
+            journal_degraded: false,
+            efs_downgraded,
+            checkpoint_used: false,
+        },
     })
+}
+
+/// Completes the source-stability check after a phased destination batch.
+pub(crate) fn finish_plain_small(
+    request: &EngineRequest<'_>,
+    written: WrittenPlainSmall,
+) -> Result<EngineResult, OperationError> {
+    if let Some(source) = &written.source_to_revalidate {
+        post_read_validate(request, source)?;
+    }
+    Ok(written.result)
 }
 
 /// Opens the direct final-name writer, clearing a read-only attribute first
@@ -713,80 +876,94 @@ fn copy_streamed(
         (temp, 0, should_hash.then(Xxh3::new))
     };
     let efs_downgraded = efs_downgraded_for(request, &temp);
-    let mut buffer = vec![0_u8; request.chunk_bytes];
-    if buffer.is_empty() {
-        return Err(OperationError::semantic(
-            ErrorCategory::Internal,
-            "allocate_buffer",
-            request.relative_path.to_path_buf(),
-            "the composed copy profile selected a zero-byte chunk",
-        ));
-    }
     let checkpoint_eligible =
         request.source_snapshot.metadata.size >= request.checkpoint_threshold && journal.is_some();
     let interval = checkpoint_interval(request.source_snapshot.metadata.size);
     let mut next_checkpoint = checkpoint_eligible
         .then(|| next_checkpoint_after(total, interval, request.source_snapshot.metadata.size));
     let mut journal_degraded = false;
-    while total < request.source_snapshot.metadata.size {
-        check_cancel(request)?;
-        let remaining = request.source_snapshot.metadata.size - total;
-        let until_checkpoint = next_checkpoint.map_or(remaining, |boundary| boundary - total);
-        let requested = usize::try_from(remaining.min(until_checkpoint).min(buffer.len() as u64))
-            .map_err(|_| {
-            OperationError::semantic(
-                ErrorCategory::Internal,
-                "read",
-                request.relative_path.to_path_buf(),
-                "stream request does not fit address space",
+    if request.transport.is_same_spindle() {
+        let remaining = request.source_snapshot.metadata.size.saturating_sub(total);
+        let mut buffer = allocate_burst_buffer(request, remaining)?;
+        while total < request.source_snapshot.metadata.size {
+            let remaining = request.source_snapshot.metadata.size - total;
+            let until_checkpoint = next_checkpoint.map_or(remaining, |boundary| boundary - total);
+            let requested = usize::try_from(
+                remaining
+                    .min(until_checkpoint)
+                    .min(buffer.capacity() as u64),
             )
-        })?;
-        let count = source
-            .read(&mut buffer[..requested])
-            .map_err(|error| operation_error("read", request.relative_path, &error))?;
-        if count == 0 {
-            return Err(OperationError::semantic(
-                ErrorCategory::SourceChanged,
-                "read",
-                request.relative_path.to_path_buf(),
-                "source ended before its enumerated size",
-            ));
-        }
-        counters.bytes_read_source = counters.bytes_read_source.saturating_add(count as u64);
-        total = total.saturating_add(count as u64);
-        if let Some(hasher) = &mut hasher {
-            hasher.update(&buffer[..count]);
-        }
-        temp.write_all(&buffer[..count])
-            .map_err(|error| operation_error("write", request.relative_path, &error))?;
-        counters.bytes_written_destination = counters
-            .bytes_written_destination
-            .saturating_add(count as u64);
-        if next_checkpoint == Some(total) {
-            match append_checkpoint(
-                journal.as_deref_mut(),
-                &mut temp,
+            .map_err(|_| address_space_error(request, "read", "stream"))?;
+            let count = transfer_same_spindle_burst(
                 request,
-                "",
-                request.source_snapshot.metadata.size,
-                total,
-                hasher.as_ref(),
-            )? {
-                CheckpointStatus::Written => {
-                    next_checkpoint = (total < request.source_snapshot.metadata.size).then(|| {
-                        next_checkpoint_after(
-                            total,
-                            interval,
-                            request.source_snapshot.metadata.size,
-                        )
-                    });
-                }
-                CheckpointStatus::Disabled => {
-                    journal = None;
-                    next_checkpoint = None;
-                    journal_degraded = true;
-                }
-                CheckpointStatus::NotConfigured => next_checkpoint = None,
+                counters,
+                source,
+                &mut temp,
+                &mut buffer,
+                requested,
+                "read",
+                "write",
+                "source ended before its enumerated size",
+                &mut hasher,
+            )?;
+            total = total.saturating_add(count as u64);
+            if next_checkpoint == Some(total) {
+                update_stream_checkpoint(
+                    request,
+                    &mut temp,
+                    &mut journal,
+                    &mut next_checkpoint,
+                    &mut journal_degraded,
+                    interval,
+                    total,
+                    hasher.as_ref(),
+                )?;
+            }
+        }
+    } else {
+        let mut buffer = vec![0_u8; request.chunk_bytes];
+        if buffer.is_empty() {
+            return Err(zero_chunk_error(request));
+        }
+        while total < request.source_snapshot.metadata.size {
+            check_cancel(request)?;
+            let remaining = request.source_snapshot.metadata.size - total;
+            let until_checkpoint = next_checkpoint.map_or(remaining, |boundary| boundary - total);
+            let requested =
+                usize::try_from(remaining.min(until_checkpoint).min(buffer.len() as u64))
+                    .map_err(|_| address_space_error(request, "read", "stream"))?;
+            let count = source
+                .read(&mut buffer[..requested])
+                .map_err(|error| operation_error("read", request.relative_path, &error))?;
+            if count == 0 {
+                return Err(OperationError::semantic(
+                    ErrorCategory::SourceChanged,
+                    "read",
+                    request.relative_path.to_path_buf(),
+                    "source ended before its enumerated size",
+                ));
+            }
+            counters.bytes_read_source = counters.bytes_read_source.saturating_add(count as u64);
+            total = total.saturating_add(count as u64);
+            if let Some(hasher) = &mut hasher {
+                hasher.update(&buffer[..count]);
+            }
+            temp.write_all(&buffer[..count])
+                .map_err(|error| operation_error("write", request.relative_path, &error))?;
+            counters.bytes_written_destination = counters
+                .bytes_written_destination
+                .saturating_add(count as u64);
+            if next_checkpoint == Some(total) {
+                update_stream_checkpoint(
+                    request,
+                    &mut temp,
+                    &mut journal,
+                    &mut next_checkpoint,
+                    &mut journal_degraded,
+                    interval,
+                    total,
+                    hasher.as_ref(),
+                )?;
             }
         }
     }
@@ -835,6 +1012,140 @@ fn copy_streamed(
         efs_downgraded,
         checkpoint_used,
     })
+}
+
+fn allocate_burst_buffer(
+    request: &EngineRequest<'_>,
+    remaining: u64,
+) -> Result<BurstBuffer, OperationError> {
+    BurstBuffer::new(request.transport, request.chunk_bytes, remaining).map_err(|error| {
+        OperationError::semantic(
+            ErrorCategory::Internal,
+            "allocate_burst_buffer",
+            request.relative_path.to_path_buf(),
+            format!(
+                "could not reserve the bounded {}-byte same-spindle buffer: {error}",
+                request.transport.burst_bytes
+            ),
+        )
+    })
+}
+
+fn zero_chunk_error(request: &EngineRequest<'_>) -> OperationError {
+    OperationError::semantic(
+        ErrorCategory::Internal,
+        "allocate_buffer",
+        request.relative_path.to_path_buf(),
+        "the composed copy profile selected a zero-byte chunk",
+    )
+}
+
+fn address_space_error(
+    request: &EngineRequest<'_>,
+    operation: &str,
+    subject: &str,
+) -> OperationError {
+    OperationError::semantic(
+        ErrorCategory::Internal,
+        operation,
+        request.relative_path.to_path_buf(),
+        format!("{subject} request does not fit address space"),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn transfer_same_spindle_burst<R: Read, W: Write>(
+    request: &EngineRequest<'_>,
+    counters: &mut Counters,
+    source: &mut R,
+    destination: &mut W,
+    buffer: &mut BurstBuffer,
+    requested: usize,
+    read_operation: &str,
+    write_operation: &str,
+    unexpected_end: &str,
+    hasher: &mut Option<Xxh3>,
+) -> Result<usize, OperationError> {
+    let count = match buffer.read_from(source, requested, request.cancel) {
+        Ok(count) => count,
+        Err(failure) => {
+            counters.bytes_read_source = counters
+                .bytes_read_source
+                .saturating_add(failure.transferred as u64);
+            return Err(match failure.kind {
+                TransferFailureKind::Canceled => canceled_error(request),
+                TransferFailureKind::Io(error) => {
+                    operation_error(read_operation, request.relative_path, &error)
+                }
+            });
+        }
+    };
+    counters.bytes_read_source = counters.bytes_read_source.saturating_add(count as u64);
+    if count != requested {
+        return Err(OperationError::semantic(
+            ErrorCategory::SourceChanged,
+            read_operation,
+            request.relative_path.to_path_buf(),
+            unexpected_end,
+        ));
+    }
+    if let Some(hasher) = hasher {
+        hasher.update(buffer.prefix(count));
+    }
+    match buffer.write_to(destination, count, request.cancel) {
+        Ok(written) => {
+            counters.bytes_written_destination = counters
+                .bytes_written_destination
+                .saturating_add(written as u64);
+            Ok(written)
+        }
+        Err(failure) => {
+            counters.bytes_written_destination = counters
+                .bytes_written_destination
+                .saturating_add(failure.transferred as u64);
+            Err(match failure.kind {
+                TransferFailureKind::Canceled => canceled_error(request),
+                TransferFailureKind::Io(error) => {
+                    operation_error(write_operation, request.relative_path, &error)
+                }
+            })
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_stream_checkpoint(
+    request: &EngineRequest<'_>,
+    temp: &mut DestinationTemp,
+    journal: &mut Option<&mut Journal>,
+    next_checkpoint: &mut Option<u64>,
+    journal_degraded: &mut bool,
+    interval: u64,
+    total: u64,
+    hasher: Option<&Xxh3>,
+) -> Result<(), OperationError> {
+    match append_checkpoint(
+        journal.as_deref_mut(),
+        temp,
+        request,
+        "",
+        request.source_snapshot.metadata.size,
+        total,
+        hasher,
+    )? {
+        CheckpointStatus::Written => {
+            *next_checkpoint = (total < request.source_snapshot.metadata.size).then(|| {
+                next_checkpoint_after(total, interval, request.source_snapshot.metadata.size)
+            });
+        }
+        CheckpointStatus::Disabled => {
+            *journal = None;
+            *next_checkpoint = None;
+            *journal_degraded = true;
+        }
+        CheckpointStatus::NotConfigured => *next_checkpoint = None,
+    }
+    Ok(())
 }
 
 fn resume_unnamed(
@@ -1181,6 +1492,11 @@ fn copy_named_streams(
             )
         };
         let mut buffer = vec![0_u8; request.chunk_bytes.clamp(64 * 1024, 8 * 1024 * 1024)];
+        let mut burst_buffer = request
+            .transport
+            .is_same_spindle()
+            .then(|| allocate_burst_buffer(request, stream.size.saturating_sub(copied)))
+            .transpose()?;
         let checkpoint_eligible = stream.size >= request.checkpoint_threshold && journal.is_some();
         let interval = checkpoint_interval(stream.size);
         let mut next_checkpoint =
@@ -1189,39 +1505,51 @@ fn copy_named_streams(
             check_cancel(request)?;
             let remaining = stream.size - copied;
             let until_checkpoint = next_checkpoint.map_or(remaining, |boundary| boundary - copied);
-            let requested = usize::try_from(
-                remaining.min(until_checkpoint).min(buffer.len() as u64),
-            )
-            .map_err(|_| {
-                OperationError::semantic(
-                    ErrorCategory::Internal,
+            let capacity = burst_buffer
+                .as_ref()
+                .map_or(buffer.len(), BurstBuffer::capacity);
+            let requested =
+                usize::try_from(remaining.min(until_checkpoint).min(capacity as u64))
+                    .map_err(|_| address_space_error(request, "read_stream", "named-stream"))?;
+            let count = if let Some(staging) = &mut burst_buffer {
+                transfer_same_spindle_burst(
+                    request,
+                    counters,
+                    &mut source,
+                    &mut destination,
+                    staging,
+                    requested,
                     "read_stream",
-                    request.relative_path.to_path_buf(),
-                    "named-stream request does not fit address space",
-                )
-            })?;
-            let count = source
-                .read(&mut buffer[..requested])
-                .map_err(|error| operation_error("read_stream", request.relative_path, &error))?;
-            if count == 0 {
-                return Err(OperationError::semantic(
-                    ErrorCategory::SourceChanged,
-                    "read_stream",
-                    request.relative_path.to_path_buf(),
+                    "write_stream",
                     "named stream ended before its enumerated size",
-                ));
-            }
-            counters.bytes_read_source = counters.bytes_read_source.saturating_add(count as u64);
+                    &mut hasher,
+                )?
+            } else {
+                let count = source.read(&mut buffer[..requested]).map_err(|error| {
+                    operation_error("read_stream", request.relative_path, &error)
+                })?;
+                if count == 0 {
+                    return Err(OperationError::semantic(
+                        ErrorCategory::SourceChanged,
+                        "read_stream",
+                        request.relative_path.to_path_buf(),
+                        "named stream ended before its enumerated size",
+                    ));
+                }
+                counters.bytes_read_source =
+                    counters.bytes_read_source.saturating_add(count as u64);
+                if let Some(hasher) = &mut hasher {
+                    hasher.update(&buffer[..count]);
+                }
+                destination.write_all(&buffer[..count]).map_err(|error| {
+                    operation_error("write_stream", request.relative_path, &error)
+                })?;
+                counters.bytes_written_destination = counters
+                    .bytes_written_destination
+                    .saturating_add(count as u64);
+                count
+            };
             copied = copied.saturating_add(count as u64);
-            if let Some(hasher) = &mut hasher {
-                hasher.update(&buffer[..count]);
-            }
-            destination
-                .write_all(&buffer[..count])
-                .map_err(|error| operation_error("write_stream", request.relative_path, &error))?;
-            counters.bytes_written_destination = counters
-                .bytes_written_destination
-                .saturating_add(count as u64);
             if next_checkpoint == Some(copied) {
                 match append_checkpoint(
                     journal.as_deref_mut(),
@@ -1498,15 +1826,19 @@ pub(crate) const PROMOTED_TO_COORDINATOR: &str = "promoted_to_coordinator";
 
 fn check_cancel(request: &EngineRequest<'_>) -> Result<(), OperationError> {
     if (request.cancel)() {
-        Err(OperationError::semantic(
-            ErrorCategory::Internal,
-            CANCELED_MID_FILE,
-            request.relative_path.to_path_buf(),
-            "graceful cancellation stopped this copy between chunks",
-        ))
+        Err(canceled_error(request))
     } else {
         Ok(())
     }
+}
+
+fn canceled_error(request: &EngineRequest<'_>) -> OperationError {
+    OperationError::semantic(
+        ErrorCategory::Internal,
+        CANCELED_MID_FILE,
+        request.relative_path.to_path_buf(),
+        "graceful cancellation stopped this copy between chunks",
+    )
 }
 
 fn source_open_error(

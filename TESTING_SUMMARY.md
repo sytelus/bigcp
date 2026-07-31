@@ -2,6 +2,64 @@
 
 Latest review: 2026-07-30
 
+## 2026-07-30 same-spindle transport validation
+
+The owner-authorized same-spindle change passed every routine gate after the
+transport, scheduler, report schema, documentation, and ADR 0036 were
+reconciled. The final serial workspace suite ran only below this new C: system
+temporary root:
+
+`C:\Users\shitals\AppData\Local\Temp\bigcp-same-spindle-final2-a06f177f79534a5aa22674416132cacc`
+
+All 102 tests passed with zero failures: 7 CLI, 39 core unit, 15 core
+end-to-end, 8 testkit safety, 2 TUI, and 31 Windows-boundary tests. The new
+coverage pins transport selection (shared HDD extents versus shared SSD
+extents), conflicting worker-override rejection, burst allocation and phased
+read/write ordering, cancellation progress, same-spindle small-file batching,
+and verified dense/sparse/named-stream copying under a forced-HDD profile.
+
+The post-change gates were:
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`
+- `cargo test --workspace --all-targets --locked -- --test-threads=1`
+- warning-denied `cargo doc --workspace --no-deps --locked`
+- `cargo build --workspace --release --locked`
+- `cargo deny check` (advisories, bans, licenses, and sources passed; the
+  existing informational `hashbrown` and `syn` duplicate-version warnings
+  remain)
+- `cargo audit` against 1,174 RustSec advisories (no vulnerability across 146
+  locked dependencies)
+- the frozen/governing-input and automated test-storage safety checks
+
+The optimized binaries then completed the bounded `e00-smoke.yaml` workflow
+in:
+
+`C:\Users\shitals\AppData\Local\Temp\bigcp-same-spindle-smoke-f853ce0ad8f94ad08b8b8389cd7d3eaa`
+
+It generated 3 directories, 5 files, and 78,848 logical bytes; proved dry-run
+left the destination absent; copied and same-run verified all five; converged
+to five skips on rerun; passed standalone strict verification and the
+independent nine-object oracle with zero mismatches/extras; reopened the saved
+report; and parsed all 16 JSONL events. The host C: topology was correctly
+reported as same-device SATA SSD and retained the standard 32-worker transport,
+so this smoke also confirms the HDD-only optimization does not replace the SSD
+path.
+
+No performance, stress, VHDX, or real-HDD test ran. No physical drive was
+mounted, formatted, dismounted, or otherwise modified, and no writes targeted
+F:, G:, or H:. The implementation is correctness-tested but not yet
+real-spindle performance-certified; that `[HW]` benchmark remains subject to
+the separate permission protocol in `docs/TESTING.md`.
+
+The owner-approved governing documents were re-pinned to:
+
+| File | SHA-256 |
+|---|---|
+| `PLAN.md` | `DFE35C96636EBBE3E9F3A361BF169EFE567C9D64B35020CECF8A44EFF1B42BD2` |
+| `VISION.md` | `739678D0602FEF55D19A988D9FD60B17E21EA4A4EC59D9094F9DDD90A38CB678` |
+| `LIMITATIONS.md` | `8FA86A1283BF8B303BBC9713D1A9B61213E23333B9320CD350C3E2D15FC29F54` |
+
 ## 2026-07-30 FAT/FAT32/exFAT support validation
 
 The owner-authorized filesystem-policy change passed every routine gate after

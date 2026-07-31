@@ -6,7 +6,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::windows::fs::symlink_file;
 use std::path::Path;
 
-use bigcp_core::{CopyOptions, RunObserver, RunSnapshot, VerifyOptions, run_copy};
+use bigcp_core::{CopyOptions, DeviceClass, RunObserver, RunSnapshot, VerifyOptions, run_copy};
 use bigcp_testkit::sandbox::{initialize_empty, validated_system_temp};
 use bigcp_testkit::{SandboxRoot, check_trees};
 use bigcp_win::{
@@ -601,6 +601,83 @@ fn options_without_analyze(base: &CopyOptions) -> CopyOptions {
     options.analyze = false;
     options.fresh = true;
     options
+}
+
+#[test]
+fn same_spindle_profile_batches_small_files_and_bursts_large_data()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Fresh writes: <2 MiB of source/destination payload plus bounded run
+    // state, within the 16 MiB end-to-end fixture budget in docs/TESTING.md.
+    let allowed_temp = validated_system_temp()?;
+    let lease = tempfile::Builder::new()
+        .prefix("bigcp-same-spindle-")
+        .tempdir_in(allowed_temp)?;
+    let sandbox = initialize_empty(lease.path())?;
+    let source = sandbox.child(Path::new("source"))?;
+    let destination = sandbox.child(Path::new("destination"))?;
+    fs::create_dir(&source)?;
+    for index in 0_u8..4 {
+        fs::write(
+            source.join(format!("small-{index}.bin")),
+            vec![index; 16 * 1024],
+        )?;
+    }
+    let large = source.join("large.bin");
+    fs::write(&large, vec![0xA7; 320 * 1024])?;
+    let stream = StreamInfo {
+        name: OsString::from(":same-spindle:$DATA"),
+        size: 192 * 1024,
+    };
+    let mut alternate = DestinationStream::create(&large, &stream, true)?;
+    alternate.write_all(&vec![0x5C; usize::try_from(stream.size)?])?;
+    alternate.flush()?;
+    drop(alternate);
+
+    let sparse_path = source.join("sparse.bin");
+    let mut sparse = DestinationTemp::create(&source, "same-spindle-fixture", false)?;
+    sparse.mark_sparse()?;
+    sparse.set_len(512 * 1024)?;
+    sparse.seek(SeekFrom::Start(384 * 1024))?;
+    sparse.write_all(&vec![0x3D; 4096])?;
+    sparse.commit(
+        &sparse_path,
+        false,
+        BasicMetadata {
+            creation_time: 0,
+            last_access_time: 0,
+            last_write_time: 0,
+            attributes: 0,
+        },
+        false,
+        true,
+    )?;
+
+    let mut options = CopyOptions::new(source, destination);
+    options.state_dir = Some(sandbox.child(Path::new("state"))?);
+    // Both roots are on this one test volume. The explicit rotational class
+    // makes the deterministic topology policy testable on SSD-only CI.
+    options.source_profile = DeviceClass::Hdd;
+    options.destination_profile = DeviceClass::Hdd;
+    options.tune.large_threshold = Some(64 * 1024);
+    options.tune.chunk_bytes = Some(64 * 1024);
+    options.tune.same_spindle_burst_bytes = Some(1024 * 1024);
+    options.verify = true;
+
+    let report = run_copy(&options, &SilentObserver)?;
+    assert_eq!(report.run.exit, 0, "copy errors: {:?}", report.errors);
+    assert!(report.devices.same_physical_disk);
+    assert!(report.devices.transport.is_same_spindle());
+    assert_eq!(report.devices.workers, 1);
+    assert_eq!(report.counters.copied_new, 6);
+    assert!(report.counters.reconcile().is_ok());
+    assert!(
+        report
+            .hints
+            .iter()
+            .any(|hint| hint.id == "same_spindle_transport")
+    );
+    assert!(report.verify.is_some_and(|summary| summary.failed == 0));
+    Ok(())
 }
 
 /// Requests cancellation only after the run is already inside the large-file

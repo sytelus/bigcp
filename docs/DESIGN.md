@@ -40,9 +40,15 @@ one whole-buffer unnamed-stream write. FAT-family files are restamped on that
 same handle after data I/O; the NTFS/ReFS path incurs no extra restamp. Files
 with destination-representable ADS/EAs, sparse files, and large/resumable files
 use `DestinationTemp` and atomic publication. Unsupported source ADS/EAs are
-counted and warned but do not force that slower route. Large
-transfers are bounded synchronous streams;
-checkpoint boundaries retain exact offset-ordered xxh3 snapshots. Both paths
+counted and warned but do not force that slower route. Large transfers are
+bounded synchronous streams. The standard transport uses one request-sized
+buffer. When volume disk extents intersect and an effective profile is
+rotational, an immutable `SameSpindle` transport instead stages a bounded
+multi-request burst before each destination phase; the coordinator drains the
+phased small-file worker before inline work. Plain small files on that topology
+are read/revalidated as one bounded batch, written as one destination phase,
+then source-revalidated before success. Checkpoint boundaries retain exact
+offset-ordered xxh3 snapshots. Both paths
 return the same `EngineResult` and only the coordinator records terminal
 outcomes. Channels and buffers have explicit caps.
 Known symbolic links are created through `CreateSymbolicLinkW` so Developer
@@ -78,9 +84,12 @@ ports:
 
 - **UNC/network:** add a path/volume backend that returns network capabilities
   and a network profile; do not add SMB behavior to current local wrappers.
-- **Same-volume acceleration:** add a separately capability-gated transport
-  behind the existing result/accounting contract. Classification, audit, and
-  verification do not change.
+- **Same-spindle transport (implemented):** `transport.rs` owns topology policy
+  data and burst mechanics, `worker.rs` owns phased plain-small batching, and
+  `engine.rs` applies it to dense/sparse/named streams behind the existing
+  result/accounting contract. Future tuning stays inside this seam.
+- **Same-volume cloning:** a separately capability-gated clone transport may
+  still be added later; classification, audit, and verification must not change.
 - **FAT/exFAT (implemented):** the policy owns timestamp projection, attribute
   projection, final restamping, and FAT size limits; volume capability flags
   govern optional streams, EAs, sparse storage, EFS, ACLs, and POSIX rename.
@@ -100,9 +109,11 @@ must state its atomicity, representation, and metadata guarantees.
 
 Device discovery uses official query-only IOCTLs: physical extents, bus type,
 seek penalty, sector sizes, and maximum transfer length. Static profiles choose
-per-side chunk size and small-file workers. Manual values are range checked; the memory override caps
-both chunk size and the number of threshold-sized small-file workers.
-Same-disk extent overlap is reported.
+per-side chunk size and small-file workers. Intersecting disk extents plus
+rotational classification select one phased worker and a bounded same-spindle
+burst; SSD overlap stays on the standard path. Manual values are range checked;
+the memory override caps chunks, threshold-sized workers, and the burst. All
+effective transport facts are reported.
 
 The directory join avoids a destination `stat` per source file. Stream and EA
 work is deferred until required. Statistics report application-side rates and

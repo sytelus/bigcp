@@ -10,10 +10,14 @@ use std::thread::JoinHandle;
 use bigcp_win::StreamInfo;
 use crossbeam_channel::{Receiver, Sender};
 
-use crate::engine::{EngineRequest, EngineResult, copy_file};
+use crate::engine::{
+    EngineRequest, EngineResult, PreparedPlainSmall, SmallPreparation, WrittenPlainSmall,
+    copy_file, finish_plain_small, prepare_plain_small, write_plain_small,
+};
 use crate::error::{BigcpError, OperationError};
 use crate::model::{Counters, EntrySnapshot};
 use crate::phase::PhaseTracker;
+use crate::transport::TransportProfile;
 
 /// Replacement decision facts retained until coordinator finalization.
 pub(crate) struct ReplacementWork {
@@ -44,6 +48,7 @@ pub(crate) struct FileCopyJob {
     pub destination_metadata: bigcp_win::BasicMetadata,
     pub destination_requires_post_write_stamp: bool,
     pub chunk_bytes: usize,
+    pub transport: TransportProfile,
     pub checkpoint_threshold: u64,
     /// Known stream set, or None for the fast-dispatch path: the engine
     /// discovers streams itself at open, keeping the coordinator probe-free.
@@ -59,10 +64,8 @@ pub(crate) struct FileCopyJob {
 }
 
 impl FileCopyJob {
-    fn execute(self) -> CompletedCopy {
-        let started = std::time::Instant::now();
-        let mut counters = Counters::default();
-        let request = EngineRequest {
+    fn request(&self) -> EngineRequest<'_> {
+        EngineRequest {
             source_path: &self.source_path,
             destination_path: &self.destination_path,
             relative_path: &self.source_snapshot.relative_path,
@@ -77,6 +80,7 @@ impl FileCopyJob {
             destination_supports_streams: self.destination_supports_streams,
             destination_supports_eas: self.destination_supports_eas,
             chunk_bytes: self.chunk_bytes,
+            transport: self.transport,
             preserve_sparse: false,
             checkpoint_threshold: self.checkpoint_threshold,
             destination_supports_encryption: self.destination_supports_encryption,
@@ -85,12 +89,16 @@ impl FileCopyJob {
             destination_metadata: self.destination_metadata,
             destination_requires_post_write_stamp: self.destination_requires_post_write_stamp,
             known_streams: self.streams.as_deref(),
-            // Small files finish in bounded time; between-file cancellation
-            // at the coordinator is responsive enough for this path.
-            cancel: &|| false,
+            cancel: &never_cancel,
             promote_threshold: self.promote_threshold,
             phases: &self.phases,
-        };
+        }
+    }
+
+    fn execute(self) -> CompletedCopy {
+        let started = std::time::Instant::now();
+        let mut counters = Counters::default();
+        let request = self.request();
         // A panicking engine call must still produce a completion: the
         // coordinator's blocking `receive` would otherwise deadlock forever
         // behind the other workers' live sender clones. Engine code is
@@ -106,18 +114,31 @@ impl FileCopyJob {
                 "worker thread panicked during copy; this is a bigcp bug — please file the log",
             )),
         };
-        CompletedCopy {
-            source_path: self.source_path,
-            destination_path: self.destination_path,
-            source_snapshot: self.source_snapshot,
-            destination_snapshot: self.destination_snapshot,
-            replacement: self.replacement,
-            counters,
-            result,
-            logical_bytes: self.logical_bytes,
-            seconds: started.elapsed().as_secs_f64(),
-        }
+        complete_job(self, counters, result, started.elapsed().as_secs_f64())
     }
+}
+
+fn complete_job(
+    job: FileCopyJob,
+    counters: Counters,
+    result: Result<EngineResult, OperationError>,
+    seconds: f64,
+) -> CompletedCopy {
+    CompletedCopy {
+        source_path: job.source_path,
+        destination_path: job.destination_path,
+        source_snapshot: job.source_snapshot,
+        destination_snapshot: job.destination_snapshot,
+        replacement: job.replacement,
+        counters,
+        result,
+        logical_bytes: job.logical_bytes,
+        seconds,
+    }
+}
+
+fn never_cancel() -> bool {
+    false
 }
 
 /// One worker completion awaiting single-threaded accounting and audit.
@@ -161,10 +182,18 @@ const PER_WORKER_QUEUE: usize = 1024;
 
 impl SmallFileWorkers {
     /// Starts the static profile's small-file workers.
-    pub fn new(worker_count: usize) -> Result<Self, BigcpError> {
+    pub fn new(
+        worker_count: usize,
+        same_spindle_burst_bytes: Option<usize>,
+    ) -> Result<Self, BigcpError> {
         if !(1..=256).contains(&worker_count) {
             return Err(BigcpError::Invalid(
                 "small-file worker count must be in 1..=256".to_owned(),
+            ));
+        }
+        if same_spindle_burst_bytes.is_some() && worker_count != 1 {
+            return Err(BigcpError::Invariant(
+                "same-spindle small-file scheduling requires exactly one phased worker".to_owned(),
             ));
         }
         let capacity = worker_count.saturating_mul(PER_WORKER_QUEUE);
@@ -177,7 +206,13 @@ impl SmallFileWorkers {
             let results = result_sender.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("bigcp-small-{index}"))
-                .spawn(move || worker_loop(&job_receiver, &results))
+                .spawn(move || {
+                    if let Some(burst_bytes) = same_spindle_burst_bytes {
+                        same_spindle_worker_loop(&job_receiver, &results, burst_bytes);
+                    } else {
+                        worker_loop(&job_receiver, &results);
+                    }
+                })
                 .map_err(|error| BigcpError::io("start small-file worker", error))?;
             handles.push(handle);
             senders.push(job_sender);
@@ -248,6 +283,143 @@ fn worker_loop(jobs: &Receiver<FileCopyJob>, results: &Sender<CompletedCopy>) {
     }
 }
 
+struct PreparedBatchEntry {
+    job: FileCopyJob,
+    prepared: PreparedPlainSmall,
+    counters: Counters,
+    seconds: f64,
+}
+
+struct WrittenBatchEntry {
+    job: FileCopyJob,
+    written: WrittenPlainSmall,
+    counters: Counters,
+    seconds: f64,
+}
+
+/// Same-spindle small-file scheduling has three coarse phases: fill the
+/// bounded batch from source handles, write every prepared destination, then
+/// revalidate the still-open source handles. This removes one source↔target
+/// head seek per file while preserving the ordinary engine's stability and
+/// completion checks.
+fn same_spindle_worker_loop(
+    jobs: &Receiver<FileCopyJob>,
+    results: &Sender<CompletedCopy>,
+    burst_bytes: usize,
+) {
+    let mut carried = None;
+    while let Some(first) = carried.take().or_else(|| jobs.recv().ok()) {
+        let mut estimated = usize::try_from(first.logical_bytes).unwrap_or(usize::MAX);
+        let mut batch = vec![first];
+        while batch.len() < PER_WORKER_QUEUE && estimated < burst_bytes {
+            let next = match jobs.recv_timeout(std::time::Duration::from_millis(2)) {
+                Ok(job) => job,
+                Err(
+                    crossbeam_channel::RecvTimeoutError::Timeout
+                    | crossbeam_channel::RecvTimeoutError::Disconnected,
+                ) => break,
+            };
+            let next_bytes = usize::try_from(next.logical_bytes).unwrap_or(usize::MAX);
+            if estimated.saturating_add(next_bytes) > burst_bytes {
+                carried = Some(next);
+                break;
+            }
+            estimated = estimated.saturating_add(next_bytes);
+            batch.push(next);
+        }
+        if !run_same_spindle_batch(batch, results) {
+            break;
+        }
+    }
+}
+
+fn run_same_spindle_batch(batch: Vec<FileCopyJob>, results: &Sender<CompletedCopy>) -> bool {
+    let mut prepared = Vec::with_capacity(batch.len());
+    let mut regular = Vec::new();
+    for job in batch {
+        let started = std::time::Instant::now();
+        let mut counters = Counters::default();
+        let result = {
+            let request = job.request();
+            prepare_plain_small(&request, &mut counters)
+        };
+        let seconds = started.elapsed().as_secs_f64();
+        match result {
+            Ok(SmallPreparation::Ready(value)) => prepared.push(PreparedBatchEntry {
+                job,
+                prepared: value,
+                counters,
+                seconds,
+            }),
+            Ok(SmallPreparation::RequiresRegular) => regular.push(job),
+            Err(error) => {
+                if results
+                    .send(complete_job(job, counters, Err(error), seconds))
+                    .is_err()
+                {
+                    return false;
+                }
+            }
+        }
+    }
+
+    let mut written = Vec::with_capacity(prepared.len());
+    for mut entry in prepared {
+        let started = std::time::Instant::now();
+        let result = {
+            let request = entry.job.request();
+            write_plain_small(&request, &mut entry.counters, entry.prepared, true)
+        };
+        entry.seconds += started.elapsed().as_secs_f64();
+        match result {
+            Ok(value) => written.push(WrittenBatchEntry {
+                job: entry.job,
+                written: value,
+                counters: entry.counters,
+                seconds: entry.seconds,
+            }),
+            Err(error) => {
+                if results
+                    .send(complete_job(
+                        entry.job,
+                        entry.counters,
+                        Err(error),
+                        entry.seconds,
+                    ))
+                    .is_err()
+                {
+                    return false;
+                }
+            }
+        }
+    }
+
+    for entry in written {
+        let started = std::time::Instant::now();
+        let result = {
+            let request = entry.job.request();
+            finish_plain_small(&request, entry.written)
+        };
+        let seconds = entry.seconds + started.elapsed().as_secs_f64();
+        if results
+            .send(complete_job(entry.job, entry.counters, result, seconds))
+            .is_err()
+        {
+            return false;
+        }
+    }
+
+    // Representable ADS/EA files keep the existing transactional engine.
+    // They are rare and are deliberately processed after the ordinary batch
+    // so they cannot break its source-only/destination-only phases.
+    for job in regular {
+        if results.send(job.execute()).is_err() {
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::SmallFileWorkers;
@@ -258,7 +430,7 @@ mod tests {
     /// see PLAN section 5.8 and BENCHMARKS.md (2026-07-29) before changing.
     #[test]
     fn shard_routing_is_stable_per_directory() {
-        let workers = SmallFileWorkers::new(8);
+        let workers = SmallFileWorkers::new(8, None);
         assert!(workers.is_ok());
         let Some(workers) = workers.ok() else {
             return;

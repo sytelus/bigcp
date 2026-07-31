@@ -42,6 +42,7 @@ use crate::report::{
     ReplacementSample, ReplacementSummary, RunInfo, RunReport, top_level,
 };
 use crate::stats::{AnalysisCollector, StatsTracker};
+use crate::transport::TransportProfile;
 use crate::verify::{VerificationTarget, verify_written_targets};
 use crate::worker::{CompletedCopy, FileCopyJob, ReplacementWork, SmallFileWorkers};
 
@@ -113,7 +114,15 @@ pub fn run_copy(
         chunk_bytes: preflight.profile.chunk_bytes,
         workers: preflight.profile.workers,
         same_physical_disk: preflight.profile.same_physical_disk,
+        transport: preflight.profile.transport.kind,
+        burst_bytes: preflight.profile.transport.burst_bytes,
     })?;
+    if preflight.profile.transport.is_same_spindle() {
+        observer.on_message(&format!(
+            "same-spindle HDD topology: using serialized small-file batches and {} MiB phased read/write bursts",
+            preflight.profile.transport.burst_bytes / (1024 * 1024)
+        ));
+    }
     if preflight.destination_write_cache_disabled {
         observer.on_message(
             "destination write caching is off (Quick-removal policy): small-file copies run \
@@ -207,7 +216,14 @@ pub fn run_copy(
         ));
     }
 
-    let small_workers = SmallFileWorkers::new(preflight.profile.workers)?;
+    let small_workers = SmallFileWorkers::new(
+        preflight.profile.workers,
+        preflight
+            .profile
+            .transport
+            .is_same_spindle()
+            .then_some(preflight.profile.transport.burst_bytes),
+    )?;
     let mut runner = Runner {
         options,
         observer,
@@ -218,6 +234,7 @@ pub fn run_copy(
         source_supports_eas: preflight.source_volume.capabilities.extended_attributes,
         destination_policy,
         chunk_bytes: preflight.profile.chunk_bytes,
+        transport: preflight.profile.transport,
         source_is_volume_root: same_path(&preflight.source, &preflight.source_volume.root)?,
         counters: Counters::default(),
         audit,
@@ -468,6 +485,7 @@ struct Runner<'a> {
     source_supports_eas: bool,
     destination_policy: FilesystemPolicy,
     chunk_bytes: usize,
+    transport: TransportProfile,
     source_is_volume_root: bool,
     counters: Counters,
     audit: AuditWriter,
@@ -1460,6 +1478,7 @@ impl Runner<'_> {
                         .destination_policy
                         .requires_post_write_stamp(),
                     chunk_bytes: self.chunk_bytes,
+                    transport: self.transport,
                     checkpoint_threshold: self.options.checkpoint_threshold(),
                     streams: None,
                     logical_bytes: unnamed,
@@ -1468,6 +1487,12 @@ impl Runner<'_> {
                 };
                 return self.submit_small_job(job);
             }
+        }
+        if self.transport.is_same_spindle() && !self.options.dry_run {
+            // The coordinator owns transactional/large files. Letting one run
+            // while the phased small-file worker is active would interleave
+            // source and destination I/O and undo the same-spindle policy.
+            self.drain_small_workers()?;
         }
         if let Err(error) = revalidate_source(source, relative) {
             return self.record_file(
@@ -1567,6 +1592,7 @@ impl Runner<'_> {
             destination_supports_streams: self.destination_policy.supports_streams(),
             destination_supports_eas: self.destination_policy.supports_eas(),
             chunk_bytes: self.chunk_bytes,
+            transport: self.transport,
             preserve_sparse: self.destination_policy.supports_sparse() && !self.options.no_sparse,
             checkpoint_threshold: self.options.checkpoint_threshold(),
             destination_supports_encryption: self.destination_policy.supports_encryption(),
@@ -2965,6 +2991,16 @@ fn derive_hints(runner: &Runner<'_>, preflight: &Preflight) -> Vec<Hint> {
                    class of workload ~3.4x in measurement; leave 'Turn off Windows write-cache \
                    buffer flushing' UNCHECKED, and always use Safely Remove before unplugging"
                 .to_owned(),
+            confidence: "high".to_owned(),
+        });
+    }
+    if preflight.profile.transport.is_same_spindle() {
+        hints.push(Hint {
+            id: "same_spindle_transport".to_owned(),
+            text: format!(
+                "Source and destination share rotational media; the {} MiB phased transport was active. A destination on a separate physical drive can still be faster because one spindle cannot read and write simultaneously",
+                preflight.profile.transport.burst_bytes / (1024 * 1024)
+            ),
             confidence: "high".to_owned(),
         });
     }

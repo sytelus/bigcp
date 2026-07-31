@@ -5,6 +5,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::BigcpError;
 use crate::options::{DeviceClass, TuneOptions};
+use crate::transport::TransportProfile;
+
+const DEFAULT_SAME_SPINDLE_BURST_BYTES: usize = 256 * 1024 * 1024;
+const MIN_SAME_SPINDLE_BURST_BYTES: usize = 1024 * 1024;
+const MAX_SAME_SPINDLE_BURST_BYTES: usize = 1024 * 1024 * 1024;
 
 /// One side's initial static settings.
 ///
@@ -36,6 +41,9 @@ pub struct CopyProfile {
     pub workers: usize,
     /// True when source and destination extent sets intersect.
     pub same_physical_disk: bool,
+    /// Data transport selected from physical topology and seek behavior.
+    #[serde(default)]
+    pub transport: TransportProfile,
 }
 
 /// Selects and composes profiles without probe traffic.
@@ -102,10 +110,45 @@ pub fn select_copy_profile(
     // close-overlap win (BENCHMARKS.md). The one exception is a seek-penalty
     // source, whose row stays authoritative: its random reads are the
     // scarcer resource.
-    let workers = if source.class == DeviceClass::Hdd {
+    let mut workers = if source.class == DeviceClass::Hdd {
         source.workers.min(destination.workers)
     } else {
         destination.workers
+    };
+    let same_spindle = same_physical_disk
+        && (source.class == DeviceClass::Hdd || destination.class == DeviceClass::Hdd);
+    let transport = if same_spindle {
+        if tune.threads.is_some_and(|workers| workers != 1) {
+            return Err(BigcpError::Invalid(
+                "same-spindle phased scheduling requires threads=1; omit threads or set it to 1"
+                    .to_owned(),
+            ));
+        }
+        let large_threshold = usize::try_from(tune.large_threshold.unwrap_or(16 * 1024 * 1024))
+            .map_err(|_| {
+                BigcpError::Invalid(
+                    "large-file threshold does not fit this address space".to_owned(),
+                )
+            })?;
+        let mut burst_bytes = tune
+            .same_spindle_burst_bytes
+            .unwrap_or(DEFAULT_SAME_SPINDLE_BURST_BYTES);
+        if let Some(memory_bytes) = tune.memory_bytes {
+            burst_bytes = burst_bytes.min(memory_bytes);
+        }
+        let minimum = chunk_bytes.max(large_threshold);
+        if burst_bytes < minimum {
+            return Err(BigcpError::Invalid(format!(
+                "same-spindle burst {burst_bytes} is smaller than the required chunk/whole-file buffer {minimum}"
+            )));
+        }
+        // One phased scheduler owns rotational source/destination I/O. More
+        // workers would interleave its read and write phases and recreate the
+        // head-seek storm this profile exists to prevent.
+        workers = 1;
+        TransportProfile::same_spindle(burst_bytes)
+    } else {
+        TransportProfile::standard(chunk_bytes)
     };
     Ok(CopyProfile {
         source,
@@ -113,6 +156,7 @@ pub fn select_copy_profile(
         chunk_bytes,
         workers,
         same_physical_disk,
+        transport,
     })
 }
 
@@ -147,6 +191,13 @@ fn validate_tuning(tune: &TuneOptions) -> Result<(), BigcpError> {
         return Err(BigcpError::Invalid(
             "checkpoint threshold must be positive".to_owned(),
         ));
+    }
+    if let Some(burst) = tune.same_spindle_burst_bytes
+        && !(MIN_SAME_SPINDLE_BURST_BYTES..=MAX_SAME_SPINDLE_BURST_BYTES).contains(&burst)
+    {
+        return Err(BigcpError::Invalid(format!(
+            "same-spindle burst must be in {MIN_SAME_SPINDLE_BURST_BYTES}..={MAX_SAME_SPINDLE_BURST_BYTES} bytes"
+        )));
     }
     Ok(())
 }
@@ -292,6 +343,14 @@ mod tests {
                 checkpoint_threshold: Some(0),
                 ..TuneOptions::default()
             },
+            TuneOptions {
+                same_spindle_burst_bytes: Some(super::MIN_SAME_SPINDLE_BURST_BYTES - 1),
+                ..TuneOptions::default()
+            },
+            TuneOptions {
+                same_spindle_burst_bytes: Some(super::MAX_SAME_SPINDLE_BURST_BYTES + 1),
+                ..TuneOptions::default()
+            },
         ] {
             assert!(
                 select_copy_profile(
@@ -326,5 +385,66 @@ mod tests {
         assert!(
             profile.is_ok_and(|value| value.workers == 2 && value.chunk_bytes <= 8 * 1024 * 1024)
         );
+    }
+
+    #[test]
+    fn shared_rotational_disk_selects_one_phased_scheduler() {
+        let mut source = nvme();
+        source.incurs_seek_penalty = Some(true);
+        source.bus = Some(DeviceBus::Usb);
+        let mut destination = source.clone();
+        destination.disk_numbers = vec![0, 2];
+        let profile = select_copy_profile(
+            &source,
+            &destination,
+            DeviceClass::Auto,
+            DeviceClass::Auto,
+            &TuneOptions::default(),
+        );
+        assert!(profile.is_ok());
+        let Some(profile) = profile.ok() else {
+            return;
+        };
+        assert!(profile.same_physical_disk);
+        assert!(profile.transport.is_same_spindle());
+        assert_eq!(profile.workers, 1);
+        assert_eq!(profile.transport.burst_bytes, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn shared_solid_state_disk_keeps_standard_transport() {
+        let profile = select_copy_profile(
+            &nvme(),
+            &nvme(),
+            DeviceClass::Auto,
+            DeviceClass::Auto,
+            &TuneOptions::default(),
+        );
+        assert!(profile.is_ok());
+        let Some(profile) = profile.ok() else {
+            return;
+        };
+        assert!(profile.same_physical_disk);
+        assert!(!profile.transport.is_same_spindle());
+        assert!(profile.workers > 1);
+        assert_eq!(profile.transport.burst_bytes, profile.chunk_bytes);
+    }
+
+    #[test]
+    fn same_spindle_rejects_conflicting_parallel_worker_override() {
+        let mut source = nvme();
+        source.incurs_seek_penalty = Some(true);
+        let tune = TuneOptions {
+            threads: Some(2),
+            ..TuneOptions::default()
+        };
+        let result = select_copy_profile(
+            &source,
+            &source,
+            DeviceClass::Auto,
+            DeviceClass::Auto,
+            &tune,
+        );
+        assert!(result.is_err_and(|error| error.to_string().contains("requires threads=1")));
     }
 }

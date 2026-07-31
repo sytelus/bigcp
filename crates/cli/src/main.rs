@@ -115,8 +115,8 @@ struct CopyFlags {
     #[arg(long, value_parser = parse_profiles, value_name = "CLASS[,CLASS]")]
     profile: Option<(DeviceClass, DeviceClass)>,
 
-    /// Comma-separated overrides: chunk, threads, mem,
-    /// large-threshold, checkpoint-threshold (sizes accept KiB/MiB/GiB).
+    /// Comma-separated overrides: chunk, threads, mem, large-threshold,
+    /// checkpoint-threshold, same-spindle-burst (sizes accept KiB/MiB/GiB).
     #[arg(long, value_parser = parse_tune, value_name = "KEY=VALUE,...")]
     tune: Option<TuneOptions>,
 
@@ -325,6 +325,7 @@ fn parse_tune(value: &str) -> Result<TuneOptions, String> {
             "mem" => tune.memory_bytes = Some(parse_size_usize(raw)?),
             "large-threshold" => tune.large_threshold = Some(parse_size(raw)?),
             "checkpoint-threshold" => tune.checkpoint_threshold = Some(parse_size(raw)?),
+            "same-spindle-burst" => tune.same_spindle_burst_bytes = Some(parse_size_usize(raw)?),
             _ => return Err(format!("unknown tune key: {key}")),
         }
     }
@@ -522,6 +523,24 @@ mod tests {
     fn removed_nonfunctional_stream_tuning_is_rejected() {
         let parsed = Cli::try_parse_from(["bigcp", "source", "destination", "--tune", "streams=2"]);
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn same_spindle_burst_tuning_parses_binary_size() {
+        let parsed = Cli::try_parse_from([
+            "bigcp",
+            "source",
+            "destination",
+            "--tune",
+            "same-spindle-burst=128MiB",
+        ]);
+        assert!(parsed.is_ok_and(|value| {
+            value
+                .flags
+                .tune
+                .and_then(|tune| tune.same_spindle_burst_bytes)
+                == Some(128 * 1024 * 1024)
+        }));
     }
 
     #[test]

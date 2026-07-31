@@ -7,6 +7,11 @@ versioning once its 1.0 release gates are complete.
 
 ### Added
 
+- Topology-gated same-spindle HDD transport: disk-extent overlap plus
+  rotational classification selects bounded small-file read/write batches and
+  multi-request dense/sparse/ADS bursts, with effective settings in logs and
+  reports and a bounded `same-spindle-burst` tune override. Same-device SSDs
+  and independent drives retain the standard path.
 - Local FAT/FAT32 and exFAT source/destination support behind an isolated
   filesystem policy. FAT-family copies preserve representable unnamed data,
   timestamps, and attributes; report unsupported feature loss explicitly;
@@ -24,6 +29,10 @@ versioning once its 1.0 release gates are complete.
 
 ### Changed
 
+- Refactored transport policy and plain-small preparation/publication so the
+  same-spindle scheduler can evolve independently while retaining the existing
+  engine result, source-stability, checkpoint, filesystem-policy, and atomic
+  publication contracts. Added ADR 0036 and explicit hardware-evidence limits.
 - FAT/exFAT support leaves the NTFS/ReFS hot path strict: exact timestamp
   equality, 128-bit identity enumeration, capability-gated POSIX rename, and
   no FAT-only final restamp. Unsupported destination ADS/EAs no longer promote

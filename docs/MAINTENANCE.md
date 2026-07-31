@@ -6,7 +6,7 @@
 |---|---|
 | `crates/win/src/path.rs`, `metadata.rs`, `volume.rs`, `device.rs`, `lock.rs`, `util.rs` | Lossless paths, 128/64-bit handle identity, fast/fallback 256 KiB enumeration, supported-volume and query-only device facts, run lock, shared error helpers. |
 | `crates/win/src/file.rs`, `streams.rs`, `ea.rs`, `sparse.rs`, `reparse.rs`, `security.rs` | Read-only source and capability-bearing destination primitives; the only unsafe boundary. |
-| `crates/core/src/model.rs`, `options.rs`, `filesystem.rs`, `classify.rs`, `copy.rs`, `worker.rs`, `engine.rs` | Work model, validated options, immutable destination filesystem policy, join, terminal outcomes, bounded scheduling, direct-plain-small and transactional auxiliary/sparse/large copy. |
+| `crates/core/src/model.rs`, `options.rs`, `filesystem.rs`, `classify.rs`, `copy.rs`, `transport.rs`, `worker.rs`, `engine.rs` | Work model, validated options, immutable destination filesystem policy, join, terminal outcomes, topology-selected standard/same-spindle transport, bounded scheduling, direct-plain-small and transactional auxiliary/sparse/large copy. |
 | `crates/core/src/journal.rs`, `audit.rs`, `report.rs`, `stats.rs`, `devprofile.rs` | Resume hints, public artifacts, throughput windows, static profiles. |
 | `crates/core/src/verify.rs` | Post-copy and standalone verification. |
 | `crates/tui` | Immutable-snapshot live UI and saved report browser. |
@@ -117,6 +117,9 @@ replacements, warnings, grouped failures, extras, hints, and verification.
 - **Filesystem policy:** one immutable destination contract for timestamp and
   attribute representation, hard limits, and post-write metadata behavior;
   optional operations remain driven by probed capability flags.
+- **Same-spindle transport:** the static policy selected only when physical
+  extents intersect and media is rotational; source reads and destination
+  writes run in bounded phases to reduce mechanical head switching.
 - **FMEA:** explicit failure-mode/effect analysis behind crash invariants.
 - **Reparse point:** filesystem object carrying a tagged buffer (symlink,
   junction, cloud placeholder); never traversed, copied by tag policy.
@@ -126,8 +129,9 @@ replacements, warnings, grouped failures, extras, hints, and verification.
   file's ordinary data.
 - **Ring:** a historical term from two deleted streaming designs (the IOCP
   overlapped ring, ADR 0027, and the unbuffered reader/writer pair, ADR
-  0028). No ring exists: the shipped engine is a sequential buffered chunk
-  loop (PLAN §5.9).
+  0028). No ring exists: the standard engine is a sequential buffered chunk
+  loop, while ADR 0036 adds only bounded synchronous same-spindle phases
+  (PLAN §5.9).
 
 ## Release checklist
 

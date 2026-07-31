@@ -46,6 +46,18 @@
     "exit": {
       "type": "integer"
     },
+    "transport": {
+      "enum": [
+        "standard",
+        "same_spindle"
+      ],
+      "description": "Preflight-selected data transport on profile events."
+    },
+    "burst_bytes": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Maximum staged bytes per read/write phase on profile events."
+    },
     "analysis": {
       "type": "object",
       "description": "Bounded --analyze insight: size-class aggregates plus slowest-copy samples (one event per run).",

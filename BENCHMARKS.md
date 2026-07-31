@@ -386,11 +386,14 @@ repetition round of the four contenders:
 
 ## Outstanding
 
-The elevated ReFS matrix and the repeated-run certified benchmark protocol
-below remain unexecuted. Endurance, million-entry, and competitor sweeps
-stay prohibited (VISION).
-
-Future entries must record OS build, CPU/RAM, source/destination volume and
+The elevated filesystem matrix, repeated-run certified benchmark protocol,
+and ADR 0036 same-spindle HDD comparison remain unexecuted. The same-spindle
+implementation is covered by deterministic topology/transport tests and a
+small verified same-volume integration case, but those tests prove correctness
+and phase ordering—not a speedup. Running the `[HW]` cell requires separate
+owner approval under `docs/TESTING.md`, including its exact bounded workload,
+target scratch root, write volume, duration, and drive impact. Endurance,
+million-entry, and competitor sweeps stay prohibited (VISION).
 
 Future entries must record OS build, CPU/RAM, source/destination volume and
 filesystem, controller/transport, device policy, workload, warmup, repetitions,

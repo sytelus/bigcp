@@ -83,6 +83,12 @@ copy engine itself still exercises its bounded workers. Keep the printed test
 root in test evidence. Cleanup is optional and may only target that exact newly
 created directory after its resolved path and marker are revalidated.
 
+The routine suite includes an explicitly forced-HDD same-volume case (under the
+same validated temporary root) that exercises phased small-file batching plus
+dense, sparse, and named-stream bursts with verification. It is a correctness
+and boundedness test below the normal end-to-end write budget, not a performance
+measurement. Real-HDD timing remains the permission-gated `[HW]` matrix cell.
+
 ## Static and supply-chain checks
 
 ```powershell

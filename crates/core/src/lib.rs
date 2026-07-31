@@ -18,6 +18,7 @@ pub mod options;
 pub mod phase;
 pub mod report;
 pub mod stats;
+pub mod transport;
 pub mod verify;
 mod worker;
 

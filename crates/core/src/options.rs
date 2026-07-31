@@ -35,6 +35,8 @@ pub struct TuneOptions {
     pub large_threshold: Option<u64>,
     /// Partial checkpoint eligibility threshold.
     pub checkpoint_threshold: Option<u64>,
+    /// Bytes staged per read/write phase on a detected same-spindle copy.
+    pub same_spindle_burst_bytes: Option<usize>,
 }
 
 /// Complete copy-run configuration.

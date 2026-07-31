@@ -15,6 +15,13 @@ with ADS/EAs, sparse files, and large files go through opaque temporaries so a
 multi-part logical file publishes atomically and resumed partials are verified,
 never trusted.
 
+When source and destination volumes share one rotational physical disk, bigcp
+automatically selects a separate same-spindle transport: small files are read
+in bounded batches before their write phase, while large/sparse/ADS streams
+stage large sequential bursts before switching direction. Same-device SSDs and
+independent drives keep the normal parallel/request-at-a-time path. The choice
+is recorded in the log/report and changes scheduling only—not copy semantics.
+
 The repository is currently **pre-1.0**. The ordinary-tree engine, safety
 contract, and measured performance work are implemented (bigcp leads robocopy
 on every measured small-file cell with default settings; see `BENCHMARKS.md`).
@@ -114,14 +121,19 @@ xxh3-128 digest agrees.
 
 Accepted profile classes are `auto`, `nvme`, `sata-ssd`, `usb-ssd`, `hdd`, and
 `unknown` (the conservative fallback profile). Advanced tune keys are
-`chunk`, `threads`, `mem`, `large-threshold`, and
-`checkpoint-threshold`; byte sizes accept `KiB`, `MiB`, or `GiB`. There are
+`chunk`, `threads`, `mem`, `large-threshold`, `checkpoint-threshold`, and
+`same-spindle-burst`; byte sizes accept `KiB`, `MiB`, or `GiB`. There are
 no stream-count or queue-depth keys: large files stream through one strictly
 sequential coordinator path, so those settings would not describe real work.
 Manual bounds are enforced in the core library as well as the CLI: workers are
 `1..=256`, chunks `64 KiB..=64 MiB`, and thresholds
 must be positive. A `mem` budget must hold at least one large-threshold buffer
-and caps both chunk size and threshold-sized workers.
+and caps both chunk size and threshold-sized workers. The same-spindle burst
+defaults to 256 MiB, is capped by `mem`, and accepts a 1 MiB–1 GiB override
+that must still hold one effective small-file buffer and one request chunk.
+The phased scheduler requires one worker, so a same-spindle run rejects an
+explicit `threads` value other than `1` instead of silently defeating the
+topology policy.
 
 ## Exit codes
 
