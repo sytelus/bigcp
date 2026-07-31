@@ -57,6 +57,12 @@ impl FilesystemPolicy {
         self.filesystem
     }
 
+    /// Destination endpoint kind, used only by endpoint-specific mechanics.
+    #[must_use]
+    pub const fn endpoint(self) -> EndpointKind {
+        self.endpoint
+    }
+
     /// Whether copied metadata must be projected or omitted.
     #[must_use]
     pub const fn is_degraded(self) -> bool {

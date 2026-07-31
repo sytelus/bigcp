@@ -97,6 +97,12 @@ pub struct EngineRequest<'a> {
     pub destination_metadata: bigcp_win::BasicMetadata,
     /// Whether data writes require a final FAT-family/remote metadata restamp.
     pub destination_requires_post_write_stamp: bool,
+    /// Whether the destination crosses WSL's Plan 9 provider.
+    ///
+    /// WSL uses this only for provider-specific create hints and to avoid an
+    /// initial metadata round trip that the required post-write stamp would
+    /// immediately supersede. Other endpoint mechanics remain unchanged.
+    pub destination_is_wsl: bool,
     /// Graceful-cancel probe checked between chunks so very large files do
     /// not delay a requested stop until they finish (the in-flight temp
     /// self-deletes or resumes from its last verified checkpoint).
@@ -327,8 +333,11 @@ fn copy_sparse(
     } else {
         // EFS + sparse are mutually exclusive on NTFS, so a sparse copy never
         // requests encryption; an encrypted source takes the non-sparse paths.
-        let temp = DestinationTemp::create(parent, request.run_id, false)
-            .map_err(|error| operation_error("create_dst_temp", request.relative_path, &error))?;
+        let temp =
+            DestinationTemp::create(parent, request.run_id, false, request.destination_is_wsl)
+                .map_err(|error| {
+                    operation_error("create_dst_temp", request.relative_path, &error)
+                })?;
         temp.mark_sparse()
             .map_err(|error| operation_error("set_sparse", request.relative_path, &error))?;
         (temp, 0, should_hash.then(Xxh3::new))
@@ -792,8 +801,14 @@ fn create_final(request: &EngineRequest<'_>) -> Result<DestinationFinal, Operati
     let expected = request
         .replacement_snapshot
         .map(|snapshot| &snapshot.metadata);
-    let stamp = request.destination_metadata;
-    match DestinationFinal::create(request.destination_path, expected, encrypted, stamp) {
+    let initial_stamp = (!request.destination_is_wsl).then_some(request.destination_metadata);
+    match DestinationFinal::create(
+        request.destination_path,
+        expected,
+        encrypted,
+        initial_stamp,
+        request.destination_is_wsl,
+    ) {
         Ok(value) => Ok(value),
         Err(error)
             if error.kind() == std::io::ErrorKind::PermissionDenied
@@ -819,7 +834,8 @@ fn create_final(request: &EngineRequest<'_>) -> Result<DestinationFinal, Operati
                 request.destination_path,
                 Some(&cleared_snapshot),
                 encrypted,
-                stamp,
+                initial_stamp,
+                request.destination_is_wsl,
             ) {
                 Ok(value) => Ok(value),
                 Err(create_error) => {
@@ -901,8 +917,13 @@ fn copy_streamed(
     let (mut temp, mut total, mut hasher) = if let Some(state) = resumed {
         state
     } else {
-        let temp = DestinationTemp::create(parent, request.run_id, wants_encryption(request))
-            .map_err(|error| operation_error("create_dst_temp", request.relative_path, &error))?;
+        let temp = DestinationTemp::create(
+            parent,
+            request.run_id,
+            wants_encryption(request),
+            request.destination_is_wsl,
+        )
+        .map_err(|error| operation_error("create_dst_temp", request.relative_path, &error))?;
         if request.destination_supports_preallocation {
             temp.preallocate(request.source_snapshot.metadata.size)
                 .map_err(|error| operation_error("preallocate", request.relative_path, &error))?;
@@ -1295,7 +1316,9 @@ fn resume_unnamed(
             .as_ref()
             .is_some_and(|identity| identity.matches(request.source_snapshot.metadata.identity))
         && checkpoint.watermark <= checkpoint.source_size;
-    let Ok(mut temp) = DestinationTemp::resume(parent, &checkpoint.temp_name) else {
+    let Ok(mut temp) =
+        DestinationTemp::resume(parent, &checkpoint.temp_name, request.destination_is_wsl)
+    else {
         // Checkpoints are optional hints. A missing, inaccessible, or
         // type-changed candidate must not prevent a clean copy through a new
         // opaque temporary.

@@ -12,6 +12,10 @@ const MIN_SAME_SPINDLE_BURST_BYTES: usize = 1024 * 1024;
 const MAX_SAME_SPINDLE_BURST_BYTES: usize = 1024 * 1024 * 1024;
 const MIN_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+const WSL_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+const WSL_WORKERS: usize = 16;
+const UNC_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+const UNC_WORKERS: usize = 16;
 
 /// One side's initial static settings.
 ///
@@ -78,6 +82,8 @@ pub fn select_copy_profile(
             .any(|disk| destination_info.disk_numbers.contains(disk));
     let same_spindle = same_physical_disk
         && (source.class == DeviceClass::Hdd || destination.class == DeviceClass::Hdd);
+    let wsl =
+        source_info.endpoint == EndpointKind::Wsl || destination_info.endpoint == EndpointKind::Wsl;
     let redirector = source_info.endpoint.is_remote() || destination_info.endpoint.is_remote();
     let mut chunk_bytes = tune
         .chunk_bytes
@@ -182,6 +188,8 @@ pub fn select_copy_profile(
         // head-seek storm this profile exists to prevent.
         workers = 1;
         TransportProfile::same_spindle(burst_bytes)
+    } else if wsl {
+        TransportProfile::wsl(chunk_bytes)
     } else if redirector {
         TransportProfile::redirector(chunk_bytes)
     } else {
@@ -257,11 +265,12 @@ fn side_profile(
     let (chunk_bytes, workers) = match (requested == DeviceClass::Auto, info.endpoint) {
         // Remote roots do not expose local device topology. These immutable
         // profiles favor fewer, larger protocol operations while retaining
-        // enough small-file concurrency to cover redirector latency. WSL is
-        // intentionally more conservative because every call crosses its 9P
-        // Windows/Linux translation boundary.
-        (true, EndpointKind::Wsl) => (4 * 1024 * 1024, 8),
-        (true, EndpointKind::Unc) => (8 * 1024 * 1024, 16),
+        // enough small-file concurrency to cover redirector latency. WSL's
+        // loopback Plan 9 boundary needs at least the generic redirector
+        // window: fewer workers serialize provider round trips without
+        // protecting any physical network or disk topology we can observe.
+        (true, EndpointKind::Wsl) => (WSL_CHUNK_BYTES, WSL_WORKERS),
+        (true, EndpointKind::Unc) => (UNC_CHUNK_BYTES, UNC_WORKERS),
         (_, _) => match class {
             DeviceClass::Nvme => (8 * 1024 * 1024, (4 * cores).min(64)),
             DeviceClass::SataSsd => (8 * 1024 * 1024, 32),
@@ -541,19 +550,26 @@ mod tests {
         source.disk_numbers.clear();
         source.incurs_seek_penalty = None;
         source.bus = None;
+        source.maximum_transfer_length = None;
         source.high_confidence = false;
+        let mut destination = nvme();
+        // Exercise the WSL class default independently of the separate local
+        // maximum-transfer clamp pinned by `composition_is_deterministic...`.
+        destination.maximum_transfer_length = None;
         let profile = select_copy_profile(
             &source,
-            &nvme(),
+            &destination,
             DeviceClass::Auto,
             DeviceClass::Auto,
             &TuneOptions::default(),
         );
         assert!(profile.is_ok_and(|value| {
             value.source.endpoint == EndpointKind::Wsl
-                && value.workers == 8
-                && value.chunk_bytes == 4 * 1024 * 1024
+                && value.source.workers == 16
+                && value.workers == value.destination.workers.min(16)
+                && value.chunk_bytes == 8 * 1024 * 1024
                 && value.transport.is_redirector()
+                && value.transport.is_wsl()
                 && !value.transport.is_same_spindle()
         }));
     }
@@ -579,6 +595,7 @@ mod tests {
         );
         assert!(profile.is_ok_and(|value| {
             value.transport.is_redirector()
+                && !value.transport.is_wsl()
                 && value.chunk_bytes == 8 * 1024 * 1024
                 && value.workers == 2
         }));

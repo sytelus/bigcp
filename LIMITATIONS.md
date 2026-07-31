@@ -226,14 +226,14 @@ acceptance.
   or cache-policy IOCTLs to a remote root and cannot know whether two shares
   use the same server disk. It therefore never selects the local same-spindle
   transport for remote paths.
-- **Remote tuning uses conservative static defaults.** Generic UNC uses an
-  8 MiB request/16-worker profile and WSL uses 4 MiB/8 workers in Auto mode.
-  Streamed files use two bounded buffers so the next source read can overlap
-  the current destination write. Independent files below the 16 GiB default
-  checkpoint threshold can use separate workers; checkpointed and sparse files
-  stay coordinator-owned. These settings are correctness-tested, not certified
-  as optimal for every network or provider. `--profile` and `--tune` remain
-  available.
+- **Remote tuning uses bounded static defaults.** Generic UNC and WSL each use
+  an independently owned 8 MiB request/16-worker Auto profile. Streamed files
+  use two bounded buffers so the next source read can overlap the current
+  destination write. Independent files below the 16 GiB default checkpoint
+  threshold can use separate workers; checkpointed and sparse files stay
+  coordinator-owned. Equal current UNC/WSL values do not merge their policies.
+  These settings are correctness-tested, not certified as optimal for every
+  network or provider. `--profile` and `--tune` remain available.
 - **A single remote handle still has synchronous I/O depth one.** The pipeline
   overlaps source and destination stages; it does not issue an unbounded set of
   SMB requests or bypass the server. Link latency, server disks, signing,
@@ -255,6 +255,16 @@ acceptance.
   reparse objects fail. Linux uid/gid/mode/xattrs and special-file semantics,
   Windows creation/access times and attributes, ADS/EAs, ACLs, EFS, and sparse
   layout are not reproduced through this Win32 engine.
+- **WSL has its own performance path.** WSL destination creates are striped
+  across the bounded worker pool instead of using NTFS directory affinity.
+  WSL destination handles receive the sequential cache hint, new files avoid
+  an unnecessary handle-metadata query, and the projected last-write time is
+  set once after data rather than before and after it. These changes reduce
+  Plan 9 round trips but have not been measured on an approved distribution.
+- **A single WSL stream still has synchronous provider depth one.** The
+  two-buffer path overlaps its source and destination stages, while concurrency
+  across independent files supplies the larger request window. One enormous
+  file can therefore remain limited by one WSL provider request at a time.
 - **WSL UNC is not the fastest Linux-to-Linux path.** Windows access crosses
   WSL's translation boundary and may start the distribution. Prefer native
   Linux tools inside WSL for sustained copies entirely within Linux.

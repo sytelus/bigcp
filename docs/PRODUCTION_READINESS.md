@@ -40,11 +40,12 @@ required by the governing plan.
   same-volume integration coverage without changing the SSD/independent path.
 - Isolated UNC/WSL endpoint policy: extended UNC normalization, mapped-drive
   final-path classification, handle-bound remote volume queries, no remote
-  local-device IOCTLs, static bounded redirector profiles, two-buffer ordered
-  read/write overlap, parallel non-checkpointed stream dispatch, shared worker
-  cancellation, WSL exact-name and basic-metadata projection, combined startup
-  acceptance, and redirector-loss breaker mapping without changing either
-  local transport/profile path.
+  local-device IOCTLs, separately identified generic-redirector and WSL
+  profiles, two-buffer ordered read/write overlap, parallel non-checkpointed
+  stream dispatch, shared worker cancellation, WSL exact-name/basic-metadata
+  projection, striped WSL destination creates, sequential handle hints, and
+  deferred final stamping; combined startup acceptance and redirector-loss
+  breaker mapping without changing either local transport/profile path.
 - Fail-closed Win32/provider parsing for returned lengths, record-local child
   names, sparse-range order, reparse framing, stream suffix containment, and
   embedded-NUL path input.
@@ -71,8 +72,9 @@ lifespan-reducing writes, no machine-stability impact — see PLAN §12.0):
 - The same-spindle HDD `[HW]` cell remains required before claiming a measured
   speedup or universal optimality for the new 256 MiB default.
 - An approved disposable UNC/WSL endpoint matrix remains required before
-  claiming a measured redirector speedup, robocopy parity, or universal
-  optimality for the 8 MiB/16-worker and 4 MiB/8-worker defaults.
+  claiming a measured generic-redirector or WSL speedup, robocopy parity, or
+  universal optimality. The independent 8 MiB/16-worker rows and WSL create
+  striping are correctness-tested static hypotheses, not certified defaults.
 - The final production-validation pass (PLAN §12.10), executed only on
   explicit owner request: chaos/kill-convergence, the adversarial set,
   sentinel/schema checks, and the bounded NTFS benchmark protocol.

@@ -2,6 +2,10 @@
 
 **Status:** Accepted
 
+**Superseded in part by ADR 0046:** WSL now has a distinct transport identity,
+8 MiB/16-worker Auto row, destination-create striping, and provider-specific
+handle/metadata-call reductions. Generic UNC retains this ADR's policy.
+
 ## Context
 
 ADR 0037 isolated UNC, mapped-drive, and WSL policy but deliberately retained
@@ -68,10 +72,11 @@ reader thread per active streamed file.
 This is not a claim that bigcp now saturates every SMB or WSL path. A single
 handle still has synchronous I/O depth one, remote topology remains opaque,
 and server storage, network latency, SMB signing/encryption/compression, DFS,
-antivirus, and provider caching can dominate. Any claim against robocopy, and
-any change to the 8 MiB/16-worker or 4 MiB/8-worker defaults, requires the
-approved remote benchmark protocol in `docs/TESTING.md` and recorded evidence
-in `BENCHMARKS.md`.
+antivirus, and provider caching can dominate. At the time of this decision,
+any claim against robocopy and any change to its generic-UNC 8 MiB/16-worker or
+WSL 4 MiB/8-worker defaults required the approved remote benchmark protocol.
+ADR 0046 later changes the WSL row without claiming a measured optimum; future
+claims or tuning still require that protocol and evidence in `BENCHMARKS.md`.
 
 ## Validation
 

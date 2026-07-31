@@ -79,7 +79,7 @@ fn copy_rerun_and_both_verification_forms_converge() -> Result<(), Box<dyn std::
     drop(alternate);
 
     let sparse_path = source.join("sparse.bin");
-    let mut sparse = DestinationTemp::create(&source, "fixture", false)?;
+    let mut sparse = DestinationTemp::create(&source, "fixture", false, false)?;
     sparse.mark_sparse()?;
     // Deliberately below the 4 MiB worker threshold: sparse preservation is
     // a storage-fidelity decision, not a large-file-only optimization.
@@ -661,7 +661,7 @@ fn same_spindle_profile_batches_small_files_and_bursts_large_data()
     drop(alternate);
 
     let sparse_path = source.join("sparse.bin");
-    let mut sparse = DestinationTemp::create(&source, "same-spindle-fixture", false)?;
+    let mut sparse = DestinationTemp::create(&source, "same-spindle-fixture", false, false)?;
     sparse.mark_sparse()?;
     sparse.set_len(512 * 1024)?;
     sparse.seek(SeekFrom::Start(384 * 1024))?;

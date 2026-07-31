@@ -175,8 +175,14 @@ impl DestinationTemp {
     /// `encrypted` requests EFS at creation time — the only reliable moment:
     /// once the temp exists with an armed delete disposition, `EncryptFileW`'s
     /// internal path-based open is refused, so post-creation encryption can
-    /// never succeed on a live temp.
-    pub fn create(parent: &Path, run_id: &str, encrypted: bool) -> io::Result<Self> {
+    /// never succeed on a live temp. `sequential` supplies only a cache hint;
+    /// it changes neither buffering nor the synchronous handle contract.
+    pub fn create(
+        parent: &Path,
+        run_id: &str,
+        encrypted: bool,
+        sequential: bool,
+    ) -> io::Result<Self> {
         for _ in 0..128 {
             let path = opaque_temp_candidate(parent, run_id)?;
             let mut options = OpenOptions::new();
@@ -188,6 +194,9 @@ impl DestinationTemp {
                 .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE | FILE_WRITE_ATTRIBUTES)
                 .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
                 .create_new(true);
+            if sequential {
+                options.custom_flags(FILE_FLAG_SEQUENTIAL_SCAN);
+            }
             if encrypted {
                 options.attributes(FILE_ATTRIBUTE_ENCRYPTED);
             }
@@ -222,7 +231,7 @@ impl DestinationTemp {
     /// exactly one normal path component. The final component is opened
     /// without following a reparse point and must be an ordinary file. The
     /// caller still must verify its identity and contents before writing.
-    pub fn resume(parent: &Path, name: &str) -> io::Result<Self> {
+    pub fn resume(parent: &Path, name: &str, sequential: bool) -> io::Result<Self> {
         // Enforce the exact opaque shape the creator produces. In particular
         // a `:` must never pass: `.bigcp-x:y.part` would open the alternate
         // stream `y.part` of a *different* file, and commit would then rename
@@ -247,10 +256,16 @@ impl DestinationTemp {
         }
         let path = parent.join(relative);
         let mut options = OpenOptions::new();
+        let flags = FILE_FLAG_OPEN_REPARSE_POINT
+            | if sequential {
+                FILE_FLAG_SEQUENTIAL_SCAN
+            } else {
+                0
+            };
         options
             .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE | FILE_WRITE_ATTRIBUTES)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+            .custom_flags(flags);
         let file = options.open(&path)?;
         if metadata_from_file(&file)?.kind != ObjectKind::File {
             return Err(io::Error::new(
@@ -498,14 +513,23 @@ impl DestinationFinal {
     /// set stops automatic updates on this handle, so subsequent data
     /// writes leave the stamped times intact; crash repair is carried by
     /// the size check (a mid-write interruption is shorter than its source
-    /// and reclassifies on rerun).
+    /// and reclassifies on rerun). A caller may defer that stamp when its
+    /// provider requires a post-write restamp anyway; `sequential` remains a
+    /// cache hint and does not change synchronous write semantics.
     pub fn create(
         path: &Path,
         expected: Option<&ObjectMetadata>,
         encrypted: bool,
-        stamp: BasicMetadata,
+        initial_stamp: Option<BasicMetadata>,
+        sequential: bool,
     ) -> io::Result<Self> {
         let mut options = OpenOptions::new();
+        let flags = FILE_FLAG_OPEN_REPARSE_POINT
+            | if sequential {
+                FILE_FLAG_SEQUENTIAL_SCAN
+            } else {
+                0
+            };
         options
             .write(true)
             // Write-only access, measured: requesting GENERIC_READ on the
@@ -514,7 +538,7 @@ impl DestinationFinal {
             // small-file benchmark. Nothing reads through this handle.
             .access_mode(GENERIC_WRITE | FILE_READ_ATTRIBUTES)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+            .custom_flags(flags);
         if expected.is_some() {
             // Do not request truncation in OpenOptions: Windows truncates as
             // part of the open, before callers can prove that the path still
@@ -526,14 +550,14 @@ impl DestinationFinal {
             options.attributes(FILE_ATTRIBUTE_ENCRYPTED);
         }
         let file = options.open(path)?;
-        let metadata = metadata_from_file(&file)?;
-        if metadata.kind != ObjectKind::File {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "destination name is not a plain file",
-            ));
-        }
         if let Some(expected) = expected {
+            let metadata = metadata_from_file(&file)?;
+            if metadata.kind != ObjectKind::File {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "destination name is not a plain file",
+                ));
+            }
             if metadata.identity != expected.identity
                 || metadata.kind != expected.kind
                 || metadata.size != expected.size
@@ -548,7 +572,14 @@ impl DestinationFinal {
             }
             file.set_len(0)?;
         }
-        set_basic_by_handle(&file, stamp)?;
+        // CREATE_NEW itself proves a new handle is a regular file, so a
+        // metadata query is necessary only when revalidating a replacement.
+        // WSL callers also defer their projected last-write stamp until after
+        // data: the Plan 9 provider may update it during writes, and the final
+        // stamp is both authoritative and one round trip cheaper.
+        if let Some(stamp) = initial_stamp {
+            set_basic_by_handle(&file, stamp)?;
+        }
         Ok(Self { file })
     }
 
@@ -854,7 +885,7 @@ mod tests {
         let Some(sandbox) = sandbox.ok() else {
             return;
         };
-        let temp = DestinationTemp::create(sandbox.path(), "delete-on-close", false);
+        let temp = DestinationTemp::create(sandbox.path(), "delete-on-close", false, false);
         assert!(temp.is_ok(), "temporary creation failed: {:?}", temp.err());
         let Some(temp) = temp.ok() else {
             return;
@@ -879,7 +910,7 @@ mod tests {
             "host:stream",
             "with space",
         ] {
-            assert!(DestinationTemp::create(sandbox.path(), run_id, false).is_err());
+            assert!(DestinationTemp::create(sandbox.path(), run_id, false, false).is_err());
         }
         assert_eq!(
             fs::read_dir(sandbox.path()).ok().map(Iterator::count),
@@ -896,7 +927,7 @@ mod tests {
         };
         let name = ".bigcp-stale-000000000000.part";
         assert!(fs::create_dir(sandbox.path().join(name)).is_ok());
-        let result = DestinationTemp::resume(sandbox.path(), name);
+        let result = DestinationTemp::resume(sandbox.path(), name, false);
         assert!(result.is_err());
         assert!(sandbox.path().join(name).is_dir());
     }
@@ -908,7 +939,7 @@ mod tests {
         let Some(sandbox) = sandbox.ok() else {
             return;
         };
-        let temp = DestinationTemp::create(sandbox.path(), "identity-reuse", false);
+        let temp = DestinationTemp::create(sandbox.path(), "identity-reuse", false, false);
         assert!(temp.is_ok());
         let Some(mut temp) = temp.ok() else {
             return;
@@ -923,7 +954,8 @@ mod tests {
         assert!(fs::remove_file(&path).is_ok());
         assert!(fs::write(&path, b"unrelated replacement").is_ok());
 
-        let resumed = name.and_then(|name| DestinationTemp::resume(sandbox.path(), name).ok());
+        let resumed =
+            name.and_then(|name| DestinationTemp::resume(sandbox.path(), name, false).ok());
         assert!(resumed.is_some());
         assert!(
             resumed
@@ -965,7 +997,7 @@ mod tests {
         if symlink_file(sandbox.path().join("missing-target"), &final_path).is_err() {
             return;
         }
-        let temp = DestinationTemp::create(sandbox.path(), "new-collision", false);
+        let temp = DestinationTemp::create(sandbox.path(), "new-collision", false, false);
         assert!(temp.is_ok());
         let Some(mut temp) = temp.ok() else {
             return;
@@ -999,7 +1031,7 @@ mod tests {
             return;
         };
         let final_path = sandbox.path().join("final.bin");
-        let temp = DestinationTemp::create(sandbox.path(), "12345678", false);
+        let temp = DestinationTemp::create(sandbox.path(), "12345678", false, false);
         assert!(temp.is_ok(), "temporary creation failed: {:?}", temp.err());
         let Some(mut temp) = temp.ok() else {
             return;
@@ -1066,7 +1098,7 @@ mod destination_final_tests {
             last_write_time: 131_000_000_000_000_002,
             attributes: 0x20,
         };
-        let file = DestinationFinal::create(&path, None, false, stamp);
+        let file = DestinationFinal::create(&path, None, false, Some(stamp), false);
         assert!(file.is_ok());
         let Some(mut file) = file.ok() else {
             return;
@@ -1082,6 +1114,32 @@ mod destination_final_tests {
                     && value.basic.creation_time == stamp.creation_time),
             "explicit stamp did not survive data writes"
         );
+    }
+
+    #[test]
+    fn deferred_stamp_is_applied_after_sequential_writes() {
+        let sandbox = tempfile::tempdir();
+        assert!(sandbox.is_ok());
+        let Some(sandbox) = sandbox.ok() else {
+            return;
+        };
+        let path = sandbox.path().join("deferred-stamp.bin");
+        let stamp = BasicMetadata {
+            creation_time: 0,
+            last_access_time: 0,
+            last_write_time: 131_000_000_000_000_004,
+            attributes: 0,
+        };
+        let file = DestinationFinal::create(&path, None, false, None, true);
+        assert!(file.is_ok());
+        let Some(mut file) = file.ok() else {
+            return;
+        };
+        assert!(file.write_all(&[0xCD_u8; 8192]).is_ok());
+        assert!(file.finish(false, Some(stamp)).is_ok());
+        assert!(metadata_at(&path).is_ok_and(|value| {
+            value.size == 8192 && value.basic.last_write_time == stamp.last_write_time
+        }));
     }
 
     #[test]
@@ -1101,8 +1159,13 @@ mod destination_final_tests {
             return;
         };
 
-        let result =
-            DestinationFinal::create(&replacement_path, Some(&expected), false, expected.basic);
+        let result = DestinationFinal::create(
+            &replacement_path,
+            Some(&expected),
+            false,
+            Some(expected.basic),
+            false,
+        );
         assert!(result.is_err());
         assert_eq!(
             std::fs::read(&replacement_path).ok(),

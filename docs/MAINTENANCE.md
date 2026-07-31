@@ -6,7 +6,7 @@
 |---|---|
 | `crates/win/src/endpoint.rs`, `path.rs`, `metadata.rs`, `volume.rs`, `device.rs`, `extents.rs`, `lock.rs`, `util.rs` | Local/UNC/WSL classification, lossless paths, 128/64-bit handle identity, fast/fallback 256 KiB enumeration, local/handle-bound-remote volume facts, query-only local device/extent facts, run lock, shared fail-closed helpers. |
 | `crates/win/src/file.rs`, `streams.rs`, `ea.rs`, `sparse.rs`, `reparse.rs`, `security.rs` | Read-only source and capability-bearing destination primitives; the only unsafe boundary. Native/provider lengths, ranges, and stream suffixes are validated here before core sees them. |
-| `crates/core/src/model.rs`, `options.rs`, `filesystem.rs`, `classify.rs`, `copy.rs`, `transport.rs`, `worker.rs`, `engine.rs` | Work model, validated options, immutable source/destination semantic policy, endpoint-aware join, terminal outcomes, isolated standard/redirector/same-spindle transports, bounded scheduling, direct-plain-small and transactional auxiliary/sparse/large copy. |
+| `crates/core/src/model.rs`, `options.rs`, `filesystem.rs`, `classify.rs`, `copy.rs`, `transport.rs`, `worker.rs`, `engine.rs` | Work model, validated options, immutable source/destination semantic policy, endpoint-aware join, terminal outcomes, isolated standard/generic-redirector/WSL/same-spindle transports, bounded scheduling, direct-plain-small and transactional auxiliary/sparse/large copy. |
 | `crates/core/src/artifact.rs`, `journal.rs`, `audit.rs`, `report.rs`, `stats.rs`, `devprofile.rs` | Shared exact-handle artifact publication, one-record-lookahead resume replay, disjoint public artifact roles, throughput windows, and exact static-profile buffer budgets. |
 | `crates/core/src/verify.rs` | Post-copy and standalone verification. |
 | `crates/tui` | Immutable-snapshot live UI and saved report browser. |
@@ -132,9 +132,14 @@ replacements, warnings, grouped failures, extras, hints, and verification.
 - **Same-spindle transport:** the static policy selected only when physical
   extents intersect and media is rotational; source reads and destination
   writes run in bounded phases to reduce mechanical head switching.
-- **Redirector transport:** the remote-only policy with two bounded buffers;
-  one synchronous source read overlaps one destination write, and only
-  non-checkpointed independent streams may use parallel workers.
+- **Generic redirector transport:** generic UNC/mapped paths use two bounded
+  buffers; one synchronous source read overlaps one destination write, and
+  only non-checkpointed independent streams may use parallel workers.
+- **WSL transport:** the separate Plan 9 profile reuses the ordered two-buffer
+  mechanics, uses its own 8 MiB/16-worker constants, stripes WSL destination
+  creates, marks destination handles sequential, and stamps projected metadata
+  only after data. Keep those choices behind `EndpointKind::Wsl`; never spread
+  WSL checks into the standard or generic-UNC data loops.
 - **FMEA:** explicit failure-mode/effect analysis behind crash invariants.
 - **Reparse point:** filesystem object carrying a tagged buffer (symlink,
   junction, cloud placeholder); never traversed, copied by tag policy.
@@ -146,7 +151,8 @@ replacements, warnings, grouped failures, extras, hints, and verification.
   overlapped ring, ADR 0027, and the unbuffered reader/writer pair, ADR
   0028). No completion ring exists: the standard transport is a sequential
   buffered chunk loop, ADR 0036 adds bounded synchronous same-spindle phases,
-  and ADR 0045 adds a fixed two-buffer redirector pipeline (PLAN §5.9).
+  ADR 0045 adds a fixed two-buffer redirector pipeline, and ADR 0046 gives WSL
+  its own profile and scheduling seam over that pipeline (PLAN §5.8–§5.9).
 
 ## Release checklist
 

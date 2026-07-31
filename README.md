@@ -142,7 +142,10 @@ no stream-count or queue-depth keys: large files stream through one strictly
 ordered path, so those settings would not describe real work. Redirector
 transfers use a fixed two-buffer pipeline and may run independent files below
 the checkpoint threshold on the bounded worker pool; local standard transfers
-retain the original request-at-a-time loop.
+retain the original request-at-a-time loop. WSL has a distinct transport/profile
+identity even though it reuses the ordered pipeline: Auto uses 8 MiB requests
+and up to 16 workers, and WSL destination creates are striped across those
+workers instead of inheriting NTFS directory affinity.
 Manual bounds are enforced in the core library as well as the CLI: workers are
 `1..=256`, chunks `64 KiB..=64 MiB`, and thresholds
 must be positive. On the standard path, a `mem` budget reserves one coordinator
@@ -200,9 +203,12 @@ when WSL is the destination. Regular-file bytes and last-write time are the
 portable contract; Linux uid/gid/mode/xattrs, special files, Windows
 creation/access times and attributes, ADS/EAs, ACLs, EFS state, sparse layout,
 and reparse objects are not claimed. Unsupported reparse objects fail rather
-than being followed or flattened. Windows access to WSL crosses its 9P
-translation boundary, so native Linux tools remain faster for sustained work
-entirely inside a distribution.
+than being followed or flattened. The WSL path uses bounded two-buffer overlap,
+striped destination creates, sequential cache hints, and one authoritative
+post-write metadata stamp to reduce Plan 9 calls. Windows access still crosses
+that translation boundary, so native Linux tools remain faster for sustained
+work entirely inside a distribution. The WSL defaults are correctness-tested
+but remain performance-unmeasured until an approved disposable path is used.
 See [LIMITATIONS.md](LIMITATIONS.md) and the normative
 [docs/SEMANTICS.md](docs/SEMANTICS.md).
 

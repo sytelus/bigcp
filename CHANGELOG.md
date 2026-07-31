@@ -36,6 +36,15 @@ versioning once its 1.0 release gates are complete.
 
 ### Changed
 
+- 2026-07-31 WSL throughput specialization: split WSL into its own stable
+  transport/profile identity while reusing the ordered two-buffer engine;
+  increased its bounded Auto row to 8 MiB/16 workers; striped small-file
+  creates when WSL is the destination; applied sequential cache hints to WSL
+  destination handles; removed the unnecessary metadata query for a newly
+  created final file; and deferred WSL's projected timestamp to one final
+  post-write call. Local and generic-UNC routing/defaults are unchanged. ADR
+  0046 and focused isolation/correctness tests landed; live WSL speed remains
+  benchmark-pending on an approved disposable distribution path.
 - 2026-07-31 UNC throughput refactor: added an isolated `redirector`
   transport that overlaps one synchronous source read with one destination
   write through exactly two bounded buffers; allowed independent non-sparse,

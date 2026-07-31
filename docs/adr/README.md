@@ -24,6 +24,8 @@ architecture as one product copy engine with two completion strategies and
 two topology transports. ADR 0044 makes a failed READONLY metadata rollback a
 first-class reported failure instead of discarding it. ADR 0045 adds a bounded
 two-buffer redirector pipeline and safe parallel streaming below the checkpoint
-boundary while leaving both local transports unchanged.
+boundary while leaving both local transports unchanged. ADR 0046 supersedes
+its shared WSL defaults with a distinct Plan 9 transport identity, striped WSL
+destination creates, sequential hints, and fewer metadata round trips.
 
 The index is filename ordered. `docs/MAINTENANCE.md` maps decisions to code and release checks.

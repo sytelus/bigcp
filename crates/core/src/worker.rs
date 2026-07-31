@@ -52,6 +52,7 @@ pub(crate) struct FileCopyJob {
     pub destination_supports_posix_unlink_rename: bool,
     pub destination_metadata: bigcp_win::BasicMetadata,
     pub destination_requires_post_write_stamp: bool,
+    pub destination_is_wsl: bool,
     pub chunk_bytes: usize,
     pub transport: TransportProfile,
     pub checkpoint_threshold: u64,
@@ -66,8 +67,8 @@ pub(crate) struct FileCopyJob {
     pub promote_threshold: Option<u64>,
     /// Shared graceful-cancel state polled by streamed worker transfers.
     pub cancel: Arc<AtomicBool>,
-    /// Small-file creates stay directory-affine; independently streamed files
-    /// use a separate round-robin shard so one directory can use every worker.
+    /// Local/generic-UNC small creates stay directory-affine. WSL-destination
+    /// creates and independently streamed files use a round-robin shard.
     pub directory_affine: bool,
     /// Measurements owned by this run and shared with every worker.
     pub phases: Arc<PhaseTracker>,
@@ -99,6 +100,7 @@ impl FileCopyJob {
             destination_supports_posix_unlink_rename: self.destination_supports_posix_unlink_rename,
             destination_metadata: self.destination_metadata,
             destination_requires_post_write_stamp: self.destination_requires_post_write_stamp,
+            destination_is_wsl: self.destination_is_wsl,
             known_streams: self.streams.as_deref(),
             cancel: self.cancel.as_ref(),
             promote_threshold: self.promote_threshold,
@@ -167,13 +169,16 @@ pub(crate) struct CompletedCopy {
 /// Fixed-size worker set with deep bounded per-worker queues and one result
 /// channel.
 ///
-/// Jobs are **directory-affine**: the coordinator shards by parent directory,
-/// so all creates inside one directory serialize on one worker. NTFS
+/// Local and generic-UNC small jobs are **directory-affine**: the coordinator
+/// shards by parent directory, so their creates inside one directory serialize
+/// on one worker. NTFS
 /// serializes same-directory creates on the directory index regardless
 /// (measured: ~2 ms per create with 64 interleaved workers vs ~0.6 ms
 /// directory-serialized), so affinity removes the cross-worker convoy while
-/// distinct directories proceed in parallel. Queues are deep (jobs are small
-/// metadata records) so the coordinator can run ahead across sibling
+/// distinct directories proceed in parallel. WSL-destination jobs are instead
+/// striped because its Plan 9 provider round trips are the scarce resource and
+/// there is no local NTFS directory index to protect. Queues are deep (jobs are
+/// small metadata records) so the coordinator can run ahead across sibling
 /// directories instead of stalling on the one currently being enumerated.
 pub(crate) struct FileWorkers {
     senders: Vec<Sender<FileCopyJob>>,

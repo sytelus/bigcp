@@ -39,15 +39,21 @@ report aggregates, and journal state.
 Plain small files use `DestinationFinal`: workers read and revalidate the
 source, then create or identity-check-and-truncate the final destination before
 one whole-buffer unnamed-stream write. FAT-family and remote files are
-restamped on that same handle after data I/O; the exact local NTFS/ReFS policy
-incurs no extra restamp. Files
+restamped on that same handle after data I/O; WSL defers its projected stamp
+until that point instead of issuing a redundant initial Plan 9 metadata call.
+New final names also skip a handle-metadata query because `CREATE_NEW` already
+proves the returned object was just created as a regular file. The exact local
+NTFS/ReFS policy retains its measured create-time stamp. Files
 with destination-representable ADS/EAs, sparse files, and large/resumable files
 use `DestinationTemp` and atomic publication. Unsupported source ADS/EAs are
 counted and warned but do not force that slower route. Large transfers are
 bounded synchronous streams. The standard transport uses one request-sized
-buffer. An immutable `Redirector` transport uses exactly two buffers and a
-scoped reader so one source read overlaps one destination write; hashing and
-writes remain ordered, and pipeline segments stop at checkpoint boundaries.
+buffer. Immutable generic `Redirector` and `Wsl` transports use exactly two
+buffers and a scoped reader so one source read overlaps one destination write;
+hashing and writes remain ordered, and pipeline segments stop at checkpoint
+boundaries.
+WSL remains a distinct transport/profile identity and stripes destination
+creates across its worker pool while generic UNC retains directory affinity.
 When local volume disk extents intersect and an effective profile is
 rotational, an immutable `SameSpindle` transport instead stages a bounded
 multi-request burst before each destination phase; the coordinator drains the
@@ -106,11 +112,12 @@ ports:
   existing Win32 local-volume path and uses handle-bound native filesystem
   queries only for redirectors; `device.rs` returns an opaque remote device
   record without local IOCTLs. Core consumes one immutable endpoint/filesystem
-  policy. `core::transport` owns the bounded two-buffer redirector pipeline,
-  and `worker.rs` confines parallel non-checkpointed stream scheduling. Remote
-  profiles, case matching, projection, preallocation, transfer mechanics, and
-  disconnect classification can therefore evolve without touching local hot
-  paths.
+  policy. `core::transport` owns generic-redirector and WSL identities over the
+  bounded two-buffer pipeline; `worker.rs` confines parallel stream scheduling
+  and WSL destination striping; `file.rs` owns sequential handle hints and
+  deferred WSL stamping. Remote profiles, case matching, projection,
+  preallocation, transfer mechanics, and disconnect classification can
+  therefore evolve without touching local hot paths.
 - **Same-spindle transport (implemented):** `transport.rs` owns topology policy
   data and burst mechanics, `worker.rs` owns phased plain-small batching, and
   `engine.rs` applies it to dense/sparse/named streams behind the existing
@@ -138,10 +145,13 @@ must state its atomicity, representation, and metadata guarantees.
 
 Local device discovery uses official query-only IOCTLs: physical extents, bus
 type, seek penalty, sector sizes, and maximum transfer length. Remote discovery
-uses provider-returned volume data and immutable generic-UNC/WSL profiles;
-remote sources cap the composed worker count. Static profiles choose per-side
-chunk size and workers. Redirector streams use two buffers per active transfer,
-and independent non-checkpointed files may occupy separate workers.
+uses provider-returned volume data and independently immutable generic-UNC/WSL
+profiles; remote sources cap the composed worker count. Static profiles choose
+per-side chunk size and workers. Both remote transports use two buffers per
+active transfer, and independent non-checkpointed files may occupy separate workers.
+WSL Auto uses 8 MiB/16 workers; a WSL destination also stripes small files to
+cover Plan 9 latency instead of applying the measured NTFS directory-index
+policy.
 Intersecting local disk extents plus
 rotational classification select one phased worker and a bounded same-spindle
 burst; SSD overlap stays on the standard path. Manual values are range checked.

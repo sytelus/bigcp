@@ -50,6 +50,7 @@
       "enum": [
         "standard",
         "redirector",
+        "wsl",
         "same_spindle"
       ],
       "description": "Preflight-selected data transport on profile events."
@@ -57,7 +58,7 @@
     "burst_bytes": {
       "type": "integer",
       "minimum": 1,
-      "description": "Standard/redirector request bytes or maximum same-spindle staged bytes on profile events."
+      "description": "Standard/redirector/WSL request bytes or maximum same-spindle staged bytes on profile events."
     },
     "source_endpoint": {
       "enum": [

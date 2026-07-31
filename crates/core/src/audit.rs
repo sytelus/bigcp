@@ -464,4 +464,29 @@ mod tests {
                 && value.get("enumeration_threads").is_none()
         }));
     }
+
+    #[test]
+    fn wsl_transport_has_a_distinct_stable_audit_value() {
+        let encoded = encode_event(&super::AuditEvent::Profile {
+            source_class: "Unknown".to_owned(),
+            destination_class: "Unknown".to_owned(),
+            source_endpoint: bigcp_win::EndpointKind::Wsl,
+            destination_endpoint: bigcp_win::EndpointKind::Local,
+            chunk_bytes: 8 * 1024 * 1024,
+            workers: 16,
+            same_physical_disk: false,
+            transport: crate::transport::TransportKind::Wsl,
+            burst_bytes: 8 * 1024 * 1024,
+        });
+        assert!(encoded.is_ok());
+        assert!(
+            encoded
+                .ok()
+                .and_then(|line| serde_json::from_slice::<serde_json::Value>(&line).ok())
+                .is_some_and(|value| {
+                    value.get("transport").and_then(serde_json::Value::as_str) == Some("wsl")
+                        && value.get("workers").and_then(serde_json::Value::as_u64) == Some(16)
+                })
+        );
+    }
 }

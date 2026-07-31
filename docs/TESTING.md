@@ -162,7 +162,10 @@ and extended UNC normalization, WSL alias canonicalization, local-vs-UNC
 classification, mapped-drive effective policy, exact WSL name keys, projected
 metadata, remote profiles, redirector error categories, two-buffer ordering and
 actual stage overlap, short-I/O accounting, cancellation, memory budgets, and
-the checkpoint/sparse worker-dispatch boundary (ADR 0045).
+the checkpoint/sparse worker-dispatch boundary. WSL-specific pure tests also
+pin its distinct transport/audit value, independent 8 MiB/16-worker row,
+destination-create striping without local-affinity regression, sequential
+handle path, and deferred final stamp (ADRs 0045/0046).
 
 Live generic-SMB, mapped-drive, or WSL source/destination tests need an
 operator-approved scratch endpoint whose exact share/distribution path is named
@@ -172,9 +175,14 @@ reuse an existing user-data tree. A read-only WSL source dry-run may establish
 provider query/enumeration compatibility but does not establish write-path or
 performance coverage. Remote performance measurements are heavy-tier and
 require the full approval record (paths, files, bytes, duration, and storage
-impact). An ADR 0045 throughput run must also record SMB/WSL provider, link
+impact). An ADR 0045 generic-UNC run must also record SMB provider, link
 topology, signing/encryption/compression state, bigcp transport/chunk/workers,
-verification mode, and the exact competitor command.
+verification mode, and the exact competitor command. An ADR 0046 WSL run must
+record `wsl --version`, WSL 1 versus 2, distribution/version, source and
+destination filesystem/path direction, VHDX backing location when known,
+transport/chunk/workers, verification mode, cold/warm state, and the exact
+native-Linux/robocopy comparison commands. Never stop or restart WSL merely to
+manufacture a cold measurement.
 
 Disconnect behavior is fault-injection-only: do not stop WSL, disconnect a
 share, remove a mapping, or manipulate a server during a test. The approved

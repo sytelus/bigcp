@@ -2,9 +2,11 @@
 
 **Status:** Accepted
 
-**Transfer-mechanics update:** ADR 0045 supersedes the decision to reuse the
-standard sequential transport. Endpoint semantics, static request/worker
-defaults, acceptance, and recovery policy in this ADR remain in force.
+**Transfer-mechanics updates:** ADR 0045 supersedes the decision to reuse the
+standard sequential transport. ADR 0046 then gives WSL a distinct transport,
+8 MiB/16-worker Auto row, and provider-specific scheduling/handle policy.
+Endpoint semantics, acceptance, and recovery policy in this ADR remain in
+force.
 
 ## Context
 

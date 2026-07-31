@@ -22,8 +22,10 @@ pub enum TransportKind {
     /// and solid-state same-device copies.
     #[default]
     Standard,
-    /// Bounded read/write overlap for UNC, mapped-network, and WSL paths.
+    /// Bounded read/write overlap for generic UNC and mapped-network paths.
     Redirector,
+    /// WSL's local Plan 9 redirector, with independently evolvable scheduling.
+    Wsl,
     /// Phased reads and writes for intersecting rotational media.
     SameSpindle,
 }
@@ -33,7 +35,7 @@ pub enum TransportKind {
 pub struct TransportProfile {
     /// Selected strategy.
     pub kind: TransportKind,
-    /// Standard/redirector request bytes, or maximum same-spindle staging.
+    /// Standard/redirector/WSL request bytes, or maximum same-spindle staging.
     pub burst_bytes: usize,
 }
 
@@ -65,6 +67,15 @@ impl TransportProfile {
         }
     }
 
+    /// Creates the bounded WSL Plan 9 pipeline.
+    #[must_use]
+    pub const fn wsl(chunk_bytes: usize) -> Self {
+        Self {
+            kind: TransportKind::Wsl,
+            burst_bytes: chunk_bytes,
+        }
+    }
+
     /// Whether reads and writes must be serialized into coarse phases.
     #[must_use]
     pub const fn is_same_spindle(self) -> bool {
@@ -75,7 +86,13 @@ impl TransportProfile {
     /// writes through the bounded redirector pipeline.
     #[must_use]
     pub const fn is_redirector(self) -> bool {
-        matches!(self.kind, TransportKind::Redirector)
+        matches!(self.kind, TransportKind::Redirector | TransportKind::Wsl)
+    }
+
+    /// Whether the transfer crosses WSL's Plan 9 provider.
+    #[must_use]
+    pub const fn is_wsl(self) -> bool {
+        matches!(self.kind, TransportKind::Wsl)
     }
 }
 

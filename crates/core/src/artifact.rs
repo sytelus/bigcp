@@ -26,7 +26,12 @@ impl AtomicArtifact {
         })?;
         fs::create_dir_all(parent)?;
         Ok(Self {
-            temporary: Some(DestinationTemp::create(parent, temporary_kind, false)?),
+            temporary: Some(DestinationTemp::create(
+                parent,
+                temporary_kind,
+                false,
+                false,
+            )?),
             final_path: path.to_path_buf(),
         })
     }

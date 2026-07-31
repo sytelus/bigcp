@@ -2,10 +2,41 @@
 
 Latest review: 2026-07-31
 
+## 2026-07-31 WSL Plan 9 throughput specialization
+
+WSL now has a distinct `wsl` transport/profile identity while reusing the
+correctness-tested ordered two-buffer engine. Its independently owned Auto row
+uses 8 MiB requests and up to 16 workers. A WSL destination stripes plain-small
+creates across the bounded worker pool, opens direct/temp/resumed handles with
+the sequential cache hint, skips the redundant metadata query after a
+successful `CREATE_NEW`, and applies projected last-write time only in the
+authoritative post-write stamp. Generic UNC keeps its `redirector` identity and
+directory affinity; local standard and same-spindle policy are unchanged.
+
+Focused tests pin WSL profile selection, stable `"wsl"` audit serialization,
+WSL-destination striping versus local/generic-UNC affinity, and deferred final
+stamping after sequential writes. All 147 confined workspace tests passed with
+zero failures: 8 CLI, 60 core unit, 16 core end-to-end, 11 testkit safety, 3
+TUI, and 49 Windows-boundary tests. Formatting, workspace/all-target
+warning-denied Clippy, warning-denied rustdoc, doc tests, the locked release
+build, and test-storage safety checks passed. Cargo-deny reported only the
+allowed duplicate-version warnings for `hashbrown` and `syn`; RustSec found no
+vulnerability among 146 locked dependencies. PLAN, LIMITATIONS, schemas,
+operator/maintainer docs, changelog, BENCHMARKS, and ADR 0046 distinguish the
+correctness-tested mechanisms from the unmeasured H7 speed hypothesis.
+`VISION.md` was not modified and remains at SHA-256
+`B970F59B791A53584FB57698B26CB70A7E7E9D80982B9118F4EF5A4199BE6C28`.
+
+No WSL/UNC write, distribution restart, physical-drive, VHDX, performance,
+endurance, large-scale, or forced-disconnect test ran. A live speed claim still
+requires an exact operator-approved disposable WSL path, file/byte budget,
+duration, and storage-impact record under `docs/TESTING.md`.
+
 ## 2026-07-31 bounded UNC/WSL redirector throughput refactor
 
-UNC, mapped-drive, and WSL profiles now select an isolated `redirector`
-transport. Streamed dense data, sparse allocated ranges, and named streams use
+In this earlier pass, UNC, mapped-drive, and WSL profiles selected one isolated
+`redirector` transport; ADR 0046 above later splits WSL policy from generic
+UNC. Streamed dense data, sparse allocated ranges, and named streams use
 two fallibly allocated buffers: a scoped reader fills the next request while
 the caller writes the prior request, with hashing and writes still strictly
 ordered and every pipeline segment capped at a checkpoint boundary.

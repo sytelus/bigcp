@@ -389,13 +389,25 @@ repetition round of the four contenders:
 **H6 — redirector overlap (registered 2026-07-31, unmeasured):** ADR 0045's
 fixed two-buffer pipeline should reduce idle time by overlapping one source
 read with one destination write, while parallel non-checkpointed streamed files
-should cover independent-file SMB/WSL latency better than the former
+should cover independent-file SMB latency better than the former
 coordinator-only path. Correctness tests prove actual stage overlap, ordering,
 bounded memory, cancellation, and checkpoint routing; they do not prove a
 speedup. The first approved remote experiment must compare the same bounded
 fixture and verification policy across the pre-ADR baseline, current defaults,
 manual thread/chunk sweeps, and robocopy's best applicable `/MT`/`/J` settings,
 with signing/encryption/compression and endpoint topology recorded.
+
+**H7 — WSL Plan 9 specialization (registered 2026-07-31, unmeasured):** ADR
+0046 separates WSL from generic UNC, raises its bounded Auto row from 4 MiB/8
+workers to 8 MiB/16, stripes small WSL-destination creates, supplies sequential
+cache hints, skips the provably redundant metadata query for a newly created
+final name, and stamps projected WSL metadata once after data instead of before
+and after it. Pure tests prove selection, routing isolation, stable audit
+serialization, and final metadata correctness; they do not prove a speedup.
+The first approved WSL run must compare the former/current defaults plus bounded
+chunk/thread sweeps in each approved direction and must record WSL version/type,
+distribution, filesystem, warm/cold state, verification policy, and exact
+native-Linux/robocopy comparison commands.
 
 The elevated filesystem matrix, repeated-run certified benchmark protocol,
 ADR 0036 same-spindle HDD comparison, and ADR 0037 generic-UNC/WSL profile
@@ -405,11 +417,11 @@ small verified same-volume integration case, but those tests prove correctness
 and phase ordering—not a speedup. Running the `[HW]` cell requires separate
 owner approval under `docs/TESTING.md`, including its exact bounded workload,
 target scratch root, write volume, duration, and drive impact. The remote
-8 MiB/16-worker and WSL 4 MiB/8-worker Auto rows are bounded static defaults,
-not measured speedup claims; any network/WSL benchmark additionally requires
-an approved scratch share/distribution path. ADR 0045's two-buffer and
-parallel-stream mechanics are likewise benchmark-pending rather than measured
-speedup claims. Endurance,
+generic-UNC and WSL 8 MiB/16-worker Auto rows are independently bounded static
+defaults, not measured speedup claims; any network/WSL benchmark additionally
+requires an approved scratch share/distribution path. ADR 0045's two-buffer and
+parallel-stream mechanics and ADR 0046's WSL-specific scheduling/round-trip
+reductions are likewise benchmark-pending rather than measured speedup claims. Endurance,
 million-entry, and competitor sweeps stay prohibited (VISION).
 
 Future entries must record OS build, CPU/RAM, source/destination volume and

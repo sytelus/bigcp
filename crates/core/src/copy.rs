@@ -128,12 +128,27 @@ pub fn run_copy(
     if preflight.source_volume.endpoint.is_remote()
         || preflight.destination_volume.endpoint.is_remote()
     {
-        let message = format!(
-            "remote topology: source={} destination={}; using bounded two-buffer read/write overlap and {} static redirector worker(s)",
-            preflight.source_volume.endpoint.name(),
-            preflight.destination_volume.endpoint.name(),
-            preflight.profile.workers,
-        );
+        let message = if preflight.profile.transport.is_wsl() {
+            format!(
+                "WSL Plan 9 topology: source={} destination={}; using bounded two-buffer overlap, {} MiB requests, and {} static worker(s){}",
+                preflight.source_volume.endpoint.name(),
+                preflight.destination_volume.endpoint.name(),
+                preflight.profile.chunk_bytes / (1024 * 1024),
+                preflight.profile.workers,
+                if preflight.destination_volume.endpoint == bigcp_win::EndpointKind::Wsl {
+                    " with striped destination creates"
+                } else {
+                    ""
+                }
+            )
+        } else {
+            format!(
+                "remote topology: source={} destination={}; using bounded two-buffer read/write overlap and {} static redirector worker(s)",
+                preflight.source_volume.endpoint.name(),
+                preflight.destination_volume.endpoint.name(),
+                preflight.profile.workers,
+            )
+        };
         observer.on_message(&message);
         audit.emit(&AuditEvent::Warning {
             kind: "remote_endpoint".to_owned(),
@@ -547,8 +562,8 @@ struct Runner<'a> {
     dir_outstanding: HashMap<PathBuf, usize>,
     file_workers: FileWorkers,
     file_jobs_outstanding: usize,
-    /// Round-robin shard for independently streamed redirector files. Small
-    /// creates use the separate directory-affine hash below.
+    /// Round-robin shard for independently streamed redirector files and WSL
+    /// destination creates. Other small creates use directory affinity.
     next_independent_shard: usize,
     /// Coordinator-owned cancellation state shared with streamed file jobs.
     worker_cancel: Arc<AtomicBool>,
@@ -585,6 +600,7 @@ struct WorkerDispatch {
 /// additionally stream independent files through the bounded worker pool.
 fn worker_dispatch(
     transport: TransportProfile,
+    destination_is_wsl: bool,
     journal_available: bool,
     unnamed_size: u64,
     large_threshold: u64,
@@ -609,7 +625,11 @@ fn worker_dispatch(
     };
     Some(WorkerDispatch {
         promote_threshold,
-        directory_affine: unnamed_size < large_threshold,
+        // NTFS and generic redirectors retain the measured same-directory
+        // create serialization. WSL's Plan 9 destination instead stripes
+        // small creates: serial affinity there merely exposes one provider
+        // round trip at a time and protects no local NTFS directory index.
+        directory_affine: unnamed_size < large_threshold && !destination_is_wsl,
     })
 }
 
@@ -1531,6 +1551,7 @@ impl Runner<'_> {
                 && is_sparse(source.metadata.basic.attributes);
             if let Some(dispatch) = worker_dispatch(
                 self.transport,
+                self.destination_policy.endpoint() == bigcp_win::EndpointKind::Wsl,
                 self.journal.is_some(),
                 unnamed,
                 self.options.large_threshold(),
@@ -1570,6 +1591,8 @@ impl Runner<'_> {
                     destination_requires_post_write_stamp: self
                         .destination_policy
                         .requires_post_write_stamp(),
+                    destination_is_wsl: self.destination_policy.endpoint()
+                        == bigcp_win::EndpointKind::Wsl,
                     chunk_bytes: self.chunk_bytes,
                     transport: self.transport,
                     checkpoint_threshold: self.options.checkpoint_threshold(),
@@ -1701,6 +1724,7 @@ impl Runner<'_> {
             destination_requires_post_write_stamp: self
                 .destination_policy
                 .requires_post_write_stamp(),
+            destination_is_wsl: self.destination_policy.endpoint() == bigcp_win::EndpointKind::Wsl,
             known_streams: Some(&streams),
             cancel: &cancel_probe,
             promote_threshold: None,
@@ -1725,9 +1749,9 @@ impl Runner<'_> {
         if self.file_jobs_outstanding >= self.file_workers.capacity() {
             self.receive_file_job()?;
         }
-        // Small creates remain directory-affine (see FileWorkers), while
-        // redirector-streamed files use a separate round-robin shard so the
-        // first independent files in one directory occupy distinct workers.
+        // Local/generic-UNC small creates remain directory-affine (see
+        // FileWorkers). Redirector streams and WSL-destination creates use a
+        // separate round-robin shard so one directory can occupy all workers.
         let parent = job
             .source_snapshot
             .relative_path
@@ -3477,18 +3501,26 @@ mod tests {
         const MIB_USIZE: usize = 1024 * 1024;
         let transport = TransportProfile::redirector(8 * MIB_USIZE);
         assert_eq!(
-            worker_dispatch(transport, true, 64 * MIB, 16 * MIB, 256 * MIB, false),
+            worker_dispatch(transport, false, true, 64 * MIB, 16 * MIB, 256 * MIB, false,),
             Some(WorkerDispatch {
                 promote_threshold: Some(256 * MIB),
                 directory_affine: false,
             })
         );
         assert_eq!(
-            worker_dispatch(transport, true, 256 * MIB, 16 * MIB, 256 * MIB, false,),
+            worker_dispatch(
+                transport,
+                false,
+                true,
+                256 * MIB,
+                16 * MIB,
+                256 * MIB,
+                false,
+            ),
             None
         );
         assert_eq!(
-            worker_dispatch(transport, true, 8 * MIB, 16 * MIB, 256 * MIB, true),
+            worker_dispatch(transport, false, true, 8 * MIB, 16 * MIB, 256 * MIB, true,),
             None
         );
     }
@@ -3498,11 +3530,26 @@ mod tests {
         const MIB: u64 = 1024 * 1024;
         const MIB_USIZE: usize = 1024 * 1024;
         let transport = TransportProfile::standard(8 * MIB_USIZE);
-        assert!(worker_dispatch(transport, true, 8 * MIB, 16 * MIB, 256 * MIB, false).is_some());
+        assert!(
+            worker_dispatch(transport, false, true, 8 * MIB, 16 * MIB, 256 * MIB, false,).is_some()
+        );
         assert_eq!(
-            worker_dispatch(transport, true, 64 * MIB, 16 * MIB, 256 * MIB, false),
+            worker_dispatch(transport, false, true, 64 * MIB, 16 * MIB, 256 * MIB, false,),
             None
         );
+    }
+
+    #[test]
+    fn wsl_destination_stripes_small_files_without_changing_other_affinity() {
+        const MIB: u64 = 1024 * 1024;
+        const MIB_USIZE: usize = 1024 * 1024;
+        let transport = TransportProfile::wsl(8 * MIB_USIZE);
+        let wsl = worker_dispatch(transport, true, true, 8 * MIB, 16 * MIB, 256 * MIB, false);
+        assert!(wsl.is_some_and(|dispatch| !dispatch.directory_affine));
+
+        let local_destination =
+            worker_dispatch(transport, false, true, 8 * MIB, 16 * MIB, 256 * MIB, false);
+        assert!(local_destination.is_some_and(|dispatch| dispatch.directory_affine));
     }
 
     #[test]
