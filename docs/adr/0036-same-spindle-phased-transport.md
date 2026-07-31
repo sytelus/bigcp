@@ -48,8 +48,9 @@ Effective kind and burst are recorded in the profile log event and report.
 
 This topology changes performance only. It causes no fidelity loss, durability
 change, or critical safety risk, so it produces one startup status message but
-does not add a confirmation. The existing single prompt remains reserved for
-FAT/exFAT fidelity acceptance and the Quick-removal opt-out.
+does not add a confirmation. ADR 0037 later combines remote/WSL acceptance
+with FAT/exFAT fidelity acceptance and the Quick-removal opt-out in the same
+single startup prompt.
 
 ## Consequences
 

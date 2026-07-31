@@ -66,16 +66,16 @@ pub fn absolute_extended(path: &Path) -> io::Result<PathBuf> {
     }
     buffer.truncate(written as usize);
 
-    if starts_with_ascii_case_insensitive(&buffer, EXTENDED_UNC_PREFIX)
-        || (starts_with(&buffer, UNC_PREFIX) && !starts_with(&buffer, EXTENDED_PREFIX))
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "bigcp works with local volumes only; UNC paths are unsupported",
-        ));
-    }
-
-    if !starts_with(&buffer, EXTENDED_PREFIX) {
+    if starts_with_ascii_case_insensitive(&buffer, EXTENDED_UNC_PREFIX) {
+        buffer = canonicalize_wsl_server(buffer);
+    } else if starts_with(&buffer, UNC_PREFIX) && !starts_with(&buffer, EXTENDED_PREFIX) {
+        // Extended UNC syntax is `\\?\UNC\server\share`, not a plain
+        // `\\?\` prefix followed by the ordinary UNC string.
+        let mut extended = Vec::with_capacity(EXTENDED_UNC_PREFIX.len() + buffer.len() - 2);
+        extended.extend_from_slice(EXTENDED_UNC_PREFIX);
+        extended.extend_from_slice(&buffer[UNC_PREFIX.len()..]);
+        buffer = canonicalize_wsl_server(extended);
+    } else if !starts_with(&buffer, EXTENDED_PREFIX) {
         let mut extended = Vec::with_capacity(EXTENDED_PREFIX.len() + buffer.len());
         extended.extend_from_slice(EXTENDED_PREFIX);
         extended.extend_from_slice(&buffer);
@@ -113,6 +113,7 @@ pub fn final_path(file: &File) -> io::Result<PathBuf> {
         return Err(last_error());
     }
     buffer.truncate(written_usize);
+    buffer = canonicalize_wsl_server(buffer);
     Ok(PathBuf::from(os_from_wide(&buffer)))
 }
 
@@ -169,13 +170,31 @@ pub fn ordinal_case_key(name: &OsStr) -> io::Result<Vec<u16>> {
     Ok(mapped)
 }
 
+/// Produces an exact or Windows-ordinal key for endpoint-aware matching.
+pub fn comparison_key(name: &OsStr, case_sensitive: bool) -> io::Result<Vec<u16>> {
+    if case_sensitive {
+        Ok(name.encode_wide().collect())
+    } else {
+        ordinal_case_key(name)
+    }
+}
+
 /// Returns true when candidate is root or is nested beneath root.
 ///
 /// Both inputs must already be absolute final paths. Component comparison uses
 /// the same Windows ordinal case folding as the destination join.
 pub fn is_same_or_descendant(candidate: &Path, root: &Path) -> io::Result<bool> {
-    let candidate_key = ordinal_case_key(candidate.as_os_str())?;
-    let mut root_key = ordinal_case_key(root.as_os_str())?;
+    is_same_or_descendant_with(candidate, root, false)
+}
+
+/// Endpoint-aware form of [`is_same_or_descendant`].
+pub fn is_same_or_descendant_with(
+    candidate: &Path,
+    root: &Path,
+    case_sensitive: bool,
+) -> io::Result<bool> {
+    let candidate_key = comparison_key(candidate.as_os_str(), case_sensitive)?;
+    let mut root_key = comparison_key(root.as_os_str(), case_sensitive)?;
     while root_key
         .last()
         .is_some_and(|value| *value == u16::from(b'\\'))
@@ -220,6 +239,42 @@ fn starts_with_ascii_case_insensitive(value: &[u16], prefix: &[u16]) -> bool {
             .all(|(left, right)| ascii_upper(*left) == ascii_upper(*right))
 }
 
+/// Gives WSL's legacy and current aliases one lock/state/root identity. The
+/// modern spelling can auto-start a distribution on Windows 11 and avoids the
+/// network-name ambiguity that caused Microsoft to introduce it.
+fn canonicalize_wsl_server(value: Vec<u16>) -> Vec<u16> {
+    if !starts_with_ascii_case_insensitive(&value, EXTENDED_UNC_PREFIX) {
+        return value;
+    }
+    let body = &value[EXTENDED_UNC_PREFIX.len()..];
+    let server_end = body
+        .iter()
+        .position(|unit| *unit == u16::from(b'\\'))
+        .unwrap_or(body.len());
+    let server = &body[..server_end];
+    let legacy = server.len() == 4
+        && server
+            .iter()
+            .zip("wsl$".bytes())
+            .all(|(left, right)| ascii_upper(*left) == u16::from(right.to_ascii_uppercase()));
+    let current = server.len() == "wsl.localhost".len()
+        && server
+            .iter()
+            .zip("wsl.localhost".bytes())
+            .all(|(left, right)| ascii_upper(*left) == u16::from(right.to_ascii_uppercase()));
+    if !legacy && !current {
+        return value;
+    }
+    let canonical: Vec<u16> = "wsl.localhost".encode_utf16().collect();
+    let mut normalized = Vec::with_capacity(
+        EXTENDED_UNC_PREFIX.len() + canonical.len() + body.len().saturating_sub(server_end),
+    );
+    normalized.extend_from_slice(EXTENDED_UNC_PREFIX);
+    normalized.extend_from_slice(&canonical);
+    normalized.extend_from_slice(&body[server_end..]);
+    normalized
+}
+
 fn ascii_upper(value: u16) -> u16 {
     if (u16::from(b'a')..=u16::from(b'z')).contains(&value) {
         value - u16::from(b'a' - b'A')
@@ -230,7 +285,11 @@ fn ascii_upper(value: u16) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::{display_path, is_same_or_descendant, ordinal_case_key};
+    use super::{
+        absolute_extended, comparison_key, display_path, final_path, is_same_or_descendant,
+        is_same_or_descendant_with, ordinal_case_key,
+    };
+    use crate::{EndpointKind, classify_endpoint, open_root};
     use std::ffi::OsStr;
     use std::path::Path;
 
@@ -260,5 +319,50 @@ mod tests {
             display_path(Path::new(r"\\?\C:\data")),
             OsStr::new(r"C:\data")
         );
+    }
+
+    #[test]
+    fn unc_paths_use_extended_syntax_and_wsl_aliases_canonicalize() {
+        assert_eq!(
+            absolute_extended(Path::new(r"\\server\share\folder")).ok(),
+            Some(Path::new(r"\\?\UNC\server\share\folder").to_path_buf())
+        );
+        assert_eq!(
+            absolute_extended(Path::new(r"\\WSL$\Ubuntu\home")).ok(),
+            Some(Path::new(r"\\?\UNC\wsl.localhost\Ubuntu\home").to_path_buf())
+        );
+        assert_eq!(
+            absolute_extended(Path::new(r"\\WSL.LOCALHOST\Ubuntu\home")).ok(),
+            Some(Path::new(r"\\?\UNC\wsl.localhost\Ubuntu\home").to_path_buf())
+        );
+    }
+
+    #[test]
+    fn endpoint_aware_comparison_preserves_wsl_case() {
+        let upper = comparison_key(OsStr::new("File"), true);
+        let lower = comparison_key(OsStr::new("file"), true);
+        assert_ne!(upper.ok(), lower.ok());
+        assert!(
+            is_same_or_descendant_with(
+                Path::new(r"\\?\UNC\wsl.localhost\Ubuntu\home\File"),
+                Path::new(r"\\?\UNC\wsl.localhost\Ubuntu\home\file"),
+                true,
+            )
+            .is_ok_and(|value| !value)
+        );
+    }
+
+    #[test]
+    fn final_path_preserves_a_local_temp_endpoint() -> std::io::Result<()> {
+        let root = tempfile::tempdir()?;
+        let pin = open_root(root.path())?;
+        let resolved = final_path(&pin)?;
+        assert_eq!(
+            classify_endpoint(&resolved),
+            EndpointKind::Local,
+            "unexpected final path: {}",
+            resolved.display()
+        );
+        Ok(())
     }
 }

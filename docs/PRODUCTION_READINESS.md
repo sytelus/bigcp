@@ -34,6 +34,11 @@ by the governing plan.
 - Topology-gated same-spindle scheduling: bounded plain-small read/write phases,
   dense/sparse/ADS burst transport, cancellation accounting, and verified
   same-volume integration coverage without changing the SSD/independent path.
+- Isolated UNC/WSL endpoint policy: extended UNC normalization, mapped-drive
+  final-path classification, handle-bound remote volume queries, no remote
+  local-device IOCTLs, static bounded redirector profiles, WSL exact-name and
+  basic-metadata projection, combined startup acceptance, and redirector-loss
+  breaker mapping without changing the local transport/profile path.
 
 ## Release-blocking evidence still required
 
@@ -48,6 +53,10 @@ lifespan-reducing writes, no machine-stability impact — see PLAN §12.0):
   million-entry behavior via synthetic enumeration simulation, never real trees.
 - The same-spindle HDD `[HW]` cell remains required before claiming a measured
   speedup or universal optimality for the new 256 MiB default.
+- Generic SMB/mapped-drive source and destination cells plus a WSL destination
+  cell remain required before claiming remote matrix certification. A bounded
+  WSL-source-to-local smoke supplies correctness evidence only; no network/WSL
+  throughput improvement is claimed without separately approved benchmarks.
 - The final production-validation pass (PLAN §12.10), executed only on
   explicit owner request: chaos/kill-convergence, the adversarial set,
   sentinel/schema checks, and the certified benchmark protocol.
@@ -74,4 +83,4 @@ release pass.
 
 No release process may reinterpret an unrun gate as a pass.
 `TESTING_SUMMARY.md` records dated evidence; intentional differences from
-the governing plan are recorded inline in PLAN.md and in ADRs 0027–0036.
+the governing plan are recorded inline in PLAN.md and in ADRs 0027–0037.

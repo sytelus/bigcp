@@ -4,9 +4,9 @@
 
 | Area | Responsibility |
 |---|---|
-| `crates/win/src/path.rs`, `metadata.rs`, `volume.rs`, `device.rs`, `lock.rs`, `util.rs` | Lossless paths, 128/64-bit handle identity, fast/fallback 256 KiB enumeration, supported-volume and query-only device facts, run lock, shared error helpers. |
+| `crates/win/src/endpoint.rs`, `path.rs`, `metadata.rs`, `volume.rs`, `device.rs`, `lock.rs`, `util.rs` | Local/UNC/WSL classification, lossless paths, 128/64-bit handle identity, fast/fallback 256 KiB enumeration, local/handle-bound-remote volume facts, query-only local device facts, run lock, shared error helpers. |
 | `crates/win/src/file.rs`, `streams.rs`, `ea.rs`, `sparse.rs`, `reparse.rs`, `security.rs` | Read-only source and capability-bearing destination primitives; the only unsafe boundary. |
-| `crates/core/src/model.rs`, `options.rs`, `filesystem.rs`, `classify.rs`, `copy.rs`, `transport.rs`, `worker.rs`, `engine.rs` | Work model, validated options, immutable destination filesystem policy, join, terminal outcomes, topology-selected standard/same-spindle transport, bounded scheduling, direct-plain-small and transactional auxiliary/sparse/large copy. |
+| `crates/core/src/model.rs`, `options.rs`, `filesystem.rs`, `classify.rs`, `copy.rs`, `transport.rs`, `worker.rs`, `engine.rs` | Work model, validated options, immutable source/destination semantic policy, endpoint-aware join, terminal outcomes, topology-selected standard/same-spindle transport, bounded scheduling, direct-plain-small and transactional auxiliary/sparse/large copy. |
 | `crates/core/src/journal.rs`, `audit.rs`, `report.rs`, `stats.rs`, `devprofile.rs` | Resume hints, public artifacts, throughput windows, static profiles. |
 | `crates/core/src/verify.rs` | Post-copy and standalone verification. |
 | `crates/tui` | Immutable-snapshot live UI and saved report browser. |
@@ -94,8 +94,9 @@ replacements, warnings, grouped failures, extras, hints, and verification.
 
 - **ADS:** NTFS/ReFS alternate `$DATA` stream attached to an object.
 - **EA:** opaque extended-attribute set copied via the backup stream protocol.
-- **Join:** case-insensitive matching of one source and destination directory
-  listing without per-source-item destination stats.
+- **Join:** destination-aware exact (WSL) or Windows-ordinal case-insensitive
+  matching of one source and destination directory listing without
+  per-source-item destination stats.
 - **Engine:** a bounded file transfer strategy; both paths share result and
   accounting contracts but have distinct completion protocols.
 - **Watermark:** contiguous temp prefix eligible for a checkpoint.
@@ -114,9 +115,13 @@ replacements, warnings, grouped failures, extras, hints, and verification.
   rename to override it.
 - **Oracle:** independent, simple full-tree comparator in `bigcp-testkit`.
 - **Breaker:** stop-dispatch policy for device loss or capacity exhaustion.
-- **Filesystem policy:** one immutable destination contract for timestamp and
-  attribute representation, hard limits, and post-write metadata behavior;
-  optional operations remain driven by probed capability flags.
+- **Filesystem policy:** one immutable source/destination contract for timestamp
+  and attribute representation, hard limits, name matching, preallocation, and
+  post-write metadata behavior; optional operations remain driven by probed
+  capability flags.
+- **Endpoint:** the access route independent of filesystem type: local, generic
+  UNC/mapped drive, or WSL UNC. Only local endpoints enter device/topology
+  IOCTLs; WSL owns exact name matching and projected Linux interoperability.
 - **Same-spindle transport:** the static policy selected only when physical
   extents intersect and media is rotational; source reads and destination
   writes run in bounded phases to reduce mechanical head switching.
@@ -145,8 +150,9 @@ replacements, warnings, grouped failures, extras, hints, and verification.
 4. Run the final production-validation pass (PLAN §12.10 — chaos/kill
    convergence, adversarial set, sentinel/schema checks, certified benchmark
    protocol); it executes only on explicit owner request.
-5. Build `--release --locked`, smoke `--help`, copy, rerun, both verification
-   forms, and report reopening.
+5. Build `--release --locked`, smoke `--help`, local copy/rerun, both
+   verification forms, report reopening, and any available bounded UNC/WSL
+   scratch endpoint. Never substitute an unapproved production share.
 6. Update `CHANGELOG.md`, `BENCHMARKS.md`, and version; tag only a clean commit.
 
 Until step 4 exists and passes, label binaries pre-1.0 and do not make v1.0

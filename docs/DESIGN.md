@@ -16,10 +16,12 @@ logic, so its oracle is independent.
 
 ## Control flow
 
-Preflight normalizes and opens roots, resolves final paths, rejects aliases and
-unsupported volumes, queries device facts without write probes, selects a
-deterministic static profile, validates audit containment, and acquires the
-destination lock. The coordinator then performs an iterative directory join.
+Preflight normalizes and opens local/UNC roots, resolves final paths, rejects
+aliases and unsupported local volumes, queries capability and device facts
+without write probes, selects a deterministic static profile, validates audit
+containment, and acquires the destination lock. Remote endpoints use
+handle-bound volume queries and never enter local device-IOCTL discovery. The
+coordinator then performs an iterative directory join.
 Directories are created before children and stamped after children.
 Their created or enumerated identities are retained through the post-order
 pass; stream, EA, and metadata handles must match those identities before any
@@ -36,8 +38,9 @@ and journal state.
 
 Plain small files use `DestinationFinal`: workers read and revalidate the
 source, then create or identity-check-and-truncate the final destination before
-one whole-buffer unnamed-stream write. FAT-family files are restamped on that
-same handle after data I/O; the NTFS/ReFS path incurs no extra restamp. Files
+one whole-buffer unnamed-stream write. FAT-family and remote files are
+restamped on that same handle after data I/O; the strict local NTFS/ReFS path
+incurs no extra restamp. Files
 with destination-representable ADS/EAs, sparse files, and large/resumable files
 use `DestinationTemp` and atomic publication. Unsupported source ADS/EAs are
 counted and warned but do not force that slower route. Large transfers are
@@ -82,8 +85,15 @@ The narrow Win32 crate, capability-based core requests, and immutable
 `FilesystemPolicy` deliberately isolate filesystem differences and future
 ports:
 
-- **UNC/network:** add a path/volume backend that returns network capabilities
-  and a network profile; do not add SMB behavior to current local wrappers.
+- **UNC/network (implemented):** `win::endpoint` classifies local, generic UNC,
+  and WSL access independently of filesystem type. Direct UNC syntax is
+  extended-length normalized, legacy `wsl$` canonicalizes to `wsl.localhost`,
+  and mapped drives resolve their opened final path. `volume.rs` preserves the
+  existing Win32 local-volume path and uses handle-bound native filesystem
+  queries only for redirectors; `device.rs` returns an opaque remote device
+  record without local IOCTLs. Core consumes one immutable endpoint/filesystem
+  policy, so remote profiles, case matching, projection, preallocation, and
+  disconnect classification can evolve without touching local hot paths.
 - **Same-spindle transport (implemented):** `transport.rs` owns topology policy
   data and burst mechanics, `worker.rs` owns phased plain-small batching, and
   `engine.rs` applies it to dense/sparse/named streams behind the existing
@@ -96,10 +106,12 @@ ports:
   `bigcp-win` contains the only 128-to-64-bit identity/enumeration and
   extended-to-legacy rename fallbacks. The exact NTFS/ReFS policy stays a
   branch-free equality path and does not pay FAT-only syscalls.
-- **Linux/macOS/WSL:** replace `bigcp-win` with a platform facade providing
+- **Native Linux/macOS:** replace `bigcp-win` with a platform facade providing
   path identity, enumeration snapshots, completion/publication, streams/xattrs,
-  sparse extents, and reparse/link equivalents. Core owns no UTF-8 assumption;
-  Windows paths remain lossless UTF-16 in audit keys.
+  sparse extents, and link equivalents. WSL UNC interoperability is already
+  available through the Windows facade, but a native Linux backend would be
+  required to preserve uid/gid/mode/xattrs and special files. Core owns no
+  UTF-8 assumption; Windows paths remain lossless UTF-16 in audit keys.
 
 Before another backend is enabled, extend these existing narrow policy and
 capability seams. Avoid a lowest-common-denominator abstraction: each backend
@@ -107,9 +119,11 @@ must state its atomicity, representation, and metadata guarantees.
 
 ## Performance model
 
-Device discovery uses official query-only IOCTLs: physical extents, bus type,
-seek penalty, sector sizes, and maximum transfer length. Static profiles choose
-per-side chunk size and small-file workers. Intersecting disk extents plus
+Local device discovery uses official query-only IOCTLs: physical extents, bus
+type, seek penalty, sector sizes, and maximum transfer length. Remote discovery
+uses provider-returned volume data and immutable generic-UNC/WSL profiles;
+remote sources cap the composed worker count. Static profiles choose per-side
+chunk size and small-file workers. Intersecting local disk extents plus
 rotational classification select one phased worker and a bounded same-spindle
 burst; SSD overlap stays on the standard path. Manual values are range checked;
 the memory override caps chunks, threshold-sized workers, and the burst. All
@@ -119,8 +133,8 @@ The directory join avoids a destination `stat` per source file. Stream and EA
 work is deferred until required. Statistics report application-side rates and
 label bottleneck conclusions as hypotheses.
 
-**Fragmentation stance.** Parallel writers normally interleave allocation and
-shred concurrently growing files into many extents — a real read-performance
+**Fragmentation stance.** On local volumes, parallel writers normally
+interleave allocation and shred concurrently growing files into many extents — a real read-performance
 cost on seek-penalty media. bigcp counters this structurally, exploiting the
 one thing a copier always knows that ordinary writers do not: the final size
 before the first byte. Dense large files are preallocated to their full source
@@ -133,7 +147,9 @@ holes being preserved, so their layout mirrors the source's own. This stance
 is evidence-backed, not assumed: `bigcp-testkit extents` measures physical
 extent counts (`FSCTL_GET_RETRIEVAL_POINTERS`, read-only) and benchmark
 entries record that evidence per `BENCHMARKS.md`, which will catch any future
-regression that quietly drops preallocation.
+regression that quietly drops preallocation. Remote endpoints skip the dense
+`FileAllocationInfo` hint because provider support and cost are not locally
+knowable; this endpoint branch does not alter local allocation behavior.
 
 ## Constraints worth preserving
 

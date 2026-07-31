@@ -101,7 +101,36 @@
       "type": "object"
     },
     "devices": {
-      "type": "object"
+      "type": "object",
+      "properties": {
+        "source": {
+          "type": "object",
+          "properties": {
+            "endpoint": {
+              "enum": [
+                "local",
+                "unc",
+                "wsl"
+              ]
+            }
+          },
+          "additionalProperties": true
+        },
+        "destination": {
+          "type": "object",
+          "properties": {
+            "endpoint": {
+              "enum": [
+                "local",
+                "unc",
+                "wsl"
+              ]
+            }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
     },
     "counters": {
       "type": "object"
@@ -151,7 +180,7 @@
         },
         "projected": {
           "type": "boolean",
-          "description": "True when verification used FAT-family destination-representable semantics."
+          "description": "True when verification used FAT-family, WSL, or unknown-remote projected semantics."
         },
         "passed": {
           "type": "integer",

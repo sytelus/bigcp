@@ -141,6 +141,7 @@ dependencies = [
 name = "bigcp-win"
 version = "0.2.1"
 dependencies = [
+ "serde",
  "tempfile",
  "thiserror",
  "uuid",

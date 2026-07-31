@@ -1,6 +1,6 @@
 //! Deterministic static device-class profiles and bounded manual overrides.
 
-use bigcp_win::{DeviceBus, DeviceInfo};
+use bigcp_win::{DeviceBus, DeviceInfo, EndpointKind};
 use serde::{Deserialize, Serialize};
 
 use crate::error::BigcpError;
@@ -18,6 +18,9 @@ const MAX_SAME_SPINDLE_BURST_BYTES: usize = 1024 * 1024 * 1024;
 /// would be a claim the implementation cannot honor.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SideProfile {
+    /// Local, generic UNC, or WSL UNC access path.
+    #[serde(default)]
+    pub endpoint: EndpointKind,
     /// Selected class.
     pub class: DeviceClass,
     /// high or low query confidence.
@@ -110,7 +113,7 @@ pub fn select_copy_profile(
     // close-overlap win (BENCHMARKS.md). The one exception is a seek-penalty
     // source, whose row stays authoritative: its random reads are the
     // scarcer resource.
-    let mut workers = if source.class == DeviceClass::Hdd {
+    let mut workers = if source.class == DeviceClass::Hdd || source_info.endpoint.is_remote() {
         source.workers.min(destination.workers)
     } else {
         destination.workers
@@ -219,22 +222,32 @@ fn side_profile(
         "low"
     }
     .to_owned();
-    let (chunk_bytes, workers) = match class {
-        DeviceClass::Nvme => (8 * 1024 * 1024, (4 * cores).min(64)),
-        DeviceClass::SataSsd => (8 * 1024 * 1024, 32),
-        DeviceClass::UsbSsd => (4 * 1024 * 1024, 16),
-        // Seek-penalty media get large sequential chunks. Small-file workers
-        // stay HIGH on an HDD destination
-        // (measured 2026-07-29, BENCHMARKS.md): small-file cost there is
-        // metadata-bound — per-file CloseHandle is a ~2.3 ms write-through
-        // round-trip on Quick-removal USB — and 32 outstanding closes
-        // overlap in the device queue (19.1 s vs 31.5 s with 8 workers on
-        // the 20k-file workload, beating robocopy). Reading from an HDD
-        // source stays conservative (seek-bound, unmeasured).
-        DeviceClass::Hdd => (16 * 1024 * 1024, if source { 4 } else { 32 }),
-        DeviceClass::Auto | DeviceClass::Unknown => (4 * 1024 * 1024, 4),
+    let (chunk_bytes, workers) = match (requested == DeviceClass::Auto, info.endpoint) {
+        // Remote roots do not expose local device topology. These immutable
+        // profiles favor fewer, larger protocol operations while retaining
+        // enough small-file concurrency to cover redirector latency. WSL is
+        // intentionally more conservative because every call crosses its 9P
+        // Windows/Linux translation boundary.
+        (true, EndpointKind::Wsl) => (4 * 1024 * 1024, 8),
+        (true, EndpointKind::Unc) => (8 * 1024 * 1024, 16),
+        (_, _) => match class {
+            DeviceClass::Nvme => (8 * 1024 * 1024, (4 * cores).min(64)),
+            DeviceClass::SataSsd => (8 * 1024 * 1024, 32),
+            DeviceClass::UsbSsd => (4 * 1024 * 1024, 16),
+            // Seek-penalty media get large sequential chunks. Small-file workers
+            // stay HIGH on an HDD destination
+            // (measured 2026-07-29, BENCHMARKS.md): small-file cost there is
+            // metadata-bound — per-file CloseHandle is a ~2.3 ms write-through
+            // round-trip on Quick-removal USB — and 32 outstanding closes
+            // overlap in the device queue (19.1 s vs 31.5 s with 8 workers on
+            // the 20k-file workload, beating robocopy). Reading from an HDD
+            // source stays conservative (seek-bound, unmeasured).
+            DeviceClass::Hdd => (16 * 1024 * 1024, if source { 4 } else { 32 }),
+            DeviceClass::Auto | DeviceClass::Unknown => (4 * 1024 * 1024, 4),
+        },
     };
     SideProfile {
+        endpoint: info.endpoint,
         class,
         confidence,
         chunk_bytes,
@@ -271,6 +284,7 @@ mod tests {
         // a drive that positively reports no seek penalty must never fall
         // to the Unknown profile just because its bus is unrecognized.
         let probe = |seek: Option<bool>| DeviceInfo {
+            endpoint: EndpointKind::Local,
             disk_numbers: vec![1],
             incurs_seek_penalty: seek,
             bus: None,
@@ -290,10 +304,11 @@ mod tests {
 
     use super::select_copy_profile;
     use crate::options::{DeviceClass, TuneOptions};
-    use bigcp_win::{DeviceBus, DeviceInfo};
+    use bigcp_win::{DeviceBus, DeviceInfo, EndpointKind};
 
     fn nvme() -> DeviceInfo {
         DeviceInfo {
+            endpoint: EndpointKind::Local,
             disk_numbers: vec![0],
             incurs_seek_penalty: Some(false),
             bus: Some(DeviceBus::Nvme),
@@ -446,5 +461,28 @@ mod tests {
             &tune,
         );
         assert!(result.is_err_and(|error| error.to_string().contains("requires threads=1")));
+    }
+
+    #[test]
+    fn remote_source_caps_local_workers_and_wsl_is_independently_profiled() {
+        let mut source = nvme();
+        source.endpoint = EndpointKind::Wsl;
+        source.disk_numbers.clear();
+        source.incurs_seek_penalty = None;
+        source.bus = None;
+        source.high_confidence = false;
+        let profile = select_copy_profile(
+            &source,
+            &nvme(),
+            DeviceClass::Auto,
+            DeviceClass::Auto,
+            &TuneOptions::default(),
+        );
+        assert!(profile.is_ok_and(|value| {
+            value.source.endpoint == EndpointKind::Wsl
+                && value.workers == 8
+                && value.chunk_bytes == 4 * 1024 * 1024
+                && !value.transport.is_same_spindle()
+        }));
     }
 }

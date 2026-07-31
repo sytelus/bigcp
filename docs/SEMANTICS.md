@@ -8,8 +8,8 @@ pre-1.0 behavior intended for v1.
 
 For an ordinary file, `Same` means exact unnamed-stream size and last-write
 time equal under the destination filesystem policy: exact `FILETIME` on
-NTFS/ReFS, within the representable 2-second interval on FAT, and within the
-10-millisecond interval on exFAT. Differences only in the destination-copyable attribute mask or
+NTFS/ReFS and remote/WSL providers, within the representable 2-second interval
+on FAT, and within the 10-millisecond interval on exFAT. Differences only in the destination-copyable attribute mask or
 creation time are repaired without rewriting data. Any size or last-write
 difference is replaced unless `--replace=false`. Large-file publication is
 atomic; small-file replacement is direct and recoverable by rerun. Destination-only
@@ -29,9 +29,9 @@ and never claim modeled work was completed.
 
 | Object | Preserved |
 |---|---|
-| File | Unnamed bytes always; named `$DATA` streams and EA blob when supported; creation and last-write time at destination granularity; `READONLY`, `HIDDEN`, `SYSTEM`, `ARCHIVE`, plus `NOT_CONTENT_INDEXED` where supported. |
-| Directory | Existence; supported named `$DATA` streams and EA blob; the same projected times and attribute mask, applied post-order; root metadata included. |
-| Symlink/junction | Link target/reparse payload and tag on capable destinations; supported named `$DATA` streams and EA blob; projected basic metadata. FAT/exFAT cannot represent links, so the object fails. |
+| File | Unnamed bytes always; named `$DATA` streams and EA blob when both endpoint capabilities allow; creation and last-write time at destination granularity; `READONLY`, `HIDDEN`, `SYSTEM`, `ARCHIVE`, plus `NOT_CONTENT_INDEXED` where supported. WSL/unknown-remote semantic projection guarantees content and last-write only. |
+| Directory | Existence; supported named `$DATA` streams and EA blob; the same projected times and attribute mask, applied post-order; root metadata included. WSL/unknown-remote semantic projection does not claim Windows creation/access times or attributes. |
+| Symlink/junction | Link target/reparse payload and tag on capable endpoints; supported named `$DATA` streams and EA blob; projected basic metadata. FAT/exFAT and WSL destinations cannot represent links in this engine, so the object fails. Unsupported WSL-source reparse objects also fail rather than being traversed. |
 
 Last-access time is written best-effort but informational in verification
 because reads legitimately change it. Sparse allocation is preserved when
@@ -50,7 +50,7 @@ source-revalidated before destination mutation. A new final name is created
 exclusively; a replacement is opened non-following, identity-checked on that
 same handle, and then truncated in place, preserving its security descriptor.
 The engine writes the one unnamed payload, revalidates the source, restamps it
-after data I/O on FAT-family destinations, optionally flushes, and only then
+after data I/O on FAT-family and remote destinations, optionally flushes, and only then
 reports `copied`. A process kill can leave an incomplete
 final-named plain file, but a mid-write file is shorter than the source and a
 completed whole-buffer write has already completed its logical data.
@@ -78,7 +78,7 @@ synchronous buffered handles through `BackupRead`/`BackupWrite`.
 When a destination cannot represent named streams or EAs, their source counts
 are reported as dropped and they do not force the transactional path. A source
 volume that advertises neither capability is never queried for it. This keeps
-the ordinary FAT/exFAT data path fast without weakening capable destinations.
+the ordinary FAT/exFAT and WSL data paths fast without weakening capable destinations.
 
 Every source/destination named-stream handle is non-following and must report
 the expected base-object identity before I/O. Directory EA and final metadata
@@ -95,19 +95,33 @@ EFS source data is read as plaintext. The destination is asked to encrypt; a
 failure is an explicit `efs_downgrade` warning. Symbolic links are recreated
 with Windows' unprivileged-create flag (when Developer Mode permits it), while
 junctions use their reparse payload. Unknown tags fail unless `--raw-reparse`
-is given. On FAT/exFAT, all reparse objects fail rather than being followed or
-flattened. FAT's 4,294,967,295-byte file limit is checked before destination
+is given. On FAT/exFAT and WSL destinations, all reparse objects fail rather
+than being followed or flattened; WSL-source Linux reparse objects that do not
+map to supported Windows link data fail the same way. FAT's
+4,294,967,295-byte file limit is checked before destination
 mutation.
 
 ## Roots, exclusions, and audit artifacts
 
-Roots are resolved through handles. Equal/nested roots, UNC paths, remote
-volumes, and filesystems other than NTFS, ReFS, FAT/FAT32, and exFAT fail
-preflight. A real FAT/exFAT destination requires one explicit acceptance before
-copy work (`--accept-degraded-filesystem` or the interactive default-no
-startup confirmation). An existing destination
+Roots are resolved through handles. Equal/nested roots and unsupported local
+filesystems fail preflight. Local paths, generic UNC shares, mapped network
+drives, and WSL's `\\wsl.localhost`/legacy `\\wsl$` paths are accepted; the
+legacy WSL spelling canonicalizes before lock/state identity is derived. A real
+FAT/exFAT destination requires `--accept-degraded-filesystem`, and any real
+remote copy requires `--accept-remote-paths`, unless the interactive default-no
+startup confirmation supplies the acceptance. All known limitations share at
+most one prompt. Dry-run and standalone verification need neither acceptance.
+An existing destination
 root is pinned. A missing destination is created component-by-component except
 in dry-run, where only its nearest existing ancestor is pinned.
+
+Generic remote shares use handle-bound provider capabilities rather than local
+disk IOCTLs. Known remote NTFS/ReFS/FAT/exFAT names use their filesystem policy;
+an unknown remote name uses content plus exact last-write projection. WSL uses
+exact, case-sensitive destination name matching and the same content/last-write
+projection. Linux uid/gid/mode/xattrs and special-file semantics are never
+invented by the Win32 engine. Network/WSL disconnect codes feed the ordinary
+device-gone breaker; recovery remains abort-and-rerun with no mid-run prompt.
 
 At a source volume root, OS artifacts such as `$RECYCLE.BIN`, `System Volume
 Information`, and page/hibernation files are excluded unless
@@ -129,10 +143,10 @@ There are exactly two verification forms:
 - `bigcp verify SRC DST` reads both entire trees and compares shape, types,
   bytes, all destination-representable named data streams (including streams
   on links), EA blobs, required metadata, directory/root fields, and raw
-  reparse buffers. Extras and omissions fail. On FAT/exFAT the comparison is
-  explicitly projected: success validates every representable field, while
-  warnings/counters describe unsupported source features that could not be
-  preserved.
+  reparse buffers. Extras and omissions fail. On FAT/exFAT, WSL, and unknown
+  remote filesystems the comparison is explicitly projected: success validates
+  every field in that endpoint contract, while warnings/counters describe
+  unsupported source features that could not be preserved.
 
 xxh3-128 detects accidental corruption; it is not a cryptographic integrity
 mechanism. Verification bypasses no honest drive-internal cache guarantee.

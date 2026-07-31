@@ -25,6 +25,7 @@ use windows_sys::Win32::System::Ioctl::{
     StorageAccessAlignmentProperty, StorageAdapterProperty, StorageDeviceSeekPenaltyProperty,
 };
 
+use crate::EndpointKind;
 use crate::util::bool_result;
 use crate::volume::VolumeInfo;
 
@@ -44,6 +45,9 @@ pub enum DeviceBus {
 /// Optional, query-only facts for one mounted volume.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeviceInfo {
+    /// How the filesystem is reached; remote endpoints never expose local
+    /// storage topology IOCTLs.
+    pub endpoint: EndpointKind,
     /// Physical disk numbers backing the volume.
     pub disk_numbers: Vec<u32>,
     /// Whether Windows reports seek penalty.
@@ -69,8 +73,22 @@ pub struct DeviceInfo {
 /// Profiles a volume without requesting read or write access to its device.
 #[must_use]
 pub fn profile_device(volume: &VolumeInfo) -> DeviceInfo {
+    if volume.endpoint.is_remote() {
+        return DeviceInfo {
+            endpoint: volume.endpoint,
+            disk_numbers: Vec::new(),
+            incurs_seek_penalty: None,
+            bus: None,
+            maximum_transfer_length: None,
+            logical_sector: Some(volume.bytes_per_sector),
+            physical_sector: None,
+            write_cache_enabled: None,
+            high_confidence: false,
+        };
+    }
     let Ok(handle) = open_volume_device(volume) else {
         return DeviceInfo {
+            endpoint: volume.endpoint,
             disk_numbers: Vec::new(),
             incurs_seek_penalty: None,
             bus: None,
@@ -105,6 +123,7 @@ pub fn profile_device(volume: &VolumeInfo) -> DeviceInfo {
         .or(Some(volume.bytes_per_sector));
     let physical_sector = alignment.map(|value| value.BytesPerPhysicalSector);
     DeviceInfo {
+        endpoint: volume.endpoint,
         disk_numbers,
         incurs_seek_penalty: seek,
         bus,

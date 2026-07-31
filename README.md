@@ -1,9 +1,10 @@
 # bigcp
 
-`bigcp` is a reliability-first, high-throughput tree copier for local NTFS,
-ReFS, FAT/FAT32, and exFAT volumes on Windows 11 22H2 or later. NTFS/ReFS use
-the strict full-fidelity path; FAT-family destinations use an explicit,
-reduced-fidelity policy. It is optimized for both large-file
+`bigcp` is a reliability-first, high-throughput tree copier for local volumes,
+generic UNC shares, mapped network drives, and WSL UNC paths on Windows 11
+22H2 or later. Local NTFS/ReFS use the strict full-fidelity path; FAT-family
+destinations use an explicit reduced-fidelity policy, while remote endpoints
+use isolated capability and transport policies. It is optimized for both large-file
 streaming and directories containing many small files. Its reliability
 promise is the one that matters: **when a run completes, every reported
 success and failure is exactly true.** If a run is interrupted, re-running it
@@ -44,8 +45,13 @@ treat this build as v1.0 certified until those gates pass. Current evidence and 
   touched, so nothing is ever lost.
 - A real FAT/exFAT destination requires one default-no confirmation before any
   copy work, or `--accept-degraded-filesystem` for deliberate scripted use.
-  UDF/third-party filesystems, remote/mapped volumes, UNC paths, and nested
-  roots are rejected before tree copying.
+- A real copy involving UNC, a mapped remote drive, or WSL requires one
+  default-no confirmation before copy work, or `--accept-remote-paths` for
+  deliberate scripted use. If FAT/exFAT and remote warnings both apply, they
+  share that one startup prompt. Dry-run and standalone verification do not
+  require acceptance.
+- Unsupported local filesystems and nested roots are rejected before tree
+  copying.
 - A machine-wide exact-destination lock prevents two writers from targeting
   the same root.
 - Every terminal outcome is written to versioned JSONL and reconciled in the
@@ -84,6 +90,10 @@ bigcp C:\source D:\destination --plain --verify
 # Noninteractive copy to an intentionally reduced-fidelity FAT/exFAT target
 bigcp C:\source E:\destination --plain --accept-degraded-filesystem
 
+# Noninteractive copy from WSL or a generic share after reviewing remote limits
+bigcp '\\wsl.localhost\Ubuntu\home\me\source' D:\destination --plain --accept-remote-paths
+bigcp C:\source '\\server\share\destination' --plain --accept-remote-paths
+
 # Forecast destination changes without writing the destination tree
 bigcp C:\source D:\destination --dry-run --plain
 
@@ -113,6 +123,7 @@ xxh3-128 digest agrees.
 | `--raw-reparse` | Opt into verbatim unknown reparse buffers. |
 | `--fresh` | Ignore prior partial checkpoints. |
 | `--accept-degraded-filesystem` | Accept FAT/exFAT destination losses without an interactive startup confirmation. |
+| `--accept-remote-paths` | Accept UNC/WSL disconnect, metadata, and remote-durability limits without an interactive startup confirmation. |
 | `--profile CLASS[,CLASS]` | Force static source/destination device classes. |
 | `--tune key=value,...` | Override bounded advanced settings. |
 | `--analyze` | Collect bounded live-run insight (size-class timings, top-20 slowest copies, finer stat samples) into the log and report. |
@@ -142,7 +153,7 @@ topology policy.
 | 0 | Run completed and all attempted objects succeeded. |
 | 2 | One or more objects failed or verification found mismatches. |
 | 3 | Graceful user cancellation; rerun to continue. Cancel takes effect between chunks, so even a huge in-flight file stops promptly and safely. |
-| 4 | Stopped early by the circuit breaker: repeated device-disconnect or disk-full failures. Reconnect the drive or free space, then rerun to resume. |
+| 4 | Stopped early by the circuit breaker: repeated device/share disconnect or disk-full failures. Reconnect the endpoint or free space, then rerun to resume. |
 | 5 | Preflight, configuration, root-lock, or fatal I/O failure. |
 | 6 | Audit, format, or internal invariant failure. |
 
@@ -164,6 +175,22 @@ followed or flattened. FAT also rejects files larger than 4,294,967,295 bytes
 before opening a destination; timestamps outside the driver's FAT-family date
 range fail rather than being silently invented. Verification on these filesystems validates the
 projected contract; it does not claim unsupported metadata survived.
+
+Generic UNC shares preserve the fields their server advertises. Remote roots
+do not receive local-disk IOCTLs, same-spindle scheduling, or dense
+preallocation hints; the automatic profile instead uses bounded buffered I/O
+chosen for redirector latency. Server-side cache durability remains outside
+bigcp's control, even with `--flush`.
+
+`\\wsl.localhost\DISTRO\...` and legacy `\\wsl$\DISTRO\...` are supported and
+share one canonical lock/state identity. WSL names are matched case-sensitively
+when WSL is the destination. Regular-file bytes and last-write time are the
+portable contract; Linux uid/gid/mode/xattrs, special files, Windows
+creation/access times and attributes, ADS/EAs, ACLs, EFS state, sparse layout,
+and reparse objects are not claimed. Unsupported reparse objects fail rather
+than being followed or flattened. Windows access to WSL crosses its 9P
+translation boundary, so native Linux tools remain faster for sustained work
+entirely inside a distribution.
 See [LIMITATIONS.md](LIMITATIONS.md) and the normative
 [docs/SEMANTICS.md](docs/SEMANTICS.md).
 
@@ -232,7 +259,12 @@ or remove that destination object and rerun so bigcp can recreate it.
   NTFS streams, EAs, ACLs, sparse layout, EFS state, or links, and FAT has a
   4 GiB-minus-1-byte file limit. The one-time startup warning makes that loss a
   deliberate choice. NTFS/ReFS retain exact timestamps and their existing
-  capability-based fast path. Local-only remains a separate safety boundary;
-  network filesystems are unsupported.
+  capability-based fast path.
+- **Why does UNC/WSL require acceptance?** A disconnected share can invalidate
+  open handles, optional metadata depends on the server, and a local process
+  cannot attest the server's durable cache state. WSL additionally translates
+  between Windows and Linux semantics. The one-time startup warning records
+  that choice; rerun after a disconnect and use `--verify` or standalone
+  verification for important data.
 
 Licensed under either Apache-2.0 or MIT, at your option.

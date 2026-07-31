@@ -148,10 +148,13 @@ fn category_for(code: Option<i32>, kind: io::ErrorKind) -> ErrorCategory {
         Some(32 | 33) => ErrorCategory::Locked,
         Some(39 | 112) => ErrorCategory::Space,
         Some(23 | 1117) => ErrorCategory::Media,
-        // 21 ERROR_NOT_READY and 55 ERROR_DEV_NOT_EXIST are what removals
-        // surface through many paths; they must trip the same breaker as the
-        // explicit device-gone codes 433/1167.
-        Some(21 | 55 | 433 | 1167) => ErrorCategory::DeviceGone,
+        // Local removals and remote redirector disconnects both invalidate an
+        // in-flight endpoint. Group them so the same five-failure breaker
+        // stops a dead share/WSL distribution instead of walking the tree and
+        // emitting one doomed operation per object.
+        Some(21 | 53 | 55 | 59 | 64 | 67 | 121 | 433 | 1167 | 1222 | 1231 | 1236 | 2250) => {
+            ErrorCategory::DeviceGone
+        }
         Some(80 | 183) => ErrorCategory::DestinationChanged,
         Some(206) => ErrorCategory::Path,
         Some(code) if code == i32::from(0x16A_u16) => ErrorCategory::Cloud,
@@ -173,7 +176,7 @@ fn hint_for(category: ErrorCategory) -> &'static str {
         ErrorCategory::Path => "Check the path and shorten the destination root if necessary",
         ErrorCategory::Space => "Free destination space, then re-run to resume",
         ErrorCategory::Media => "Check the drive and its health before re-running",
-        ErrorCategory::DeviceGone => "Reconnect the device and re-run to resume",
+        ErrorCategory::DeviceGone => "Reconnect the device or remote path and re-run to resume",
         ErrorCategory::FsLimit => {
             "Use a destination filesystem that supports this object type, feature, or size"
         }
@@ -206,6 +209,8 @@ mod tests {
             (112, ErrorCategory::Space),
             (23, ErrorCategory::Media),
             (1167, ErrorCategory::DeviceGone),
+            (64, ErrorCategory::DeviceGone),
+            (1231, ErrorCategory::DeviceGone),
             (206, ErrorCategory::Path),
             (183, ErrorCategory::DestinationChanged),
         ] {

@@ -1,13 +1,13 @@
 # Verifies that the implementation task's three governing inputs remain
 # byte-identical to their last owner-approved revision. Re-pinned 2026-07-30
-# after the owner-authorized same-spindle transport and policy change updated
-# VISION.md, PLAN.md, and LIMITATIONS.md together with ADR 0036.
+# after the owner-authorized UNC/WSL endpoint change updated VISION.md,
+# PLAN.md, and LIMITATIONS.md together with ADR 0037.
 # Re-pin only as the final step of an owner-approved documentation change.
 $ErrorActionPreference = 'Stop'
 $Expected = @{
-    'PLAN.md' = 'DFE35C96636EBBE3E9F3A361BF169EFE567C9D64B35020CECF8A44EFF1B42BD2'
-    'VISION.md' = '739678D0602FEF55D19A988D9FD60B17E21EA4A4EC59D9094F9DDD90A38CB678'
-    'LIMITATIONS.md' = '8FA86A1283BF8B303BBC9713D1A9B61213E23333B9320CD350C3E2D15FC29F54'
+    'PLAN.md' = 'BCEBCB7216E53F8FE5EE08991F81C1AE4EEFC6D38FA9879593096C36C7EFF799'
+    'VISION.md' = 'D8FAD02510CD02192D7D17571C96FAFF9C7673BA4FFC6312705731E91D93EC6B'
+    'LIMITATIONS.md' = '6860A8AF1DC21C3E6E825C2B75210234CD811E8D5BB007F532EA5F266ED7215D'
 }
 
 foreach ($entry in $Expected.GetEnumerator()) {

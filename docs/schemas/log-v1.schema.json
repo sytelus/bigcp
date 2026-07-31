@@ -58,6 +58,22 @@
       "minimum": 1,
       "description": "Maximum staged bytes per read/write phase on profile events."
     },
+    "source_endpoint": {
+      "enum": [
+        "local",
+        "unc",
+        "wsl"
+      ],
+      "description": "Source access endpoint on profile events; absent in older v1 logs."
+    },
+    "destination_endpoint": {
+      "enum": [
+        "local",
+        "unc",
+        "wsl"
+      ],
+      "description": "Destination access endpoint on profile events; absent in older v1 logs."
+    },
     "analysis": {
       "type": "object",
       "description": "Bounded --analyze insight: size-class aggregates plus slowest-copy samples (one event per run).",

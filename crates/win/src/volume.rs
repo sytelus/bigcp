@@ -1,14 +1,26 @@
-//! Volume capability probing and the supported-local-volume pre-flight gate.
+//! Local and remote volume capability probing for pre-flight policy.
 
 use std::ffi::OsString;
+use std::fs::File;
 use std::io;
+use std::mem::size_of;
 use std::os::windows::ffi::OsStringExt;
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 
+use windows_sys::Wdk::Storage::FileSystem::{
+    FILE_FS_ATTRIBUTE_INFORMATION, FileFsAttributeInformation, FileFsSizeInformation,
+    FileFsVolumeInformation, NtQueryVolumeInformationFile,
+};
+use windows_sys::Wdk::System::SystemServices::{
+    FILE_FS_SIZE_INFORMATION, FILE_FS_VOLUME_INFORMATION,
+};
+use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
 use windows_sys::Win32::Storage::FileSystem::{
     GetDiskFreeSpaceExW, GetDiskFreeSpaceW, GetDriveTypeW, GetVolumeInformationW,
     GetVolumePathNameW,
 };
+use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 use windows_sys::Win32::System::SystemServices::{
     FILE_NAMED_STREAMS, FILE_PERSISTENT_ACLS, FILE_SUPPORTS_BLOCK_REFCOUNTING,
     FILE_SUPPORTS_ENCRYPTION, FILE_SUPPORTS_EXTENDED_ATTRIBUTES, FILE_SUPPORTS_POSIX_UNLINK_RENAME,
@@ -16,6 +28,9 @@ use windows_sys::Win32::System::SystemServices::{
 };
 use windows_sys::Win32::System::WindowsProgramming::{DRIVE_NO_ROOT_DIR, DRIVE_REMOTE};
 
+use crate::endpoint::{EndpointKind, classify_endpoint};
+use crate::metadata::open_root;
+use crate::path::final_path;
 use crate::util::{bool_result, wide_null};
 
 /// Supported filesystem families.
@@ -29,6 +44,10 @@ pub enum FileSystem {
     Fat,
     /// Microsoft Extended FAT.
     ExFat,
+    /// Linux filesystem exposed through WSL's UNC provider.
+    Wsl,
+    /// Capability-probed remote filesystem without known timestamp semantics.
+    Remote,
 }
 
 impl FileSystem {
@@ -40,6 +59,8 @@ impl FileSystem {
             Self::Refs => "ReFS",
             Self::Fat => "FAT/FAT32",
             Self::ExFat => "exFAT",
+            Self::Wsl => "WSL/Linux",
+            Self::Remote => "remote filesystem",
         }
     }
 
@@ -56,7 +77,7 @@ impl FileSystem {
             // FAT directory entries carry a 32-bit byte length. The all-ones
             // value is the largest byte count that can be represented.
             Self::Fat => Some(4_294_967_295),
-            Self::Ntfs | Self::Refs | Self::ExFat => None,
+            Self::Ntfs | Self::Refs | Self::ExFat | Self::Wsl | Self::Remote => None,
         }
     }
 }
@@ -82,11 +103,31 @@ pub struct VolumeCapabilities {
     pub posix_unlink_rename: bool,
 }
 
+impl VolumeCapabilities {
+    /// Conservative capability set for providers whose Linux semantics cannot
+    /// be represented by bigcp's Win32 metadata engine.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            named_streams: false,
+            extended_attributes: false,
+            sparse_files: false,
+            encryption: false,
+            reparse_points: false,
+            block_refcounting: false,
+            persistent_acls: false,
+            posix_unlink_rename: false,
+        }
+    }
+}
+
 /// Immutable facts used by pre-flight, tuning, and reports.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VolumeInfo {
     /// Mounted volume root such as an extended C drive root.
     pub root: PathBuf,
+    /// Whether this root is local, generic UNC, or WSL UNC.
+    pub endpoint: EndpointKind,
     /// Filesystem family.
     pub filesystem: FileSystem,
     /// Volume serial number.
@@ -105,7 +146,11 @@ pub struct VolumeInfo {
     pub capabilities: VolumeCapabilities,
 }
 
-/// Probes one existing local path and rejects unsupported filesystems or shares.
+/// Probes one existing local or UNC path.
+///
+/// Local roots retain the original volume-management API path. Remote roots
+/// use handle-bound native volume queries because SMB deliberately does not
+/// implement Win32 volume-management functions.
 pub fn probe_volume(path: &Path) -> io::Result<VolumeInfo> {
     let input = wide_null(path.as_os_str());
     let mut volume_path = vec![0_u16; 32_768];
@@ -120,15 +165,13 @@ pub fn probe_volume(path: &Path) -> io::Result<VolumeInfo> {
     }
     truncate_nul(&mut volume_path);
     let volume_root = PathBuf::from(OsString::from_wide(&volume_path));
+    let endpoint = classify_endpoint(&volume_root);
     let volume_root_wide = wide_null(volume_root.as_os_str());
 
     // SAFETY: volume_root_wide is a live, nul-terminated string.
     let drive_type = unsafe { GetDriveTypeW(volume_root_wide.as_ptr()) };
-    if drive_type == DRIVE_REMOTE {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "bigcp works with local volumes only; mapped network drives are unsupported",
-        ));
+    if drive_type == DRIVE_REMOTE || endpoint.is_remote() {
+        return probe_remote_volume(volume_root, endpoint);
     }
     if drive_type == DRIVE_NO_ROOT_DIR {
         // GetDriveTypeW does not set the thread's last error; surfacing
@@ -160,24 +203,14 @@ pub fn probe_volume(path: &Path) -> io::Result<VolumeInfo> {
     }
     truncate_nul(&mut filesystem);
     let filesystem_name = String::from_utf16_lossy(&filesystem);
-    let filesystem = if filesystem_name.eq_ignore_ascii_case("NTFS") {
-        FileSystem::Ntfs
-    } else if filesystem_name.eq_ignore_ascii_case("ReFS") {
-        FileSystem::Refs
-    } else if filesystem_name.eq_ignore_ascii_case("FAT")
-        || filesystem_name.eq_ignore_ascii_case("FAT32")
-    {
-        FileSystem::Fat
-    } else if filesystem_name.eq_ignore_ascii_case("exFAT") {
-        FileSystem::ExFat
-    } else {
-        return Err(io::Error::new(
+    let filesystem = known_filesystem(&filesystem_name).ok_or_else(|| {
+        io::Error::new(
             io::ErrorKind::Unsupported,
             format!(
                 "bigcp supports NTFS, ReFS, FAT/FAT32, and exFAT local volumes; found {filesystem_name}"
             ),
-        ));
-    };
+        )
+    })?;
 
     let mut sectors_per_cluster = 0_u32;
     let mut bytes_per_sector = 0_u32;
@@ -205,6 +238,7 @@ pub fn probe_volume(path: &Path) -> io::Result<VolumeInfo> {
 
     Ok(VolumeInfo {
         root: volume_root,
+        endpoint,
         filesystem,
         serial,
         maximum_component_length: max_component,
@@ -212,17 +246,234 @@ pub fn probe_volume(path: &Path) -> io::Result<VolumeInfo> {
         cluster_size: u64::from(sectors_per_cluster) * u64::from(bytes_per_sector),
         free_bytes_available: free_for_caller,
         total_bytes,
-        capabilities: VolumeCapabilities {
-            named_streams: flags & FILE_NAMED_STREAMS != 0,
-            extended_attributes: flags & FILE_SUPPORTS_EXTENDED_ATTRIBUTES != 0,
-            sparse_files: flags & FILE_SUPPORTS_SPARSE_FILES != 0,
-            encryption: flags & FILE_SUPPORTS_ENCRYPTION != 0,
-            reparse_points: flags & FILE_SUPPORTS_REPARSE_POINTS != 0,
-            block_refcounting: flags & FILE_SUPPORTS_BLOCK_REFCOUNTING != 0,
-            persistent_acls: flags & FILE_PERSISTENT_ACLS != 0,
-            posix_unlink_rename: flags & FILE_SUPPORTS_POSIX_UNLINK_RENAME != 0,
-        },
+        capabilities: capabilities_from_flags(flags),
     })
+}
+
+fn probe_remote_volume(root: PathBuf, endpoint: EndpointKind) -> io::Result<VolumeInfo> {
+    let handle = open_root(&root)?;
+    let endpoint = if endpoint == EndpointKind::Local {
+        // GetVolumePathNameW returns a drive-letter root for a mapped drive.
+        // Resolve that already-open remote handle once so mapped WSL drives
+        // retain WSL case/capability policy; other mapped drives are UNC.
+        let resolved = final_path(&handle).ok();
+        effective_remote_endpoint(endpoint, resolved.as_deref())
+    } else {
+        endpoint
+    };
+    let attributes = query_remote_attributes(&handle)?;
+    let serial = query_remote_serial(&handle)?;
+    let size = query_remote_struct::<FILE_FS_SIZE_INFORMATION>(&handle, FileFsSizeInformation)?;
+    let bytes_per_sector = size.BytesPerSector;
+    let cluster_size = u64::from(size.SectorsPerAllocationUnit)
+        .checked_mul(u64::from(bytes_per_sector))
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "remote cluster size overflow")
+        })?;
+    if bytes_per_sector == 0 || cluster_size == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "remote filesystem reported a zero sector or cluster size",
+        ));
+    }
+    let total_units = u64::try_from(size.TotalAllocationUnits).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "remote filesystem reported negative total allocation units",
+        )
+    })?;
+    let available_units = u64::try_from(size.AvailableAllocationUnits).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "remote filesystem reported negative available allocation units",
+        )
+    })?;
+    let total_bytes = total_units
+        .checked_mul(cluster_size)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "remote size overflow"))?;
+    let free_bytes_available = available_units
+        .checked_mul(cluster_size)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "remote free-space overflow"))?;
+    let filesystem = if endpoint == EndpointKind::Wsl {
+        FileSystem::Wsl
+    } else {
+        known_filesystem(&attributes.filesystem_name).unwrap_or(FileSystem::Remote)
+    };
+    let flags = attributes.flags;
+    let capabilities = if endpoint == EndpointKind::Wsl {
+        // The 9P provider can expose Linux objects as Windows reparse data,
+        // but bigcp cannot yet recreate Linux uid/gid/mode/xattrs or special
+        // files through its Win32 semantic engine. Do not mistake provider
+        // visibility for destination representability.
+        VolumeCapabilities::none()
+    } else {
+        capabilities_from_flags(flags)
+    };
+    Ok(VolumeInfo {
+        root,
+        endpoint,
+        filesystem,
+        serial,
+        maximum_component_length: u32::try_from(attributes.maximum_component_length).map_err(
+            |_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "remote maximum component length was negative",
+                )
+            },
+        )?,
+        bytes_per_sector,
+        cluster_size,
+        free_bytes_available,
+        total_bytes,
+        capabilities,
+    })
+}
+
+fn effective_remote_endpoint(probed: EndpointKind, resolved: Option<&Path>) -> EndpointKind {
+    if probed.is_remote() {
+        return probed;
+    }
+    resolved.map_or(EndpointKind::Unc, |path| match classify_endpoint(path) {
+        EndpointKind::Local => EndpointKind::Unc,
+        endpoint => endpoint,
+    })
+}
+
+struct RemoteAttributes {
+    flags: u32,
+    maximum_component_length: i32,
+    filesystem_name: String,
+}
+
+fn query_remote_attributes(handle: &File) -> io::Result<RemoteAttributes> {
+    // Filesystem names are normally tiny ("NTFS", "9P", "lxfs"). A fixed
+    // page keeps this query allocation bounded while leaving ample room for a
+    // third-party redirector's identifier.
+    let mut words = vec![0_u64; 4096 / size_of::<u64>()];
+    query_remote_bytes(handle, FileFsAttributeInformation, &mut words)?;
+    let info = words.as_ptr().cast::<FILE_FS_ATTRIBUTE_INFORMATION>();
+    // SAFETY: the buffer is eight-byte aligned and at least one page. The
+    // native query succeeded before these fixed fields are read.
+    let (flags, maximum_component_length, name_bytes, name_ptr) = unsafe {
+        (
+            (*info).FileSystemAttributes,
+            (*info).MaximumComponentNameLength,
+            usize::try_from((*info).FileSystemNameLength)
+                .map_err(|_| io::Error::other("remote filesystem name is too long"))?,
+            (*info).FileSystemName.as_ptr(),
+        )
+    };
+    let name_offset = std::mem::offset_of!(FILE_FS_ATTRIBUTE_INFORMATION, FileSystemName);
+    if !name_bytes.is_multiple_of(size_of::<u16>())
+        || name_offset
+            .checked_add(name_bytes)
+            .is_none_or(|end| end > words.len() * size_of::<u64>())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "remote filesystem returned an invalid name length",
+        ));
+    }
+    // SAFETY: the variable name bounds and UTF-16 alignment were validated.
+    let name = unsafe { std::slice::from_raw_parts(name_ptr, name_bytes / size_of::<u16>()) };
+    Ok(RemoteAttributes {
+        flags,
+        maximum_component_length,
+        filesystem_name: String::from_utf16_lossy(name),
+    })
+}
+
+fn query_remote_serial(handle: &File) -> io::Result<u32> {
+    // FILE_FS_VOLUME_INFORMATION ends in a variable-length volume label. A
+    // fixed `size_of` query works only for an empty/one-code-unit label and
+    // would reject ordinary SMB shares. One bounded page covers Windows label
+    // limits while preserving eight-byte alignment for the fixed header.
+    let mut words = vec![0_u64; 4096 / size_of::<u64>()];
+    query_remote_bytes(handle, FileFsVolumeInformation, &mut words)?;
+    let info = words.as_ptr().cast::<FILE_FS_VOLUME_INFORMATION>();
+    // SAFETY: the aligned page is larger than the fixed portion of the native
+    // structure, and the query succeeded before this field is read.
+    Ok(unsafe { (*info).VolumeSerialNumber })
+}
+
+fn query_remote_struct<T: Default>(handle: &File, class: i32) -> io::Result<T> {
+    let mut value = T::default();
+    let mut status = IO_STATUS_BLOCK::default();
+    // SAFETY: value is an initialized concrete structure of the length passed,
+    // the root handle remains live, and the operation is a synchronous query.
+    let result = unsafe {
+        NtQueryVolumeInformationFile(
+            handle.as_raw_handle().cast(),
+            &raw mut status,
+            (&raw mut value).cast(),
+            u32::try_from(size_of::<T>())
+                .map_err(|_| io::Error::other("remote query structure is too large"))?,
+            class,
+        )
+    };
+    nt_result(result)?;
+    Ok(value)
+}
+
+fn query_remote_bytes(handle: &File, class: i32, words: &mut [u64]) -> io::Result<()> {
+    let mut status = IO_STATUS_BLOCK::default();
+    let length = words
+        .len()
+        .checked_mul(size_of::<u64>())
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| io::Error::other("remote query buffer is too large"))?;
+    // SAFETY: words is writable and naturally aligned, the handle remains
+    // live, and the native call completes synchronously.
+    let result = unsafe {
+        NtQueryVolumeInformationFile(
+            handle.as_raw_handle().cast(),
+            &raw mut status,
+            words.as_mut_ptr().cast(),
+            length,
+            class,
+        )
+    };
+    nt_result(result)
+}
+
+fn nt_result(status: i32) -> io::Result<()> {
+    if status >= 0 {
+        Ok(())
+    } else {
+        // SAFETY: this pure ntdll conversion accepts any NTSTATUS value.
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        Err(io::Error::from_raw_os_error(
+            i32::try_from(code).unwrap_or(i32::MAX),
+        ))
+    }
+}
+
+fn known_filesystem(name: &str) -> Option<FileSystem> {
+    if name.eq_ignore_ascii_case("NTFS") {
+        Some(FileSystem::Ntfs)
+    } else if name.eq_ignore_ascii_case("ReFS") {
+        Some(FileSystem::Refs)
+    } else if name.eq_ignore_ascii_case("FAT") || name.eq_ignore_ascii_case("FAT32") {
+        Some(FileSystem::Fat)
+    } else if name.eq_ignore_ascii_case("exFAT") {
+        Some(FileSystem::ExFat)
+    } else {
+        None
+    }
+}
+
+fn capabilities_from_flags(flags: u32) -> VolumeCapabilities {
+    VolumeCapabilities {
+        named_streams: flags & FILE_NAMED_STREAMS != 0,
+        extended_attributes: flags & FILE_SUPPORTS_EXTENDED_ATTRIBUTES != 0,
+        sparse_files: flags & FILE_SUPPORTS_SPARSE_FILES != 0,
+        encryption: flags & FILE_SUPPORTS_ENCRYPTION != 0,
+        reparse_points: flags & FILE_SUPPORTS_REPARSE_POINTS != 0,
+        block_refcounting: flags & FILE_SUPPORTS_BLOCK_REFCOUNTING != 0,
+        persistent_acls: flags & FILE_PERSISTENT_ACLS != 0,
+        posix_unlink_rename: flags & FILE_SUPPORTS_POSIX_UNLINK_RENAME != 0,
+    }
 }
 
 fn truncate_nul(buffer: &mut Vec<u16>) {
@@ -233,7 +484,8 @@ fn truncate_nul(buffer: &mut Vec<u16>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{FileSystem, probe_volume};
+    use super::{EndpointKind, FileSystem, effective_remote_endpoint, probe_volume};
+    use std::path::Path;
 
     #[test]
     fn system_temp_is_on_a_supported_local_volume() {
@@ -247,6 +499,7 @@ mod tests {
             info.filesystem,
             FileSystem::Ntfs | FileSystem::Refs | FileSystem::Fat | FileSystem::ExFat
         ));
+        assert_eq!(info.endpoint, EndpointKind::Local);
         assert!(info.cluster_size > 0);
     }
 
@@ -260,5 +513,27 @@ mod tests {
         assert!(FileSystem::Fat.is_fat_family());
         assert!(FileSystem::ExFat.is_fat_family());
         assert!(!FileSystem::Ntfs.is_fat_family());
+    }
+
+    #[test]
+    fn mapped_remote_drives_resolve_to_unc_or_wsl_endpoint_policy() {
+        assert_eq!(
+            effective_remote_endpoint(
+                EndpointKind::Local,
+                Some(Path::new(r"\\?\UNC\server\share"))
+            ),
+            EndpointKind::Unc
+        );
+        assert_eq!(
+            effective_remote_endpoint(
+                EndpointKind::Local,
+                Some(Path::new(r"\\?\UNC\wsl.localhost\Ubuntu"))
+            ),
+            EndpointKind::Wsl
+        );
+        assert_eq!(
+            effective_remote_endpoint(EndpointKind::Local, None),
+            EndpointKind::Unc
+        );
     }
 }

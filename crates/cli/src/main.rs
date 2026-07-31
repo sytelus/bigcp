@@ -20,7 +20,7 @@ use clap::{Args, Parser, Subcommand};
 #[command(
     name = "bigcp",
     version,
-    about = "Reliable, high-throughput local NTFS/ReFS/FAT/exFAT tree copy for Windows 11",
+    about = "Reliable, high-throughput local and UNC tree copy for Windows 11",
     disable_help_subcommand = true
 )]
 struct Cli {
@@ -110,6 +110,10 @@ struct CopyFlags {
     /// Accept timestamp/metadata degradation on FAT or exFAT destinations.
     #[arg(long)]
     accept_degraded_filesystem: bool,
+
+    /// Accept UNC/WSL semantic and remote-durability limitations.
+    #[arg(long)]
+    accept_remote_paths: bool,
 
     /// Device class (auto|nvme|sata-ssd|usb-ssd|hdd|unknown), or "SRC,DST".
     #[arg(long, value_parser = parse_profiles, value_name = "CLASS[,CLASS]")]
@@ -208,16 +212,21 @@ fn execute(cli: Cli) -> Result<u8, (u8, String)> {
             let destination = cli
                 .destination
                 .ok_or_else(|| (5, "copy requires SRC and DST; see --help".to_owned()))?;
-            let accept_degraded_filesystem = confirm_preflight_warnings(
+            let acceptance = confirm_preflight_warnings(
                 &source,
                 &destination,
-                std::io::stdin().is_terminal()
-                    && stdout_is_terminal()
-                    && !cli.flags.plain
-                    && !cli.flags.quiet
-                    && !cli.flags.dry_run,
-                cli.flags.accept_degraded_filesystem,
-                cli.flags.dry_run,
+                PreflightWarningOptions {
+                    interactive: std::io::stdin().is_terminal()
+                        && stdout_is_terminal()
+                        && !cli.flags.plain
+                        && !cli.flags.quiet
+                        && !cli.flags.dry_run,
+                    accepted: PreflightAcceptance {
+                        degraded_filesystem: cli.flags.accept_degraded_filesystem,
+                        remote_paths: cli.flags.accept_remote_paths,
+                    },
+                    dry_run: cli.flags.dry_run,
+                },
             )?;
             let mut options = CopyOptions::new(source, destination);
             options.dry_run = cli.flags.dry_run;
@@ -230,7 +239,8 @@ fn execute(cli: Cli) -> Result<u8, (u8, String)> {
             options.analyze = cli.flags.analyze;
             options.raw_reparse = cli.flags.raw_reparse;
             options.fresh = cli.flags.fresh;
-            options.accept_degraded_filesystem = accept_degraded_filesystem;
+            options.accept_degraded_filesystem = acceptance.degraded_filesystem;
+            options.accept_remote_paths = acceptance.remote_paths;
             options.state_dir = cli.flags.state_dir;
             options.log_path = cli.flags.log;
             options.report_path = cli.flags.report;
@@ -268,6 +278,7 @@ fn reject_copy_only_flags(flags: &CopyFlags) -> Result<(), (u8, String)> {
         || flags.raw_reparse
         || flags.fresh
         || flags.accept_degraded_filesystem
+        || flags.accept_remote_paths
         || flags.profile.is_some()
         || flags.tune.is_some()
         || flags.state_dir.is_some()
@@ -381,18 +392,29 @@ fn exit_for_error(error: &bigcp_core::BigcpError) -> u8 {
     }
 }
 
-/// Emits all known pre-copy filesystem/device warnings and prompts at most
-/// once. FAT-family fidelity loss requires explicit acceptance (interactive
-/// `yes` or `--accept-degraded-filesystem`); Quick-removal remains a warning
-/// with an interactive opt-out. Detection failures stay silent and bigcp
-/// never changes device policy itself (ADR 0032/0035).
+#[derive(Clone, Copy)]
+struct PreflightAcceptance {
+    degraded_filesystem: bool,
+    remote_paths: bool,
+}
+
+#[derive(Clone, Copy)]
+struct PreflightWarningOptions {
+    interactive: bool,
+    accepted: PreflightAcceptance,
+    dry_run: bool,
+}
+
+/// Emits all known pre-copy filesystem/endpoint/device warnings and prompts
+/// at most once. FAT-family fidelity loss and remote-path limitations require
+/// explicit acceptance; Quick-removal remains a warning with an interactive
+/// opt-out. Detection failures stay silent and the core repeats every required
+/// acceptance gate before mutation (ADRs 0032/0035/0037).
 fn confirm_preflight_warnings(
     source: &std::path::Path,
     destination: &std::path::Path,
-    interactive: bool,
-    accepted_degradation: bool,
-    dry_run: bool,
-) -> Result<bool, (u8, String)> {
+    options: PreflightWarningOptions,
+) -> Result<PreflightAcceptance, (u8, String)> {
     // `GetVolumePathNameW` is most reliable with an absolute path. Resolve
     // lexically here so a relative, not-yet-created FAT destination can still
     // receive its one interactive acceptance instead of reaching the core
@@ -405,7 +427,7 @@ fn confirm_preflight_warnings(
             Ok(volume) => break volume,
             Err(_) => {
                 if !probe.pop() {
-                    return Ok(accepted_degradation);
+                    return Ok(options.accepted);
                 }
             }
         }
@@ -425,6 +447,24 @@ fn confirm_preflight_warnings(
             }
         );
     }
+    let source_endpoint = source_volume
+        .as_ref()
+        .map_or(bigcp_win::EndpointKind::Local, |volume| volume.endpoint);
+    let remote = source_endpoint.is_remote() || destination_volume.endpoint.is_remote();
+    let wsl = source_endpoint == bigcp_win::EndpointKind::Wsl
+        || destination_volume.endpoint == bigcp_win::EndpointKind::Wsl;
+    if remote {
+        eprintln!(
+            "warning: this copy uses a remote endpoint (source: {}; destination: {}).\n  Network or WSL disconnects can interrupt open handles, and server-side cache durability and\n  optional metadata support cannot be inferred from local disk IOCTLs. bigcp keeps bounded I/O,\n  atomic-or-rerunnable publication, verification, and no retries, but cannot make the remote\n  server durable.{}",
+            source_endpoint.name(),
+            destination_volume.endpoint.name(),
+            if wsl {
+                "\n  WSL access crosses Windows/Linux 9P translation. Linux uid/gid/mode/xattrs and special\n  files are not representable by this Win32 engine; unsupported reparse objects fail, and\n  case-colliding names fail when the destination is case-insensitive. Microsoft recommends\n  native Linux tools for sustained Linux-filesystem workloads because \\\\wsl.localhost I/O is slower."
+            } else {
+                ""
+            }
+        );
+    }
     let device = bigcp_win::profile_device(&destination_volume);
     let quick_removal = device.write_cache_enabled == Some(false);
     if quick_removal {
@@ -439,35 +479,47 @@ fn confirm_preflight_warnings(
         );
     }
 
-    let needs_degradation_confirmation = degraded && !accepted_degradation && !dry_run;
-    if needs_degradation_confirmation && !interactive {
+    let needs_degradation_confirmation =
+        degraded && !options.accepted.degraded_filesystem && !options.dry_run;
+    let needs_remote_confirmation = remote && !options.accepted.remote_paths && !options.dry_run;
+    let needs_required_confirmation = needs_degradation_confirmation || needs_remote_confirmation;
+    if needs_required_confirmation && !options.interactive {
+        let required = if needs_degradation_confirmation && needs_remote_confirmation {
+            "--accept-degraded-filesystem and --accept-remote-paths"
+        } else if needs_degradation_confirmation {
+            "--accept-degraded-filesystem"
+        } else {
+            "--accept-remote-paths"
+        };
         return Err((
             5,
-            "FAT/exFAT destination requires confirmation, but no interactive prompt is available; pass --accept-degraded-filesystem after reviewing the warning"
-                .to_owned(),
+            format!(
+                "copy limitations require confirmation, but no interactive prompt is available; pass {required} after reviewing the warning"
+            ),
         ));
     }
-    if interactive && (needs_degradation_confirmation || quick_removal) {
-        if needs_degradation_confirmation {
-            eprint!("Continue with reduced filesystem fidelity? [y/N] ");
+    if options.interactive && (needs_required_confirmation || quick_removal) {
+        if needs_required_confirmation {
+            eprint!("Continue with the acknowledged copy limitations? [y/N] ");
         } else {
             eprint!("Continue with the current drive policy? [Y/n] ");
         }
         let mut answer = String::new();
         let read = std::io::stdin().read_line(&mut answer);
-        let accepted =
-            read.is_ok() && prompt_answer_accepted(&answer, needs_degradation_confirmation);
+        let accepted = read.is_ok() && prompt_answer_accepted(&answer, needs_required_confirmation);
         if !accepted {
             return Err((
                 5,
                 "aborted before any copying; no destination-tree changes were made".to_owned(),
             ));
         }
-        if needs_degradation_confirmation {
-            return Ok(true);
-        }
+        return Ok(PreflightAcceptance {
+            degraded_filesystem: options.accepted.degraded_filesystem
+                || needs_degradation_confirmation,
+            remote_paths: options.accepted.remote_paths || needs_remote_confirmation,
+        });
     }
-    Ok(accepted_degradation)
+    Ok(options.accepted)
 }
 
 fn prompt_answer_accepted(answer: &str, degradation_confirmation: bool) -> bool {
@@ -567,6 +619,26 @@ mod tests {
         assert!(execute(verify).is_err_and(|(code, message)| {
             code == 5 && message.contains("copy flags are not accepted")
         }));
+    }
+
+    #[test]
+    fn remote_path_acceptance_is_copy_only_and_explicit() {
+        let copy = Cli::try_parse_from([
+            "bigcp",
+            r"\\server\share\source",
+            r"C:\destination",
+            "--accept-remote-paths",
+        ]);
+        assert!(copy.is_ok_and(|value| value.flags.accept_remote_paths));
+
+        let verify = Cli::try_parse_from([
+            "bigcp",
+            "verify",
+            "source",
+            "destination",
+            "--accept-remote-paths",
+        ]);
+        assert!(verify.is_err());
     }
 
     #[test]

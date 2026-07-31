@@ -71,6 +71,10 @@ pub enum AuditEvent {
         source_class: String,
         /// Destination class.
         destination_class: String,
+        /// Source access endpoint.
+        source_endpoint: bigcp_win::EndpointKind,
+        /// Destination access endpoint.
+        destination_endpoint: bigcp_win::EndpointKind,
         /// Composed chunk bytes.
         chunk_bytes: usize,
         /// Small-file worker cap.
@@ -347,6 +351,7 @@ pub fn option_summary(options: &CopyOptions) -> serde_json::Value {
         "raw_reparse": options.raw_reparse,
         "fresh": options.fresh,
         "accept_degraded_filesystem": options.accept_degraded_filesystem,
+        "accept_remote_paths": options.accept_remote_paths,
         "source_profile": options.source_profile,
         "destination_profile": options.destination_profile,
         "tune": options.tune,
@@ -437,6 +442,8 @@ mod tests {
         let encoded = encode_event(&super::AuditEvent::Profile {
             source_class: "Nvme".to_owned(),
             destination_class: "Hdd".to_owned(),
+            source_endpoint: bigcp_win::EndpointKind::Local,
+            destination_endpoint: bigcp_win::EndpointKind::Local,
             chunk_bytes: 8 * 1024 * 1024,
             workers: 32,
             same_physical_disk: false,

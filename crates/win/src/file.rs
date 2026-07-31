@@ -535,10 +535,10 @@ impl DestinationFinal {
     /// Completes the file by optionally flushing and closing its handle.
     pub fn finish(self, flush: bool, final_stamp: Option<BasicMetadata>) -> io::Result<()> {
         if let Some(metadata) = final_stamp {
-            // FAT-family filesystems can update archive/time fields while
-            // data is written. Restamp only those destinations after the
-            // payload lands; NTFS/ReFS keep the measured create-time-only
-            // fast path by passing None.
+            // FAT-family filesystems and remote providers can update
+            // archive/time fields while data is written. Restamp only those
+            // destinations after the payload lands; local NTFS/ReFS keep the
+            // measured create-time-only fast path by passing None.
             set_basic_by_handle(&self.file, metadata)?;
         }
         if flush {

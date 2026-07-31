@@ -7,6 +7,13 @@ versioning once its 1.0 release gates are complete.
 
 ### Added
 
+- Generic UNC, mapped-drive, and WSL UNC source/destination support through an
+  isolated endpoint axis. Remote roots use handle-bound filesystem queries,
+  bounded static redirector profiles, endpoint-aware reporting, and the
+  existing rerun/verification/audit engine without local device IOCTLs or
+  same-spindle guesses. Mutating runs require one startup acceptance or
+  `--accept-remote-paths`; WSL aliases canonicalize and WSL destination names
+  match exactly.
 - Topology-gated same-spindle HDD transport: disk-extent overlap plus
   rotational classification selects bounded small-file read/write batches and
   multi-request dense/sparse/ADS bursts, with effective settings in logs and
@@ -29,6 +36,12 @@ versioning once its 1.0 release gates are complete.
 
 ### Changed
 
+- Kept the local hot paths intact while separating filesystem, endpoint, and
+  physical-device policy. WSL and unknown remote providers use explicit
+  content/last-write projection; remote destinations skip local-volume dense
+  preallocation; common redirector disconnects feed the existing resumable
+  breaker. Updated VISION, PLAN, LIMITATIONS, normative/operator docs, schemas,
+  and ADR 0037, with remote matrix and performance claims left explicitly open.
 - Refactored transport policy and plain-small preparation/publication so the
   same-spindle scheduler can evolve independently while retaining the existing
   engine result, source-stability, checkpoint, filesystem-policy, and atomic

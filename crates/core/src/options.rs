@@ -71,9 +71,16 @@ pub struct CopyOptions {
     ///
     /// The CLI sets this after its one-time interactive confirmation or when
     /// `--accept-degraded-filesystem` is supplied. Library callers must make
-    /// the same decision explicitly; dry-runs are exempt because they write
-    /// nothing.
+    /// the same decision explicitly; dry-runs are exempt because they do not
+    /// mutate the destination tree (audit log/report files are still written).
     pub accept_degraded_filesystem: bool,
+    /// Explicitly accept remote/WSL semantic and durability limitations.
+    ///
+    /// The CLI sets this after its combined startup confirmation or when
+    /// `--accept-remote-paths` is supplied. Library callers must opt in before
+    /// a destination-mutating UNC copy; dry-runs and standalone verification
+    /// are exempt.
+    pub accept_remote_paths: bool,
     /// Optional audit state directory.
     pub state_dir: Option<PathBuf>,
     /// Optional JSONL log path.
@@ -106,6 +113,7 @@ impl CopyOptions {
             raw_reparse: false,
             fresh: false,
             accept_degraded_filesystem: false,
+            accept_remote_paths: false,
             state_dir: None,
             log_path: None,
             report_path: None,

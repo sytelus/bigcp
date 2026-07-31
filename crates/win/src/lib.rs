@@ -13,6 +13,7 @@ mod util;
 
 pub mod device;
 pub mod ea;
+pub mod endpoint;
 pub mod extents;
 pub mod file;
 pub mod lock;
@@ -30,6 +31,7 @@ pub use ea::{
     read_extended_attributes, read_extended_attributes_checked, write_extended_attributes,
     write_extended_attributes_checked,
 };
+pub use endpoint::{EndpointKind, classify_endpoint};
 pub use extents::extent_count;
 pub use file::{
     COPYABLE_ATTRIBUTES, DestinationFinal, DestinationTemp, FAT_COPYABLE_ATTRIBUTES, SourceFile,
@@ -42,7 +44,8 @@ pub use metadata::{
     metadata_at, open_metadata, open_root,
 };
 pub use path::{
-    absolute_extended, display_path, final_path, is_same_or_descendant, ordinal_case_key,
+    absolute_extended, comparison_key, display_path, final_path, is_same_or_descendant,
+    is_same_or_descendant_with, ordinal_case_key,
 };
 pub use reparse::{
     ReparseCopyError, ReparseCopyResult, ReparseData, copy_reparse, read_reparse_data,

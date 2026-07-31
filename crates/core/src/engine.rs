@@ -84,13 +84,15 @@ pub struct EngineRequest<'a> {
     pub checkpoint_threshold: u64,
     /// Whether the destination advertises EFS support.
     pub destination_supports_encryption: bool,
+    /// Whether local-volume dense allocation hints are appropriate.
+    pub destination_supports_preallocation: bool,
     /// Whether protected destination DACLs can exist and need preservation.
     pub destination_supports_persistent_acls: bool,
     /// Whether publication can use POSIX unlink/rename semantics.
     pub destination_supports_posix_unlink_rename: bool,
     /// Source metadata projected to fields the destination can represent.
     pub destination_metadata: bigcp_win::BasicMetadata,
-    /// Whether data writes require a final FAT-family metadata restamp.
+    /// Whether data writes require a final FAT-family/remote metadata restamp.
     pub destination_requires_post_write_stamp: bool,
     /// Graceful-cancel probe checked between chunks so very large files do
     /// not delay a requested stop until they finish (the in-flight temp
@@ -871,8 +873,10 @@ fn copy_streamed(
     } else {
         let temp = DestinationTemp::create(parent, request.run_id, wants_encryption(request))
             .map_err(|error| operation_error("create_dst_temp", request.relative_path, &error))?;
-        temp.preallocate(request.source_snapshot.metadata.size)
-            .map_err(|error| operation_error("preallocate", request.relative_path, &error))?;
+        if request.destination_supports_preallocation {
+            temp.preallocate(request.source_snapshot.metadata.size)
+                .map_err(|error| operation_error("preallocate", request.relative_path, &error))?;
+        }
         (temp, 0, should_hash.then(Xxh3::new))
     };
     let efs_downgraded = efs_downgraded_for(request, &temp);

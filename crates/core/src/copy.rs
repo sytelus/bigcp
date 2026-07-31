@@ -16,11 +16,11 @@ use std::time::{Duration, Instant};
 
 use bigcp_win::{
     DestinationLock, DestinationStream, DirectoryEntry, FileSystem, ObjectKind, ObjectMetadata,
-    SourceStream, VolumeInfo, absolute_extended, clear_extended_attributes_checked, copy_reparse,
-    create_directory, display_path, enumerate_directory, final_path, is_cloud_placeholder,
-    is_compressed, is_same_or_descendant, is_sparse, list_streams, metadata_at, open_root,
-    ordinal_case_key, probe_volume, read_extended_attributes_checked, set_basic_at_checked,
-    write_extended_attributes_checked,
+    SourceStream, VolumeInfo, absolute_extended, classify_endpoint,
+    clear_extended_attributes_checked, comparison_key, copy_reparse, create_directory,
+    display_path, enumerate_directory, final_path, is_cloud_placeholder, is_compressed,
+    is_same_or_descendant_with, is_sparse, list_streams, metadata_at, open_root, probe_volume,
+    read_extended_attributes_checked, set_basic_at_checked, write_extended_attributes_checked,
 };
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
@@ -87,10 +87,8 @@ pub fn run_copy(
 ) -> Result<RunReport, BigcpError> {
     observer.on_message("pre-flight: resolving and pinning roots");
     let preflight = preflight(options)?;
-    let destination_policy = FilesystemPolicy::new(
-        preflight.destination_volume.filesystem,
-        preflight.destination_volume.capabilities,
-    );
+    let destination_policy =
+        FilesystemPolicy::from_volumes(&preflight.source_volume, &preflight.destination_volume);
     let run_id = Uuid::new_v4().simple().to_string();
     let started_at = OffsetDateTime::now_utc();
     let started = format_time(started_at);
@@ -111,6 +109,8 @@ pub fn run_copy(
     audit.emit(&AuditEvent::Profile {
         source_class: format!("{:?}", preflight.profile.source.class),
         destination_class: format!("{:?}", preflight.profile.destination.class),
+        source_endpoint: preflight.profile.source.endpoint,
+        destination_endpoint: preflight.profile.destination.endpoint,
         chunk_bytes: preflight.profile.chunk_bytes,
         workers: preflight.profile.workers,
         same_physical_disk: preflight.profile.same_physical_disk,
@@ -122,6 +122,21 @@ pub fn run_copy(
             "same-spindle HDD topology: using serialized small-file batches and {} MiB phased read/write bursts",
             preflight.profile.transport.burst_bytes / (1024 * 1024)
         ));
+    }
+    if preflight.source_volume.endpoint.is_remote()
+        || preflight.destination_volume.endpoint.is_remote()
+    {
+        let message = format!(
+            "remote topology: source={} destination={}; using bounded buffered I/O and the static redirector profile",
+            preflight.source_volume.endpoint.name(),
+            preflight.destination_volume.endpoint.name()
+        );
+        observer.on_message(&message);
+        audit.emit(&AuditEvent::Warning {
+            kind: "remote_endpoint".to_owned(),
+            rel: None,
+            message,
+        })?;
     }
     if preflight.destination_write_cache_disabled {
         observer.on_message(
@@ -137,15 +152,30 @@ pub fn run_copy(
         })?;
     }
     if destination_policy.is_degraded() {
-        let message = format!(
-            "{} destination: timestamps and attributes are projected to a coarse, range-limited representation; named streams, EAs, sparse layout, EFS, ACLs, and reparse points cannot be preserved{}",
-            destination_policy.filesystem().name(),
-            if destination_policy.maximum_file_size().is_some() {
-                "; files larger than 4 GiB minus 1 byte fail"
-            } else {
-                ""
-            }
-        );
+        let message = if destination_policy.filesystem().is_fat_family() {
+            format!(
+                "{} destination: timestamps and attributes are projected to a coarse, range-limited representation; named streams, EAs, sparse layout, EFS, ACLs, and reparse points cannot be preserved{}",
+                destination_policy.filesystem().name(),
+                if destination_policy.maximum_file_size().is_some() {
+                    "; files larger than 4 GiB minus 1 byte fail"
+                } else {
+                    ""
+                }
+            )
+        } else if matches!(
+            destination_policy.filesystem(),
+            FileSystem::Wsl | FileSystem::Remote
+        ) {
+            format!(
+                "remote semantic projection with {} destination: content and last-write time are preserved; Windows creation/access times and attributes are not claimed, and optional features remain capability-gated",
+                destination_policy.filesystem().name()
+            )
+        } else {
+            format!(
+                "remote source semantic projection onto {}: content and last-write time are preserved; source creation/access times and Windows attributes are not claimed, while optional features remain capability-gated",
+                destination_policy.filesystem().name()
+            )
+        };
         observer.on_message(&message);
         audit.emit(&AuditEvent::Warning {
             kind: "degraded_filesystem".to_owned(),
@@ -694,7 +724,7 @@ impl Runner<'_> {
             }
         };
         let mut destination_map = if destination_exists {
-            match destination_join(&destination) {
+            match destination_join(&destination, self.destination_policy) {
                 Ok(map) => map,
                 Err(error) => {
                     self.counters.dirs_failed = self.counters.dirs_failed.saturating_add(1);
@@ -765,7 +795,10 @@ impl Runner<'_> {
                 }
                 continue;
             }
-            let key = match ordinal_case_key(&source_entry.name) {
+            let key = match comparison_key(
+                &source_entry.name,
+                self.destination_policy.names_are_case_sensitive(),
+            ) {
                 Ok(key) => key,
                 Err(error) => {
                     self.record_entry_failure(
@@ -784,7 +817,7 @@ impl Runner<'_> {
                         ErrorCategory::TypeConflict,
                         "join",
                         PathBuf::new(),
-                        "source directory contains names that collide under Windows case-insensitive matching",
+                        "source directory contains names that collide under the destination's name-matching semantics",
                     ),
                 )?;
                 continue;
@@ -1465,6 +1498,9 @@ impl Runner<'_> {
                     destination_supports_streams: self.destination_policy.supports_streams(),
                     destination_supports_eas: self.destination_policy.supports_eas(),
                     destination_supports_encryption: self.destination_policy.supports_encryption(),
+                    destination_supports_preallocation: self
+                        .destination_policy
+                        .supports_preallocation(),
                     destination_supports_persistent_acls: self
                         .destination_policy
                         .supports_persistent_acls(),
@@ -1596,6 +1632,7 @@ impl Runner<'_> {
             preserve_sparse: self.destination_policy.supports_sparse() && !self.options.no_sparse,
             checkpoint_threshold: self.options.checkpoint_threshold(),
             destination_supports_encryption: self.destination_policy.supports_encryption(),
+            destination_supports_preallocation: self.destination_policy.supports_preallocation(),
             destination_supports_persistent_acls: self
                 .destination_policy
                 .supports_persistent_acls(),
@@ -2732,10 +2769,20 @@ fn preflight(options: &CopyOptions) -> Result<Preflight, BigcpError> {
         .fold(final_ancestor.clone(), |path, component| {
             path.join(component)
         });
-    if is_same_or_descendant(&prospective_destination, &source)
+    let source_endpoint = classify_endpoint(&source);
+    let destination_endpoint = classify_endpoint(&final_ancestor);
+    if is_same_or_descendant_with(
+        &prospective_destination,
+        &source,
+        source_endpoint.names_are_case_sensitive(),
+    )
+    .map_err(|error| BigcpError::io("compare roots", error))?
+        || is_same_or_descendant_with(
+            &source,
+            &prospective_destination,
+            destination_endpoint.names_are_case_sensitive(),
+        )
         .map_err(|error| BigcpError::io("compare roots", error))?
-        || is_same_or_descendant(&source, &prospective_destination)
-            .map_err(|error| BigcpError::io("compare roots", error))?
     {
         return Err(BigcpError::Invalid(
             "source and destination must be distinct, non-nested trees".to_owned(),
@@ -2756,6 +2803,15 @@ fn preflight(options: &CopyOptions) -> Result<Preflight, BigcpError> {
         probe_volume(&source).map_err(|error| BigcpError::io("probe source volume", error))?;
     let destination_volume = probe_volume(&final_ancestor)
         .map_err(|error| BigcpError::io("probe destination volume", error))?;
+    if (source_volume.endpoint.is_remote() || destination_volume.endpoint.is_remote())
+        && !options.accept_remote_paths
+        && !options.dry_run
+    {
+        return Err(BigcpError::Invalid(
+            "UNC/WSL copying requires explicit remote-path acceptance; rerun interactively or pass --accept-remote-paths"
+                .to_owned(),
+        ));
+    }
     if destination_volume.filesystem.is_fat_family()
         && !options.accept_degraded_filesystem
         && !options.dry_run
@@ -2787,8 +2843,12 @@ fn preflight(options: &CopyOptions) -> Result<Preflight, BigcpError> {
             .map_err(|error| BigcpError::io("pin created destination root", error))?;
         let resolved = final_path(&pin)
             .map_err(|error| BigcpError::io("resolve created destination root", error))?;
-        if !is_same_or_descendant(&resolved, &final_ancestor)
-            .map_err(|error| BigcpError::io("revalidate created destination root", error))?
+        if !is_same_or_descendant_with(
+            &resolved,
+            &final_ancestor,
+            destination_endpoint.names_are_case_sensitive(),
+        )
+        .map_err(|error| BigcpError::io("revalidate created destination root", error))?
         {
             return Err(BigcpError::Invalid(
                 "created destination escaped its pinned ancestor through a reparse point"
@@ -2858,10 +2918,18 @@ fn audit_paths(
         ("report", &report_path),
     ] {
         let resolved = prospective_final_path(path)?;
-        if is_same_or_descendant(&resolved, source)
+        if is_same_or_descendant_with(
+            &resolved,
+            source,
+            classify_endpoint(source).names_are_case_sensitive(),
+        )
+        .map_err(|error| BigcpError::io("validate audit path", error))?
+            || is_same_or_descendant_with(
+                &resolved,
+                destination,
+                classify_endpoint(destination).names_are_case_sensitive(),
+            )
             .map_err(|error| BigcpError::io("validate audit path", error))?
-            || is_same_or_descendant(&resolved, destination)
-                .map_err(|error| BigcpError::io("validate audit path", error))?
         {
             return Err(BigcpError::Invalid(format!(
                 "{label} may not be inside the source or destination tree"
@@ -2918,14 +2986,17 @@ fn create_missing_components(base: &Path, missing: &[OsString]) -> Result<(), Bi
     Ok(())
 }
 
-fn destination_join(path: &Path) -> std::io::Result<HashMap<Vec<u16>, DirectoryEntry>> {
+fn destination_join(
+    path: &Path,
+    policy: FilesystemPolicy,
+) -> std::io::Result<HashMap<Vec<u16>, DirectoryEntry>> {
     let mut map = HashMap::new();
     for entry in enumerate_directory(path)? {
-        let key = ordinal_case_key(&entry.name)?;
+        let key = comparison_key(&entry.name, policy.names_are_case_sensitive())?;
         if map.insert(key, entry).is_some() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "destination contains case-insensitive duplicate names",
+                "destination contains duplicate names under its matching semantics",
             ));
         }
     }
@@ -2943,8 +3014,11 @@ fn path_hash(path: &Path) -> Result<String, BigcpError> {
 fn path_hash_parts<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Result<String, BigcpError> {
     let mut hasher = Sha256::new();
     for path in paths {
-        let folded = ordinal_case_key(path.as_os_str())
-            .map_err(|error| BigcpError::io("case-fold path lock identity", error))?;
+        let folded = comparison_key(
+            path.as_os_str(),
+            classify_endpoint(path).names_are_case_sensitive(),
+        )
+        .map_err(|error| BigcpError::io("case-fold path lock identity", error))?;
         for code_unit in folded {
             hasher.update(code_unit.to_le_bytes());
         }
@@ -2957,12 +3031,16 @@ fn same_path(left: &Path, right: &Path) -> Result<bool, BigcpError> {
     let left = absolute_extended(left).map_err(|error| BigcpError::io("normalize path", error))?;
     let right =
         absolute_extended(right).map_err(|error| BigcpError::io("normalize path", error))?;
-    Ok(
-        ordinal_case_key(left.as_os_str())
-            .map_err(|error| BigcpError::io("compare path", error))?
-            == ordinal_case_key(right.as_os_str())
-                .map_err(|error| BigcpError::io("compare path", error))?,
+    Ok(comparison_key(
+        left.as_os_str(),
+        classify_endpoint(&left).names_are_case_sensitive(),
     )
+    .map_err(|error| BigcpError::io("compare path", error))?
+        == comparison_key(
+            right.as_os_str(),
+            classify_endpoint(&right).names_are_case_sensitive(),
+        )
+        .map_err(|error| BigcpError::io("compare path", error))?)
 }
 
 fn format_time(value: OffsetDateTime) -> String {
@@ -2973,6 +3051,29 @@ fn format_time(value: OffsetDateTime) -> String {
 
 fn derive_hints(runner: &Runner<'_>, preflight: &Preflight) -> Vec<Hint> {
     let mut hints = Vec::new();
+    if preflight.source_volume.endpoint.is_remote()
+        || preflight.destination_volume.endpoint.is_remote()
+    {
+        hints.push(Hint {
+            id: "remote_endpoint".to_owned(),
+            text: format!(
+                "Remote endpoint active (source: {}, destination: {}). Re-run after any disconnect; --verify checks the completed tree but cannot force or attest server-side cache durability",
+                preflight.source_volume.endpoint.name(),
+                preflight.destination_volume.endpoint.name()
+            ),
+            confidence: "high".to_owned(),
+        });
+    }
+    if preflight.source_volume.endpoint == bigcp_win::EndpointKind::Wsl
+        || preflight.destination_volume.endpoint == bigcp_win::EndpointKind::Wsl
+    {
+        hints.push(Hint {
+            id: "wsl_interop".to_owned(),
+            text: "WSL UNC access crosses the Windows/Linux 9P boundary. Native Linux copy tools remain faster for sustained Linux-filesystem work; review projected metadata and unsupported reparse failures"
+                .to_owned(),
+            confidence: "high".to_owned(),
+        });
+    }
     if preflight.destination_volume.filesystem.is_fat_family() {
         hints.push(Hint {
             id: "degraded_filesystem".to_owned(),

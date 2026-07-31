@@ -146,6 +146,30 @@ fallbacks selected by the mounted driver. This matrix is not routine CI and
 must be recorded in `TESTING_SUMMARY.md`; absence of that evidence means the
 filesystem is implemented but not matrix-certified.
 
+## Remote endpoint matrix
+
+Routine `cargo test` and `bigcp-testkit` remain local-only by construction; UNC
+support does not weaken the sandbox whitelist above. Pure tests cover ordinary
+and extended UNC normalization, WSL alias canonicalization, local-vs-UNC
+classification, mapped-drive effective policy, exact WSL name keys, projected
+metadata, remote profiles, and redirector error categories.
+
+Live generic-SMB, mapped-drive, or WSL source/destination tests need an
+operator-approved scratch endpoint whose exact share/distribution path is named
+in advance. They may create only a unique test-owned subtree, must use the same
+small routine write budget unless separately approved as heavy, and must never
+reuse an existing user-data tree. A read-only WSL source dry-run may establish
+provider query/enumeration compatibility but is not a write-path or performance
+certification. Remote performance measurements are heavy-tier and require the
+full approval record (paths, files, bytes, duration, and storage impact).
+
+Disconnect behavior is fault-injection-only: do not stop WSL, disconnect a
+share, remove a mapping, or manipulate a server during a test. The approved
+matrix covers direct/extended/legacy aliases, `--accept-remote-paths`, projected
+metadata, WSL exact-case names, unsupported link failure, rerun, and both
+verification forms. Record every executed cell in `TESTING_SUMMARY.md`; missing
+cells remain explicit limitations.
+
 ## Adding a test
 
 1. State its fresh-write ceiling in the test or scenario.
@@ -179,8 +203,9 @@ bounded real-process chaos passes, emitted-instance schema validation,
 synthetic-enumeration scale simulation, and real-hardware throughput gates
 within bounded write budgets require dedicated work and hardware. They are
 release-blocking before a 1.0 claim and run only on explicit owner request;
-the elevated NTFS/ReFS/FAT32/exFAT VHDX matrix and differential OS-copy
-comparisons are post-v1/matrix-certification evidence under ADRs 0029/0035.
+the elevated NTFS/ReFS/FAT32/exFAT VHDX matrix, the approved generic-UNC/
+mapped-drive/WSL destination matrix, and differential OS-copy comparisons are
+  post-v1/matrix-certification evidence under ADRs 0029/0035/0037.
 See PLAN §12.10, §13.2, and `BENCHMARKS.md`.
 Hours-long
 soaks, million-entry real trees, and forced-disconnect tests are not deferred —

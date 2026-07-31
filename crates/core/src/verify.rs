@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 
 use bigcp_win::{
     BasicMetadata, ObjectKind, SourceFile, SourceStream, StreamInfo, absolute_extended,
-    enumerate_directory, final_path, is_same_or_descendant, list_streams, metadata_at, open_root,
-    ordinal_case_key, probe_volume, read_extended_attributes, read_reparse_data,
+    classify_endpoint, comparison_key, enumerate_directory, final_path, is_same_or_descendant_with,
+    list_streams, metadata_at, open_root, probe_volume, read_extended_attributes,
+    read_reparse_data,
 };
 use xxhash_rust::xxh3::Xxh3;
 
@@ -156,10 +157,20 @@ pub fn run_standalone_verify(options: &VerifyOptions) -> Result<VerificationSumm
         final_path(&source_pin).map_err(|error| BigcpError::io("resolve verify source", error))?;
     let destination = final_path(&destination_pin)
         .map_err(|error| BigcpError::io("resolve verify destination", error))?;
-    if is_same_or_descendant(&source, &destination)
+    let source_endpoint = classify_endpoint(&source);
+    let destination_endpoint = classify_endpoint(&destination);
+    if is_same_or_descendant_with(
+        &source,
+        &destination,
+        destination_endpoint.names_are_case_sensitive(),
+    )
+    .map_err(|error| BigcpError::io("compare verify roots", error))?
+        || is_same_or_descendant_with(
+            &destination,
+            &source,
+            source_endpoint.names_are_case_sensitive(),
+        )
         .map_err(|error| BigcpError::io("compare verify roots", error))?
-        || is_same_or_descendant(&destination, &source)
-            .map_err(|error| BigcpError::io("compare verify roots", error))?
     {
         return Err(BigcpError::Invalid(
             "verification roots must be distinct, non-nested trees".to_owned(),
@@ -169,10 +180,7 @@ pub fn run_standalone_verify(options: &VerifyOptions) -> Result<VerificationSumm
         probe_volume(&source).map_err(|error| BigcpError::io("probe verify source", error))?;
     let destination_volume = probe_volume(&destination)
         .map_err(|error| BigcpError::io("probe verify destination", error))?;
-    let policy = FilesystemPolicy::new(
-        destination_volume.filesystem,
-        destination_volume.capabilities,
-    );
+    let policy = FilesystemPolicy::from_volumes(&source_volume, &destination_volume);
     let source_features = VerificationFeatures {
         streams: source_volume.capabilities.named_streams,
         eas: source_volume.capabilities.extended_attributes,
@@ -242,14 +250,14 @@ pub fn run_standalone_verify(options: &VerifyOptions) -> Result<VerificationSumm
             .map_err(|error| BigcpError::io("enumerate verify destination", error))?;
         let mut destination_map = HashMap::new();
         for entry in destination_entries {
-            let key = ordinal_case_key(&entry.name)
-                .map_err(|error| BigcpError::io("case-fold verify destination", error))?;
+            let key = comparison_key(&entry.name, policy.names_are_case_sensitive())
+                .map_err(|error| BigcpError::io("match verify destination name", error))?;
             if destination_map.insert(key, entry).is_some() {
                 summary.failed = summary.failed.saturating_add(1);
                 push_mismatch(
                     &mut summary,
                     format!(
-                        "{}: destination has a case-insensitive name collision",
+                        "{}: destination has a name collision under its matching semantics",
                         relative_dir.display()
                     ),
                 );
@@ -258,14 +266,14 @@ pub fn run_standalone_verify(options: &VerifyOptions) -> Result<VerificationSumm
         let mut source_keys = HashSet::new();
         for source_entry in source_entries {
             let relative = relative_dir.join(&source_entry.name);
-            let key = ordinal_case_key(&source_entry.name)
-                .map_err(|error| BigcpError::io("case-fold verify source", error))?;
+            let key = comparison_key(&source_entry.name, policy.names_are_case_sensitive())
+                .map_err(|error| BigcpError::io("match verify source name", error))?;
             if !source_keys.insert(key.clone()) {
                 summary.failed = summary.failed.saturating_add(1);
                 push_mismatch(
                     &mut summary,
                     format!(
-                        "{}: source case-insensitive name collision",
+                        "{}: source has a name collision under destination matching semantics",
                         relative.display()
                     ),
                 );

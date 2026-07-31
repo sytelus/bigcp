@@ -2,6 +2,70 @@
 
 Latest review: 2026-07-30
 
+## 2026-07-30 UNC and WSL endpoint validation
+
+The owner-authorized UNC/WSL endpoint change passed every routine gate after
+the endpoint, filesystem, profile, prompt, report/schema, documentation, and
+ADR 0037 changes were reconciled. All 110 workspace tests passed with zero
+failures: 8 CLI, 41 core unit, 15 core end-to-end, 8 testkit safety, 2 TUI, and
+36 Windows-boundary tests. New coverage pins ordinary/extended UNC and both WSL
+aliases, guards extended local paths against UNC misclassification, keeps WSL
+name keys exact, projects WSL/unknown-remote basic metadata, isolates known UNC
+NTFS and local NTFS policy, selects mapped-drive endpoint policy, caps remote
+source concurrency, and classifies redirector disconnect failures. The final
+review also moved standalone verification to the same endpoint-aware name join
+as copy.
+
+The post-change gates were:
+
+- `cargo fmt --all -- --check`
+- `cargo check --workspace --all-targets --locked`
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`
+- `cargo test --workspace --all-targets --locked -- --test-threads=1`
+- warning-denied `cargo doc --workspace --no-deps --locked`
+- `cargo build --workspace --release --locked`
+- `cargo deny check` (advisories, bans, licenses, and sources passed; the
+  existing informational `hashbrown` and `syn` duplicate-version warnings
+  remain)
+- `cargo audit` against 1,174 RustSec advisories (no vulnerability across 146
+  locked dependencies)
+- the frozen/governing-input and automated test-storage safety checks
+
+The optimized local NTFS smoke workflow ran in:
+
+`C:\Users\shitals\AppData\Local\Temp\bigcp-unc-wsl-smoke-8ff8522b02874147975466c14d8b3cee`
+
+It generated 3 directories, 5 files, and 78,848 logical bytes; proved dry-run
+left the destination absent; copied and same-run verified all five; converged
+to five skips on rerun; passed standalone strict verification and the
+independent nine-object oracle with zero mismatches/extras; reopened the saved
+report; and parsed all 16 JSONL events.
+
+The final read-only WSL interoperability workflow used `/etc/skel` from the
+existing `u2` distribution and stored only local audit artifacts under:
+
+`C:\Users\shitals\AppData\Local\Temp\bigcp-wsl-final-bf9480a9ef3940c78679e3be2695654b`
+
+Both `\\WSL.LOCALHOST\u2\etc\skel` and legacy
+`\\WSL$\u2\etc\skel` canonicalized to
+`\\wsl.localhost\u2\etc\skel`, reported the `wsl` endpoint, enumerated the
+same three files in dry-run, and left both prospective destinations absent. A
+noninteractive real-copy invocation without `--accept-remote-paths` exited 5,
+named the required flag, and left its destination absent.
+
+No remote destination write, generic SMB/mapped-drive live cell, WSL
+destination cell, disconnect injection, or remote performance test ran. Those
+tests require a separately approved scratch share/distribution path under
+`docs/TESTING.md`; the implemented profiles are not throughput claims.
+
+The owner-approved governing documents were re-pinned to:
+
+| File | SHA-256 |
+|---|---|
+| `PLAN.md` | `BCEBCB7216E53F8FE5EE08991F81C1AE4EEFC6D38FA9879593096C36C7EFF799` |
+| `VISION.md` | `D8FAD02510CD02192D7D17571C96FAFF9C7673BA4FFC6312705731E91D93EC6B` |
+| `LIMITATIONS.md` | `6860A8AF1DC21C3E6E825C2B75210234CD811E8D5BB007F532EA5F266ED7215D` |
+
 ## 2026-07-30 same-spindle transport validation
 
 The owner-authorized same-spindle change passed every routine gate after the

@@ -8,6 +8,8 @@ ADR. ADR 0034 narrows direct writes to plain small files so auxiliary data is
 published transactionally. ADR 0035 supersedes the NTFS/ReFS-only scope with
 an isolated, opt-in FAT/exFAT filesystem policy. ADR 0036 adds a
 topology-gated phased transport for same-spindle HDD copies without changing
-the standard device path.
+the standard device path. ADR 0037 supersedes the local-only network boundary
+with an isolated UNC/WSL endpoint axis, bounded redirector profiles, and one
+explicit remote-copy acceptance without changing local discovery or transport.
 
 The index is filename ordered. `docs/MAINTENANCE.md` maps decisions to code and release checks.
