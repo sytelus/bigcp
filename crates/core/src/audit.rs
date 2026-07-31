@@ -444,13 +444,13 @@ mod tests {
     fn profile_event_contains_only_effective_execution_settings() {
         let encoded = encode_event(&super::AuditEvent::Profile {
             source_class: "Nvme".to_owned(),
-            destination_class: "Hdd".to_owned(),
+            destination_class: "Unknown".to_owned(),
             source_endpoint: bigcp_win::EndpointKind::Local,
-            destination_endpoint: bigcp_win::EndpointKind::Local,
+            destination_endpoint: bigcp_win::EndpointKind::Unc,
             chunk_bytes: 8 * 1024 * 1024,
             workers: 32,
             same_physical_disk: false,
-            transport: crate::transport::TransportKind::Standard,
+            transport: crate::transport::TransportKind::Redirector,
             burst_bytes: 8 * 1024 * 1024,
         });
         assert!(encoded.is_ok());
@@ -459,6 +459,7 @@ mod tests {
             .and_then(|line| serde_json::from_slice::<serde_json::Value>(&line).ok());
         assert!(parsed.as_ref().is_some_and(|value| {
             value.get("workers").and_then(serde_json::Value::as_u64) == Some(32)
+                && value.get("transport").and_then(serde_json::Value::as_str) == Some("redirector")
                 && value.get("streams").is_none()
                 && value.get("enumeration_threads").is_none()
         }));

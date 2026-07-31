@@ -2,6 +2,49 @@
 
 Latest review: 2026-07-31
 
+## 2026-07-31 bounded UNC/WSL redirector throughput refactor
+
+UNC, mapped-drive, and WSL profiles now select an isolated `redirector`
+transport. Streamed dense data, sparse allocated ranges, and named streams use
+two fallibly allocated buffers: a scoped reader fills the next request while
+the caller writes the prior request, with hashing and writes still strictly
+ordered and every pipeline segment capped at a checkpoint boundary.
+Independent non-sparse files that do not require persistent checkpoints can use
+the existing bounded worker pool; round-robin sharding lets several streamed
+files in one directory occupy separate workers. Checkpoint-eligible or sparse
+work remains coordinator-owned, and worker transfers share graceful user and
+breaker cancellation. `mem=` now accounts for two chunks per active
+redirector stream. Local standard and same-spindle selection are unchanged.
+
+Nine focused pipeline tests prove ordered bytes under forced short reads and
+writes, interrupted-write retry, stage-specific I/O failures, actual
+read-ahead/write overlap, short-source and actual-I/O accounting, shared
+cancellation, bounded reader-panic handling, and existing phased-buffer
+behavior. Two dispatch tests pin remote-only parallel streaming and local
+small-file-only behavior; profile tests pin redirector selection and exact
+two-buffer memory caps. During integration validation, removing an unused
+same-spindle scratch allocation exposed one trailing sparse-hole loop that had
+still used the scratch length for progress. The exact sparse/ADS/same-spindle
+test caught the resulting stall; the loop now uses the configured chunk and the
+test completes normally.
+
+All 144 confined workspace tests passed with zero failures: 8 CLI, 58 core
+unit, 16 core end-to-end, 11 testkit safety, 3 TUI, and 48 Windows-boundary
+tests. Formatting, workspace/all-target warning-denied Clippy, warning-denied
+rustdoc, doc tests, the locked release build, governing-input and test-storage
+safety checks, cargo-deny, and cargo-audit passed. Cargo-deny reported only the
+allowed duplicate-version warnings for `hashbrown` and `syn`; RustSec found no
+vulnerability among 146 locked dependencies. PLAN, LIMITATIONS, schemas,
+operator/maintainer docs, changelog, BENCHMARKS, and ADR 0045 now distinguish
+the correctness-tested implementation from the unmeasured H6 speed hypothesis.
+`VISION.md` was not modified and remains at SHA-256
+`B970F59B791A53584FB57698B26CB70A7E7E9D80982B9118F4EF5A4199BE6C28`.
+
+No UNC/WSL write, physical-drive, VHDX, performance, endurance, large-scale, or
+forced-disconnect test ran. A live speed claim still requires an exact
+operator-approved disposable remote path, file/byte budget, duration, and
+storage-impact record under `docs/TESTING.md`.
+
 ## 2026-07-31 output, handle-completion, and test-cap review
 
 This whole-repository pass fixed three concrete safety/correctness gaps.

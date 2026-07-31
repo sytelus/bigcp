@@ -13,6 +13,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use bigcp_win::{
@@ -45,7 +46,7 @@ use crate::report::{
 use crate::stats::{AnalysisCollector, StatsTracker};
 use crate::transport::TransportProfile;
 use crate::verify::{VerificationTarget, verify_written_targets};
-use crate::worker::{CompletedCopy, FileCopyJob, ReplacementWork, SmallFileWorkers};
+use crate::worker::{CompletedCopy, FileCopyJob, FileWorkers, ReplacementWork};
 
 const REPORT_SAMPLE_LIMIT: usize = 100;
 /// Consecutive device-gone/disk-full failures (with no success in between)
@@ -128,9 +129,10 @@ pub fn run_copy(
         || preflight.destination_volume.endpoint.is_remote()
     {
         let message = format!(
-            "remote topology: source={} destination={}; using bounded buffered I/O and the static redirector profile",
+            "remote topology: source={} destination={}; using bounded two-buffer read/write overlap and {} static redirector worker(s)",
             preflight.source_volume.endpoint.name(),
-            preflight.destination_volume.endpoint.name()
+            preflight.destination_volume.endpoint.name(),
+            preflight.profile.workers,
         );
         observer.on_message(&message);
         audit.emit(&AuditEvent::Warning {
@@ -247,7 +249,8 @@ pub fn run_copy(
         ));
     }
 
-    let small_workers = SmallFileWorkers::new(
+    let worker_cancel = Arc::new(AtomicBool::new(false));
+    let file_workers = FileWorkers::new(
         preflight.profile.workers,
         preflight
             .profile
@@ -284,8 +287,10 @@ pub fn run_copy(
         breaker_streak: 0,
         breaker_announced: false,
         dir_outstanding: HashMap::new(),
-        small_workers,
-        small_jobs_outstanding: 0,
+        file_workers,
+        file_jobs_outstanding: 0,
+        next_independent_shard: 0,
+        worker_cancel,
         last_snapshot: Instant::now(),
     };
     if destination_policy.is_degraded() {
@@ -540,8 +545,13 @@ struct Runner<'a> {
     /// Outstanding worker jobs per parent directory, so a directory's exit
     /// waits only for its own files while sibling directories keep copying.
     dir_outstanding: HashMap<PathBuf, usize>,
-    small_workers: SmallFileWorkers,
-    small_jobs_outstanding: usize,
+    file_workers: FileWorkers,
+    file_jobs_outstanding: usize,
+    /// Round-robin shard for independently streamed redirector files. Small
+    /// creates use the separate directory-affine hash below.
+    next_independent_shard: usize,
+    /// Coordinator-owned cancellation state shared with streamed file jobs.
+    worker_cancel: Arc<AtomicBool>,
     last_snapshot: Instant,
 }
 
@@ -564,6 +574,45 @@ enum DirectoryTask {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WorkerDispatch {
+    promote_threshold: Option<u64>,
+    directory_affine: bool,
+}
+
+/// Selects only files whose correctness does not require coordinator-owned
+/// journal access. Local behavior remains small-file-only; redirectors may
+/// additionally stream independent files through the bounded worker pool.
+fn worker_dispatch(
+    transport: TransportProfile,
+    journal_available: bool,
+    unnamed_size: u64,
+    large_threshold: u64,
+    checkpoint_threshold: u64,
+    preserve_sparse: bool,
+) -> Option<WorkerDispatch> {
+    let checkpoint_eligible = journal_available && unnamed_size >= checkpoint_threshold;
+    let redirector_stream =
+        transport.is_redirector() && (!journal_available || unnamed_size < checkpoint_threshold);
+    if preserve_sparse
+        || checkpoint_eligible
+        || (unnamed_size >= large_threshold && !redirector_stream)
+    {
+        return None;
+    }
+    let promote_threshold = if transport.is_redirector() {
+        journal_available.then_some(checkpoint_threshold)
+    } else if journal_available {
+        Some(large_threshold.min(checkpoint_threshold))
+    } else {
+        Some(large_threshold)
+    };
+    Some(WorkerDispatch {
+        promote_threshold,
+        directory_affine: unnamed_size < large_threshold,
+    })
+}
+
 impl Runner<'_> {
     fn copy_tree(
         &mut self,
@@ -584,17 +633,7 @@ impl Runner<'_> {
             destination_metadata,
         });
         while let Some(task) = tasks.pop_back() {
-            if !self.canceled && self.observer.cancellation_requested() {
-                self.canceled = true;
-                self.observer
-                    .on_message("cancellation requested: no new directories will be dispatched");
-                self.publish(RunState::Canceling);
-                self.audit.emit(&AuditEvent::Warning {
-                    kind: "canceled".to_owned(),
-                    rel: None,
-                    message: "user requested a graceful stop".to_owned(),
-                })?;
-            }
+            self.observe_cancellation()?;
             if let Some(category) = self.breaker
                 && !self.breaker_announced
             {
@@ -672,7 +711,7 @@ impl Runner<'_> {
                     // remaining tasks, so sibling directories keep feeding
                     // their affine workers instead of serializing dir-by-dir.
                     if self.dir_outstanding.contains_key(&relative) && !tasks.is_empty() {
-                        self.receive_small_job()?;
+                        self.receive_file_job()?;
                         tasks.push_front(DirectoryTask::Exit {
                             source,
                             destination,
@@ -696,7 +735,26 @@ impl Runner<'_> {
         }
         // Safety net: every directory exit drained its own jobs; this
         // catches anything a stopped (canceled/breaker) walk left in flight.
-        self.drain_small_workers()?;
+        self.drain_file_workers()?;
+        Ok(())
+    }
+
+    fn observe_cancellation(&mut self) -> Result<(), BigcpError> {
+        let requested = self.observer.cancellation_requested();
+        if requested {
+            self.worker_cancel.store(true, Ordering::Release);
+        }
+        if !self.canceled && requested {
+            self.canceled = true;
+            self.observer
+                .on_message("cancellation requested: no new directories will be dispatched");
+            self.publish(RunState::Canceling);
+            self.audit.emit(&AuditEvent::Warning {
+                kind: "canceled".to_owned(),
+                rel: None,
+                message: "user requested a graceful stop".to_owned(),
+            })?;
+        }
         Ok(())
     }
 
@@ -977,7 +1035,7 @@ impl Runner<'_> {
         // sibling directories copying in parallel (a global drain here
         // measurably serialized the whole run directory-by-directory).
         while self.dir_outstanding.contains_key(relative) {
-            self.receive_small_job()?;
+            self.receive_file_job()?;
         }
         if self.options.dry_run || !destination_exists {
             if self.options.dry_run {
@@ -1464,23 +1522,21 @@ impl Runner<'_> {
         // Routing keys on the enumerated unnamed size alone; the engine
         // revalidates at open (section 4.8) and discovers streams itself,
         // and a worker that meets `promote_threshold` hands the file back
-        // untouched so checkpoints and mid-file cancel stay inline-only.
+        // untouched so coordinator-owned checkpoint persistence stays inline.
+        // Redirector-streamed jobs share the coordinator's cancellation bit.
         if dispatch && !self.options.dry_run {
             let unnamed = source.metadata.size;
-            let checkpoint_possible =
-                self.journal.is_some() && unnamed >= self.options.checkpoint_threshold();
             let preserve_sparse = self.destination_policy.supports_sparse()
                 && !self.options.no_sparse
                 && is_sparse(source.metadata.basic.attributes);
-            if unnamed < self.options.large_threshold() && !checkpoint_possible && !preserve_sparse
-            {
-                let promote_threshold = if self.journal.is_some() {
-                    self.options
-                        .large_threshold()
-                        .min(self.options.checkpoint_threshold())
-                } else {
-                    self.options.large_threshold()
-                };
+            if let Some(dispatch) = worker_dispatch(
+                self.transport,
+                self.journal.is_some(),
+                unnamed,
+                self.options.large_threshold(),
+                self.options.checkpoint_threshold(),
+                preserve_sparse,
+            ) {
                 let job = FileCopyJob {
                     source_path: source.path.clone(),
                     destination_path: self.destination_root.join(relative),
@@ -1519,17 +1575,19 @@ impl Runner<'_> {
                     checkpoint_threshold: self.options.checkpoint_threshold(),
                     streams: None,
                     logical_bytes: unnamed,
-                    promote_threshold: Some(promote_threshold),
+                    promote_threshold: dispatch.promote_threshold,
+                    cancel: Arc::clone(&self.worker_cancel),
+                    directory_affine: dispatch.directory_affine,
                     phases: Arc::clone(&self.phases),
                 };
-                return self.submit_small_job(job);
+                return self.submit_file_job(job);
             }
         }
         if self.transport.is_same_spindle() && !self.options.dry_run {
             // The coordinator owns transactional/large files. Letting one run
             // while the phased small-file worker is active would interleave
             // source and destination I/O and undo the same-spindle policy.
-            self.drain_small_workers()?;
+            self.drain_file_workers()?;
         }
         if let Err(error) = revalidate_source(source, relative) {
             return self.record_file(
@@ -1605,13 +1663,12 @@ impl Runner<'_> {
             destination_newer,
         });
         // Every non-dry-run file reaching here copies inline: the fast path
-        // above dispatched everything routable by unnamed size, and promoted
-        // hand-backs re-enter with `dispatch: false`.
+        // above dispatched everything that needs no coordinator-owned journal,
+        // and promoted hand-backs re-enter with `dispatch: false`.
         let mut counters = Counters::default();
-        // Large files copy inline on this thread, so the front end's cancel
-        // flag is polled from inside the chunk loops — a graceful stop no
-        // longer waits for a 40 GiB file to finish (the partial temp
-        // self-deletes or resumes from its last verified checkpoint).
+        // Inline files poll the front end directly. Worker-streamed redirector
+        // files poll the shared atomic mirror instead, so both paths retain
+        // chunk-boundary graceful cancellation.
         let observer = self.observer;
         let cancel_probe = move || observer.cancellation_requested();
         let request = EngineRequest {
@@ -1664,42 +1721,57 @@ impl Runner<'_> {
         })
     }
 
-    fn submit_small_job(&mut self, job: FileCopyJob) -> Result<(), BigcpError> {
-        if self.small_jobs_outstanding >= self.small_workers.capacity() {
-            self.receive_small_job()?;
+    fn submit_file_job(&mut self, job: FileCopyJob) -> Result<(), BigcpError> {
+        if self.file_jobs_outstanding >= self.file_workers.capacity() {
+            self.receive_file_job()?;
         }
-        // Directory-affine shard (see SmallFileWorkers): same-directory
-        // creates serialize on one worker, distinct directories in parallel.
+        // Small creates remain directory-affine (see FileWorkers), while
+        // redirector-streamed files use a separate round-robin shard so the
+        // first independent files in one directory occupy distinct workers.
         let parent = job
             .source_snapshot
             .relative_path
             .parent()
             .unwrap_or_else(|| Path::new(""))
             .to_path_buf();
-        let mut hasher = DefaultHasher::new();
-        parent.hash(&mut hasher);
-        let shard = usize::try_from(hasher.finish()).unwrap_or(usize::MAX);
+        let shard = if job.directory_affine {
+            let mut hasher = DefaultHasher::new();
+            parent.hash(&mut hasher);
+            usize::try_from(hasher.finish()).unwrap_or(usize::MAX)
+        } else {
+            let shard = self.next_independent_shard;
+            self.next_independent_shard = self.next_independent_shard.wrapping_add(1);
+            shard
+        };
         let mut job = job;
         loop {
-            match self.small_workers.try_submit(job, shard)? {
+            match self.file_workers.try_submit(job, shard)? {
                 None => break,
                 Some(returned) => {
                     // The shard's queue is full: drain one completion (which
                     // may be anyone's) and retry — never block with results
                     // unconsumed.
-                    self.receive_small_job()?;
+                    self.receive_file_job()?;
                     job = returned;
                 }
             }
         }
-        self.small_jobs_outstanding = self.small_jobs_outstanding.saturating_add(1);
+        self.file_jobs_outstanding = self.file_jobs_outstanding.saturating_add(1);
         *self.dir_outstanding.entry(parent).or_insert(0) += 1;
         Ok(())
     }
 
-    fn receive_small_job(&mut self) -> Result<(), BigcpError> {
-        let completed = self.small_workers.receive()?;
-        self.small_jobs_outstanding = self.small_jobs_outstanding.saturating_sub(1);
+    fn receive_file_job(&mut self) -> Result<(), BigcpError> {
+        let completed = loop {
+            self.observe_cancellation()?;
+            if let Some(completed) = self
+                .file_workers
+                .receive_timeout(Duration::from_millis(100))?
+            {
+                break completed;
+            }
+        };
+        self.file_jobs_outstanding = self.file_jobs_outstanding.saturating_sub(1);
         let parent = completed
             .source_snapshot
             .relative_path
@@ -1718,9 +1790,9 @@ impl Runner<'_> {
         outcome
     }
 
-    fn drain_small_workers(&mut self) -> Result<(), BigcpError> {
-        while self.small_jobs_outstanding > 0 {
-            self.receive_small_job()?;
+    fn drain_file_workers(&mut self) -> Result<(), BigcpError> {
+        while self.file_jobs_outstanding > 0 {
+            self.receive_file_job()?;
         }
         Ok(())
     }
@@ -1878,6 +1950,7 @@ impl Runner<'_> {
                 // empty error summary); the interrupted temp self-deletes or
                 // stays behind as a verified-checkpoint resume asset.
                 self.canceled = true;
+                self.worker_cancel.store(true, Ordering::Release);
                 self.increment_warning("canceled_mid_file");
                 self.audit.emit(&AuditEvent::Warning {
                     kind: "canceled_mid_file".to_owned(),
@@ -2680,6 +2753,7 @@ impl Runner<'_> {
             self.breaker_streak = self.breaker_streak.saturating_add(1);
             if self.breaker_streak >= BREAKER_THRESHOLD && self.breaker.is_none() {
                 self.breaker = Some(error.category);
+                self.worker_cancel.store(true, Ordering::Release);
             }
         }
         let folder = top_level(&error.path);
@@ -3388,10 +3462,48 @@ fn revalidate_destination(
 mod tests {
     use std::path::Path;
 
-    use super::{completed_exit, path_hash, summarize_phases, validate_audit_layout};
+    use super::{
+        WorkerDispatch, completed_exit, path_hash, summarize_phases, validate_audit_layout,
+        worker_dispatch,
+    };
     use crate::model::Counters;
     use crate::report::VerificationSummary;
     use crate::stats::TimelinePoint;
+    use crate::transport::TransportProfile;
+
+    #[test]
+    fn redirector_dispatches_streamed_files_but_keeps_checkpoint_owners_inline() {
+        const MIB: u64 = 1024 * 1024;
+        const MIB_USIZE: usize = 1024 * 1024;
+        let transport = TransportProfile::redirector(8 * MIB_USIZE);
+        assert_eq!(
+            worker_dispatch(transport, true, 64 * MIB, 16 * MIB, 256 * MIB, false),
+            Some(WorkerDispatch {
+                promote_threshold: Some(256 * MIB),
+                directory_affine: false,
+            })
+        );
+        assert_eq!(
+            worker_dispatch(transport, true, 256 * MIB, 16 * MIB, 256 * MIB, false,),
+            None
+        );
+        assert_eq!(
+            worker_dispatch(transport, true, 8 * MIB, 16 * MIB, 256 * MIB, true),
+            None
+        );
+    }
+
+    #[test]
+    fn standard_transport_dispatch_remains_small_file_only() {
+        const MIB: u64 = 1024 * 1024;
+        const MIB_USIZE: usize = 1024 * 1024;
+        let transport = TransportProfile::standard(8 * MIB_USIZE);
+        assert!(worker_dispatch(transport, true, 8 * MIB, 16 * MIB, 256 * MIB, false).is_some());
+        assert_eq!(
+            worker_dispatch(transport, true, 64 * MIB, 16 * MIB, 256 * MIB, false),
+            None
+        );
+    }
 
     #[test]
     fn every_completed_failure_universe_controls_the_exit_code() {

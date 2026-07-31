@@ -228,8 +228,19 @@ acceptance.
   transport for remote paths.
 - **Remote tuning uses conservative static defaults.** Generic UNC uses an
   8 MiB request/16-worker profile and WSL uses 4 MiB/8 workers in Auto mode.
-  These settings are bounded and correctness-tested, not certified as optimal
-  for every network or provider. `--profile` and `--tune` remain available.
+  Streamed files use two bounded buffers so the next source read can overlap
+  the current destination write. Independent files below the 16 GiB default
+  checkpoint threshold can use separate workers; checkpointed and sparse files
+  stay coordinator-owned. These settings are correctness-tested, not certified
+  as optimal for every network or provider. `--profile` and `--tune` remain
+  available.
+- **A single remote handle still has synchronous I/O depth one.** The pipeline
+  overlaps source and destination stages; it does not issue an unbounded set of
+  SMB requests or bypass the server. Link latency, server disks, signing,
+  encryption, compression policy, antivirus, and provider caching can remain
+  the bottleneck. No generic UNC performance result has been measured yet on
+  an approved scratch share, so compare with robocopy on your own disposable
+  workload before choosing manual overrides.
 - **Generic UNC fidelity depends on the provider.** Known filesystem names use
   their corresponding policy and reported capabilities. Unknown providers
   require regular content and last-write time but do not claim Windows
@@ -268,9 +279,11 @@ standalone verification against the actual provider.
 - **Same-drive SSDs retain the normal parallel transport.** SSDs have no seek
   penalty, so serial HDD phasing would normally reduce useful concurrency.
 - **Large files use Windows buffered I/O.** There is no robocopy-style `/J`
-  unbuffered mode. Windows read-ahead and write-behind are simple and fast on
-  the primary external-drive scenarios, but a huge copy can temporarily evict
-  other applications' cached data. That is harmless and self-correcting.
+  unbuffered mode. Local standard copies alternate one read and write;
+  redirector copies overlap those stages with two bounded buffers. Windows
+  caching is simple and fast on the primary external-drive scenarios, but a
+  huge copy can temporarily evict other applications' cached data. That is
+  harmless and self-correcting.
   Large files are also hashed while being read to protect checkpoint/resume
   integrity; there is no switch to disable that integrity check.
 - **One directory is currently materialized in memory.** Total tree size is

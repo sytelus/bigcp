@@ -2,6 +2,10 @@
 
 **Status:** Accepted
 
+**Transfer-mechanics update:** ADR 0045 supersedes the decision to reuse the
+standard sequential transport. Endpoint semantics, static request/worker
+defaults, acceptance, and recovery policy in this ADR remain in force.
+
 ## Context
 
 The original local-only boundary kept SMB behavior out of the copy engine, but

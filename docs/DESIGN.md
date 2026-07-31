@@ -30,11 +30,11 @@ destination update.
 Plain files are classified from the joined snapshots under one immutable
 destination `FilesystemPolicy`. Stream discovery can promote a nominally small
 file with a large ADS. The single product engine routes plain small work to a
-bounded fixed worker pool and routes auxiliary-data, sparse, and
-large/checkpoint-capable work through its transactional completion strategy on
-the coordinator path. Workers receive immutable snapshots and distinct
-destinations. Only the coordinator mutates counters, audit, report aggregates,
-and journal state.
+bounded fixed worker pool. Redirector paths may also route non-sparse streamed
+files that do not require checkpoint persistence to that pool; checkpointed
+and sparse files remain coordinator-owned. Workers receive immutable snapshots
+and distinct destinations. Only the coordinator mutates counters, audit,
+report aggregates, and journal state.
 
 Plain small files use `DestinationFinal`: workers read and revalidate the
 source, then create or identity-check-and-truncate the final destination before
@@ -45,13 +45,16 @@ with destination-representable ADS/EAs, sparse files, and large/resumable files
 use `DestinationTemp` and atomic publication. Unsupported source ADS/EAs are
 counted and warned but do not force that slower route. Large transfers are
 bounded synchronous streams. The standard transport uses one request-sized
-buffer. When volume disk extents intersect and an effective profile is
+buffer. An immutable `Redirector` transport uses exactly two buffers and a
+scoped reader so one source read overlaps one destination write; hashing and
+writes remain ordered, and pipeline segments stop at checkpoint boundaries.
+When local volume disk extents intersect and an effective profile is
 rotational, an immutable `SameSpindle` transport instead stages a bounded
 multi-request burst before each destination phase; the coordinator drains the
 phased small-file worker before inline work. Plain small files on that topology
 are read/revalidated as one bounded batch, written as one destination phase,
 then source-revalidated before success. Checkpoint boundaries retain exact
-offset-ordered xxh3 snapshots. Both paths
+offset-ordered xxh3 snapshots. All paths
 return the same `EngineResult` and only the coordinator records terminal
 outcomes. Channels and buffers have explicit caps.
 Known symbolic links are created through `CreateSymbolicLinkW` so Developer
@@ -103,8 +106,11 @@ ports:
   existing Win32 local-volume path and uses handle-bound native filesystem
   queries only for redirectors; `device.rs` returns an opaque remote device
   record without local IOCTLs. Core consumes one immutable endpoint/filesystem
-  policy, so remote profiles, case matching, projection, preallocation, and
-  disconnect classification can evolve without touching local hot paths.
+  policy. `core::transport` owns the bounded two-buffer redirector pipeline,
+  and `worker.rs` confines parallel non-checkpointed stream scheduling. Remote
+  profiles, case matching, projection, preallocation, transfer mechanics, and
+  disconnect classification can therefore evolve without touching local hot
+  paths.
 - **Same-spindle transport (implemented):** `transport.rs` owns topology policy
   data and burst mechanics, `worker.rs` owns phased plain-small batching, and
   `engine.rs` applies it to dense/sparse/named streams behind the existing
@@ -134,13 +140,16 @@ Local device discovery uses official query-only IOCTLs: physical extents, bus
 type, seek penalty, sector sizes, and maximum transfer length. Remote discovery
 uses provider-returned volume data and immutable generic-UNC/WSL profiles;
 remote sources cap the composed worker count. Static profiles choose per-side
-chunk size and small-file workers. Intersecting local disk extents plus
+chunk size and workers. Redirector streams use two buffers per active transfer,
+and independent non-checkpointed files may occupy separate workers.
+Intersecting local disk extents plus
 rotational classification select one phased worker and a bounded same-spindle
 burst; SSD overlap stays on the standard path. Manual values are range checked.
 On standard transport the memory override reserves the concurrently live
-coordinator chunk before capping threshold-sized workers; on same-spindle
-transport the drain-before-inline rule permits one direct burst cap. All
-effective transport facts are reported.
+coordinator chunk before capping threshold-sized workers. Redirector accounting
+reserves two coordinator chunks and the larger of one whole-small-file buffer
+or two chunks per worker. On same-spindle transport the drain-before-inline
+rule permits one direct burst cap. All effective transport facts are reported.
 
 The directory join avoids a destination `stat` per source file. Stream and EA
 work is deferred until required. Statistics report application-side rates and

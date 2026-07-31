@@ -1,11 +1,15 @@
-//! Bounded worker pipeline for independent small-file transfers.
+//! Bounded worker pipeline for independent file transfers.
 //!
 //! Scheduling and outcome accounting stay on the coordinator thread. Workers
 //! own immutable snapshots and distinct destination paths, return only a typed
-//! result plus actual-I/O counters, and never write audit state.
+//! result plus actual-I/O counters, and never write audit state. Local paths
+//! dispatch only whole-buffer small files. Redirector paths may also dispatch
+//! streamed files that do not require coordinator-owned checkpoints.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use bigcp_win::StreamInfo;
 use crossbeam_channel::{Receiver, Sender};
@@ -27,7 +31,7 @@ pub(crate) struct ReplacementWork {
     pub destination_newer: bool,
 }
 
-/// Fully owned small-file transfer accepted by the bounded worker queue.
+/// Fully owned transfer accepted by the bounded worker queue.
 pub(crate) struct FileCopyJob {
     pub source_path: std::path::PathBuf,
     pub destination_path: std::path::PathBuf,
@@ -60,6 +64,11 @@ pub(crate) struct FileCopyJob {
     /// Streams at or above this size promote the file back to the
     /// coordinator before any write (see `EngineRequest::promote_threshold`).
     pub promote_threshold: Option<u64>,
+    /// Shared graceful-cancel state polled by streamed worker transfers.
+    pub cancel: Arc<AtomicBool>,
+    /// Small-file creates stay directory-affine; independently streamed files
+    /// use a separate round-robin shard so one directory can use every worker.
+    pub directory_affine: bool,
     /// Measurements owned by this run and shared with every worker.
     pub phases: Arc<PhaseTracker>,
 }
@@ -91,7 +100,7 @@ impl FileCopyJob {
             destination_metadata: self.destination_metadata,
             destination_requires_post_write_stamp: self.destination_requires_post_write_stamp,
             known_streams: self.streams.as_deref(),
-            cancel: &never_cancel,
+            cancel: self.cancel.as_ref(),
             promote_threshold: self.promote_threshold,
             phases: &self.phases,
         }
@@ -139,10 +148,6 @@ fn complete_job(
     }
 }
 
-fn never_cancel() -> bool {
-    false
-}
-
 /// One worker completion awaiting single-threaded accounting and audit.
 pub(crate) struct CompletedCopy {
     /// Absolute source path, retained so a promoted file can rerun inline.
@@ -170,7 +175,7 @@ pub(crate) struct CompletedCopy {
 /// distinct directories proceed in parallel. Queues are deep (jobs are small
 /// metadata records) so the coordinator can run ahead across sibling
 /// directories instead of stalling on the one currently being enumerated.
-pub(crate) struct SmallFileWorkers {
+pub(crate) struct FileWorkers {
     senders: Vec<Sender<FileCopyJob>>,
     receiver: Option<Receiver<CompletedCopy>>,
     handles: Vec<JoinHandle<()>>,
@@ -182,15 +187,15 @@ pub(crate) struct SmallFileWorkers {
 /// hundred KiB per worker, firmly bounded).
 const PER_WORKER_QUEUE: usize = 1024;
 
-impl SmallFileWorkers {
-    /// Starts the static profile's small-file workers.
+impl FileWorkers {
+    /// Starts the static profile's bounded file workers.
     pub fn new(
         worker_count: usize,
         same_spindle_burst_bytes: Option<usize>,
     ) -> Result<Self, BigcpError> {
         if !(1..=256).contains(&worker_count) {
             return Err(BigcpError::Invalid(
-                "small-file worker count must be in 1..=256".to_owned(),
+                "file worker count must be in 1..=256".to_owned(),
             ));
         }
         if same_spindle_burst_bytes.is_some() && worker_count != 1 {
@@ -207,7 +212,7 @@ impl SmallFileWorkers {
                 crossbeam_channel::bounded::<FileCopyJob>(PER_WORKER_QUEUE);
             let results = result_sender.clone();
             let handle = std::thread::Builder::new()
-                .name(format!("bigcp-small-{index}"))
+                .name(format!("bigcp-file-{index}"))
                 .spawn(move || {
                     if let Some(burst_bytes) = same_spindle_burst_bytes {
                         same_spindle_worker_loop(&job_receiver, &results, burst_bytes);
@@ -215,7 +220,7 @@ impl SmallFileWorkers {
                         worker_loop(&job_receiver, &results);
                     }
                 })
-                .map_err(|error| BigcpError::io("start small-file worker", error))?;
+                .map_err(|error| BigcpError::io("start file worker", error))?;
             handles.push(handle);
             senders.push(job_sender);
         }
@@ -245,29 +250,37 @@ impl SmallFileWorkers {
         let index = shard % self.senders.len().max(1);
         let Some(sender) = self.senders.get(index) else {
             return Err(BigcpError::Invariant(
-                "small-file workers already stopped".to_owned(),
+                "file workers already stopped".to_owned(),
             ));
         };
         match sender.try_send(job) {
             Ok(()) => Ok(None),
             Err(crossbeam_channel::TrySendError::Full(job)) => Ok(Some(job)),
             Err(crossbeam_channel::TrySendError::Disconnected(_)) => Err(BigcpError::Invariant(
-                "small-file worker queue disconnected".to_owned(),
+                "file-worker queue disconnected".to_owned(),
             )),
         }
     }
 
-    /// Waits for one submitted job to finish.
-    pub fn receive(&self) -> Result<CompletedCopy, BigcpError> {
-        self.receiver
+    /// Waits for one submitted job while allowing the coordinator to poll its
+    /// front-end cancellation source. `None` is a timeout, not a disconnect.
+    pub fn receive_timeout(&self, timeout: Duration) -> Result<Option<CompletedCopy>, BigcpError> {
+        match self
+            .receiver
             .as_ref()
-            .ok_or_else(|| BigcpError::Invariant("small-file workers already stopped".to_owned()))?
-            .recv()
-            .map_err(|_| BigcpError::Invariant("small-file result queue disconnected".to_owned()))
+            .ok_or_else(|| BigcpError::Invariant("file workers already stopped".to_owned()))?
+            .recv_timeout(timeout)
+        {
+            Ok(completed) => Ok(Some(completed)),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Ok(None),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(BigcpError::Invariant(
+                "file-worker result queue disconnected".to_owned(),
+            )),
+        }
     }
 }
 
-impl Drop for SmallFileWorkers {
+impl Drop for FileWorkers {
     fn drop(&mut self) {
         self.senders.clear();
         drop(self.receiver.take());
@@ -314,7 +327,7 @@ fn same_spindle_worker_loop(
         let mut estimated = usize::try_from(first.logical_bytes).unwrap_or(usize::MAX);
         let mut batch = vec![first];
         while batch.len() < PER_WORKER_QUEUE && estimated < burst_bytes {
-            let next = match jobs.recv_timeout(std::time::Duration::from_millis(2)) {
+            let next = match jobs.recv_timeout(Duration::from_millis(2)) {
                 Ok(job) => job,
                 Err(
                     crossbeam_channel::RecvTimeoutError::Timeout
@@ -424,7 +437,7 @@ fn run_same_spindle_batch(batch: Vec<FileCopyJob>, results: &Sender<CompletedCop
 
 #[cfg(test)]
 mod tests {
-    use super::SmallFileWorkers;
+    use super::FileWorkers;
 
     /// Pins the directory-affinity contract: a shard value must map to a
     /// stable worker index (same directory → same queue). If this fails, the
@@ -432,7 +445,7 @@ mod tests {
     /// see PLAN section 5.8 and BENCHMARKS.md (2026-07-29) before changing.
     #[test]
     fn shard_routing_is_stable_per_directory() {
-        let workers = SmallFileWorkers::new(8, None);
+        let workers = FileWorkers::new(8, None);
         assert!(workers.is_ok());
         let Some(workers) = workers.ok() else {
             return;

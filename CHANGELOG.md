@@ -36,6 +36,15 @@ versioning once its 1.0 release gates are complete.
 
 ### Changed
 
+- 2026-07-31 UNC throughput refactor: added an isolated `redirector`
+  transport that overlaps one synchronous source read with one destination
+  write through exactly two bounded buffers; allowed independent non-sparse,
+  non-checkpointed streamed files to use the existing worker pool; propagated
+  graceful cancellation into those workers; and made `mem=` account for every
+  concurrently live remote buffer. Local standard and same-spindle selection
+  are unchanged. Focused concurrency/correctness tests and ADR 0045 landed;
+  live UNC speed remains benchmark-pending on an operator-approved scratch
+  share, and `VISION.md` remains unchanged.
 - Reorganized `LIMITATIONS.md` as a user-facing decision guide: critical
   pre-copy choices and recovery actions now appear first, repeated engineering
   detail is consolidated into task-oriented sections, and permanent behavior

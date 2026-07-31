@@ -386,6 +386,17 @@ repetition round of the four contenders:
 
 ## Outstanding
 
+**H6 — redirector overlap (registered 2026-07-31, unmeasured):** ADR 0045's
+fixed two-buffer pipeline should reduce idle time by overlapping one source
+read with one destination write, while parallel non-checkpointed streamed files
+should cover independent-file SMB/WSL latency better than the former
+coordinator-only path. Correctness tests prove actual stage overlap, ordering,
+bounded memory, cancellation, and checkpoint routing; they do not prove a
+speedup. The first approved remote experiment must compare the same bounded
+fixture and verification policy across the pre-ADR baseline, current defaults,
+manual thread/chunk sweeps, and robocopy's best applicable `/MT`/`/J` settings,
+with signing/encryption/compression and endpoint topology recorded.
+
 The elevated filesystem matrix, repeated-run certified benchmark protocol,
 ADR 0036 same-spindle HDD comparison, and ADR 0037 generic-UNC/WSL profile
 comparisons remain unexecuted. The same-spindle
@@ -396,7 +407,9 @@ owner approval under `docs/TESTING.md`, including its exact bounded workload,
 target scratch root, write volume, duration, and drive impact. The remote
 8 MiB/16-worker and WSL 4 MiB/8-worker Auto rows are bounded static defaults,
 not measured speedup claims; any network/WSL benchmark additionally requires
-an approved scratch share/distribution path. Endurance,
+an approved scratch share/distribution path. ADR 0045's two-buffer and
+parallel-stream mechanics are likewise benchmark-pending rather than measured
+speedup claims. Endurance,
 million-entry, and competitor sweeps stay prohibited (VISION).
 
 Future entries must record OS build, CPU/RAM, source/destination volume and

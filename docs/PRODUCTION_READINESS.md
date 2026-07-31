@@ -40,14 +40,17 @@ required by the governing plan.
   same-volume integration coverage without changing the SSD/independent path.
 - Isolated UNC/WSL endpoint policy: extended UNC normalization, mapped-drive
   final-path classification, handle-bound remote volume queries, no remote
-  local-device IOCTLs, static bounded redirector profiles, WSL exact-name and
-  basic-metadata projection, combined startup acceptance, and redirector-loss
-  breaker mapping without changing the local transport/profile path.
+  local-device IOCTLs, static bounded redirector profiles, two-buffer ordered
+  read/write overlap, parallel non-checkpointed stream dispatch, shared worker
+  cancellation, WSL exact-name and basic-metadata projection, combined startup
+  acceptance, and redirector-loss breaker mapping without changing either
+  local transport/profile path.
 - Fail-closed Win32/provider parsing for returned lengths, record-local child
   names, sparse-range order, reparse framing, stream suffix containment, and
   embedded-NUL path input.
 - Disjoint resolved log/report/state/journal roles, streaming journal replay,
-  and exact standard-path concurrent-buffer accounting for `mem` overrides.
+  and exact standard/redirector concurrent-buffer accounting for `mem`
+  overrides.
 - Safe one-component temporary identifiers shared across payload, reparse, and
   state paths, with full-UUID candidate names and no path-based artifact cleanup.
 - Complete official Win32 Cloud Files error-family classification and explicit
@@ -67,6 +70,9 @@ lifespan-reducing writes, no machine-stability impact — see PLAN §12.0):
   million-entry behavior via synthetic enumeration simulation, never real trees.
 - The same-spindle HDD `[HW]` cell remains required before claiming a measured
   speedup or universal optimality for the new 256 MiB default.
+- An approved disposable UNC/WSL endpoint matrix remains required before
+  claiming a measured redirector speedup, robocopy parity, or universal
+  optimality for the 8 MiB/16-worker and 4 MiB/8-worker defaults.
 - The final production-validation pass (PLAN §12.10), executed only on
   explicit owner request: chaos/kill-convergence, the adversarial set,
   sentinel/schema checks, and the bounded NTFS benchmark protocol.
@@ -93,4 +99,4 @@ create a certification claim (ADR 0042).
 
 No release process may reinterpret an unrun gate as a pass.
 `TESTING_SUMMARY.md` records dated evidence; intentional differences from
-the governing plan are recorded inline in PLAN.md and in ADRs 0027–0044.
+the governing plan are recorded inline in PLAN.md and in ADRs 0027–0045.

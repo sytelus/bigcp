@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::BigcpError;
 use crate::options::{DeviceClass, TuneOptions};
-use crate::transport::TransportProfile;
+use crate::transport::{REDIRECTOR_PIPELINE_BUFFERS, TransportProfile};
 
 const DEFAULT_SAME_SPINDLE_BURST_BYTES: usize = 256 * 1024 * 1024;
 const MIN_SAME_SPINDLE_BURST_BYTES: usize = 1024 * 1024;
@@ -29,7 +29,7 @@ pub struct SideProfile {
     pub confidence: String,
     /// Preferred chunk bytes.
     pub chunk_bytes: usize,
-    /// Small-file workers.
+    /// Bounded file workers (small files locally, eligible streams remotely).
     pub workers: usize,
 }
 
@@ -42,7 +42,7 @@ pub struct CopyProfile {
     pub destination: SideProfile,
     /// Chunk clamped by both adapters.
     pub chunk_bytes: usize,
-    /// Composed small-file worker count (destination-led, source-HDD-capped).
+    /// Composed file worker count (destination-led, source-HDD/remote-capped).
     pub workers: usize,
     /// True when source and destination extent sets intersect.
     pub same_physical_disk: bool,
@@ -78,6 +78,7 @@ pub fn select_copy_profile(
             .any(|disk| destination_info.disk_numbers.contains(disk));
     let same_spindle = same_physical_disk
         && (source.class == DeviceClass::Hdd || destination.class == DeviceClass::Hdd);
+    let redirector = source_info.endpoint.is_remote() || destination_info.endpoint.is_remote();
     let mut chunk_bytes = tune
         .chunk_bytes
         .unwrap_or_else(|| source.chunk_bytes.min(destination.chunk_bytes));
@@ -96,12 +97,18 @@ pub fn select_copy_profile(
         let chunk_budget = if same_spindle {
             memory_bytes
         } else {
+            let coordinator_chunks = if redirector {
+                REDIRECTOR_PIPELINE_BUFFERS
+            } else {
+                1
+            };
             memory_bytes
                 .checked_sub(large_threshold)
+                .map(|available| available / coordinator_chunks)
                 .filter(|available| *available >= MIN_CHUNK_BYTES)
                 .ok_or_else(|| {
                     BigcpError::Invalid(format!(
-                        "memory budget {memory_bytes} must hold one small-file buffer ({large_threshold}) and a minimum coordinator chunk ({MIN_CHUNK_BYTES})"
+                        "memory budget {memory_bytes} must hold one worker buffer ({large_threshold}) and {coordinator_chunks} minimum coordinator chunk(s) ({MIN_CHUNK_BYTES} bytes each)"
                     ))
                 })?
         };
@@ -129,13 +136,24 @@ pub fn select_copy_profile(
         // while small workers each hold one threshold-bounded file. Reserve
         // that chunk before deriving the worker cap so `mem=` is an actual
         // aggregate copy-buffer bound, not merely a per-allocation bound.
-        let worker_bytes = memory_bytes.saturating_sub(chunk_bytes);
-        if worker_bytes < large_threshold {
+        let coordinator_chunks = if redirector {
+            REDIRECTOR_PIPELINE_BUFFERS
+        } else {
+            1
+        };
+        let coordinator_bytes = chunk_bytes.saturating_mul(coordinator_chunks);
+        let per_worker_bytes = if redirector {
+            large_threshold.max(chunk_bytes.saturating_mul(coordinator_chunks))
+        } else {
+            large_threshold
+        };
+        let worker_bytes = memory_bytes.saturating_sub(coordinator_bytes);
+        if worker_bytes < per_worker_bytes {
             return Err(BigcpError::Invalid(format!(
-                "memory budget {memory_bytes} must hold one chunk ({chunk_bytes}) and one small-file buffer ({large_threshold})"
+                "memory budget {memory_bytes} must hold {coordinator_chunks} coordinator chunk(s) ({chunk_bytes} bytes each) and one worker buffer ({per_worker_bytes})"
             )));
         }
-        let budgeted_workers = (worker_bytes / large_threshold).clamp(1, 256);
+        let budgeted_workers = (worker_bytes / per_worker_bytes).clamp(1, 256);
         source.workers = source.workers.min(budgeted_workers);
         destination.workers = destination.workers.min(budgeted_workers);
         workers = workers.min(budgeted_workers);
@@ -164,6 +182,8 @@ pub fn select_copy_profile(
         // head-seek storm this profile exists to prevent.
         workers = 1;
         TransportProfile::same_spindle(burst_bytes)
+    } else if redirector {
+        TransportProfile::redirector(chunk_bytes)
     } else {
         TransportProfile::standard(chunk_bytes)
     };
@@ -182,7 +202,7 @@ fn validate_tuning(tune: &TuneOptions) -> Result<(), BigcpError> {
         && !(1..=256).contains(&workers)
     {
         return Err(BigcpError::Invalid(
-            "small-file worker count must be in 1..=256".to_owned(),
+            "file worker count must be in 1..=256".to_owned(),
         ));
     }
     if let Some(chunk) = tune.chunk_bytes
@@ -533,7 +553,34 @@ mod tests {
             value.source.endpoint == EndpointKind::Wsl
                 && value.workers == 8
                 && value.chunk_bytes == 4 * 1024 * 1024
+                && value.transport.is_redirector()
                 && !value.transport.is_same_spindle()
+        }));
+    }
+
+    #[test]
+    fn redirector_memory_budget_accounts_for_two_buffers_per_active_stream() {
+        let mut destination = nvme();
+        destination.endpoint = EndpointKind::Unc;
+        destination.disk_numbers.clear();
+        destination.maximum_transfer_length = None;
+        let tune = TuneOptions {
+            memory_bytes: Some(48 * 1024 * 1024),
+            ..TuneOptions::default()
+        };
+        let mut source = nvme();
+        source.maximum_transfer_length = None;
+        let profile = select_copy_profile(
+            &source,
+            &destination,
+            DeviceClass::Auto,
+            DeviceClass::Auto,
+            &tune,
+        );
+        assert!(profile.is_ok_and(|value| {
+            value.transport.is_redirector()
+                && value.chunk_bytes == 8 * 1024 * 1024
+                && value.workers == 2
         }));
     }
 }

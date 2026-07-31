@@ -49,6 +49,7 @@
     "transport": {
       "enum": [
         "standard",
+        "redirector",
         "same_spindle"
       ],
       "description": "Preflight-selected data transport on profile events."
@@ -56,7 +57,7 @@
     "burst_bytes": {
       "type": "integer",
       "minimum": 1,
-      "description": "Maximum staged bytes per read/write phase on profile events."
+      "description": "Standard/redirector request bytes or maximum same-spindle staged bytes on profile events."
     },
     "source_endpoint": {
       "enum": [

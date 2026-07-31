@@ -139,13 +139,18 @@ Accepted profile classes are `auto`, `nvme`, `sata-ssd`, `usb-ssd`, `hdd`, and
 `chunk`, `threads`, `mem`, `large-threshold`, `checkpoint-threshold`, and
 `same-spindle-burst`; byte sizes accept `KiB`, `MiB`, or `GiB`. There are
 no stream-count or queue-depth keys: large files stream through one strictly
-sequential coordinator path, so those settings would not describe real work.
+ordered path, so those settings would not describe real work. Redirector
+transfers use a fixed two-buffer pipeline and may run independent files below
+the checkpoint threshold on the bounded worker pool; local standard transfers
+retain the original request-at-a-time loop.
 Manual bounds are enforced in the core library as well as the CLI: workers are
 `1..=256`, chunks `64 KiB..=64 MiB`, and thresholds
 must be positive. On the standard path, a `mem` budget reserves one coordinator
-chunk and must also hold at least one large-threshold worker buffer; remaining
-bytes cap the worker count. The same-spindle path serializes coordinator and
-worker I/O, so its 256 MiB burst is instead capped directly by `mem`; a
+chunk and must also hold at least one large-threshold worker buffer. The
+redirector path reserves two coordinator chunks and
+`max(large-threshold, 2 × chunk)` for each worker. Remaining bytes cap the
+worker count. The same-spindle path serializes coordinator and worker I/O, so
+its 256 MiB burst is instead capped directly by `mem`; a
 1 MiB–1 GiB override must be at least the larger of the effective chunk and
 small-file threshold.
 The phased scheduler requires one worker, so a same-spindle run rejects an
@@ -184,9 +189,10 @@ projected contract; it does not claim unsupported metadata survived.
 
 Generic UNC shares preserve the fields their server advertises. Remote roots
 do not receive local-disk IOCTLs, same-spindle scheduling, or dense
-preallocation hints; the automatic profile instead uses bounded buffered I/O
-chosen for redirector latency. Server-side cache durability remains outside
-bigcp's control, even with `--flush`.
+preallocation hints. The automatic profile uses bounded buffered requests,
+overlaps one source read with one destination write through two buffers, and
+can run independent non-checkpointed streams on separate workers. Server-side
+cache durability remains outside bigcp's control, even with `--flush`.
 
 `\\wsl.localhost\DISTRO\...` and legacy `\\wsl$\DISTRO\...` are supported and
 share one canonical lock/state identity. WSL names are matched case-sensitively

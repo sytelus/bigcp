@@ -488,7 +488,7 @@ fn draw_report(frame: &mut ratatui::Frame<'_>, report: &RunReport, tab: usize) {
         }
         1 => frame.render_widget(
             Paragraph::new(format!(
-                "Source: {} ({} / {:?})\nDestination: {} ({} / {:?})\nTransport: {:?}  Same physical disk: {}\nChunk: {} bytes  Burst: {} bytes  Workers: {}\nDurability: {}  Audit: {}",
+                "Source: {} ({} / {:?})\nDestination: {} ({} / {:?})\nTransport: {:?}  Same physical disk: {}\nChunk: {} bytes  Request/burst: {} bytes  Workers: {}\nDurability: {}  Audit: {}",
                 report.run.source,
                 report.devices.source.endpoint.name(),
                 report.devices.source.class,

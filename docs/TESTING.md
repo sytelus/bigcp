@@ -160,7 +160,9 @@ Routine `cargo test` and `bigcp-testkit` remain local-only by construction; UNC
 support does not weaken the sandbox whitelist above. Pure tests cover ordinary
 and extended UNC normalization, WSL alias canonicalization, local-vs-UNC
 classification, mapped-drive effective policy, exact WSL name keys, projected
-metadata, remote profiles, and redirector error categories.
+metadata, remote profiles, redirector error categories, two-buffer ordering and
+actual stage overlap, short-I/O accounting, cancellation, memory budgets, and
+the checkpoint/sparse worker-dispatch boundary (ADR 0045).
 
 Live generic-SMB, mapped-drive, or WSL source/destination tests need an
 operator-approved scratch endpoint whose exact share/distribution path is named
@@ -168,8 +170,11 @@ in advance. They may create only a unique test-owned subtree, must use the same
 small routine write budget unless separately approved as heavy, and must never
 reuse an existing user-data tree. A read-only WSL source dry-run may establish
 provider query/enumeration compatibility but does not establish write-path or
-performance coverage. Remote performance measurements are heavy-tier and require the
-full approval record (paths, files, bytes, duration, and storage impact).
+performance coverage. Remote performance measurements are heavy-tier and
+require the full approval record (paths, files, bytes, duration, and storage
+impact). An ADR 0045 throughput run must also record SMB/WSL provider, link
+topology, signing/encryption/compression state, bigcp transport/chunk/workers,
+verification mode, and the exact competitor command.
 
 Disconnect behavior is fault-injection-only: do not stop WSL, disconnect a
 share, remove a mapping, or manipulate a server during a test. The approved
