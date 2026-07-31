@@ -73,8 +73,6 @@ pub enum AuditEvent {
         destination_class: String,
         /// Composed chunk bytes.
         chunk_bytes: usize,
-        /// Concurrent stream cap.
-        streams: usize,
         /// Small-file worker cap.
         workers: usize,
         /// Whether volume extents intersect.
@@ -208,20 +206,34 @@ impl AuditWriter {
 
     /// Emits one complete JSON object or fails rather than continuing unaudited.
     pub fn emit(&mut self, event: &AuditEvent) -> Result<(), BigcpError> {
-        let envelope = Envelope {
-            ts: format_timestamp(OffsetDateTime::now_utc()),
-            event,
-        };
-        let mut line = serde_json::to_vec(&envelope)
+        let line = encode_event(event)
             .map_err(|error| BigcpError::Format(format!("serialize log event: {error}")))?;
-        line.push(b'\n');
         if let Err(first) = write_atomic_line(&mut self.file, &line) {
-            if self.reopen_and_retry(&line).is_err() && self.failover_and_retry(&line).is_err() {
-                return Err(BigcpError::Audit(format!(
-                    "JSONL log failed at {} and fallback {} was unavailable: {first}",
-                    self.primary_path.display(),
-                    self.fallback_path.display()
-                )));
+            let first_message = first.error.to_string();
+            let retried = if first.safe_to_retry {
+                self.reopen_and_retry(&line)
+            } else {
+                Err(first)
+            };
+            if let Err(last) = retried {
+                // A partial append that could not be truncated away poisons
+                // its file: any further append there would follow torn JSON.
+                // A poisoned primary is abandoned by failing over to the
+                // distinct fallback path; a poisoned fallback has nowhere
+                // safe left, so the run stops making audit claims.
+                if !last.safe_to_retry && self.current_path == self.fallback_path {
+                    return Err(BigcpError::Audit(format!(
+                        "JSONL fallback log {} tore an event that could not be rolled back: {first_message}",
+                        self.fallback_path.display()
+                    )));
+                }
+                if let Err(failover) = self.failover_and_retry(&line) {
+                    return Err(BigcpError::Audit(format!(
+                        "JSONL log failed at {}; failover to {} also failed: {first_message}; {failover}",
+                        self.primary_path.display(),
+                        self.fallback_path.display()
+                    )));
+                }
             }
         }
         if self.last_flush.elapsed() >= Duration::from_secs(2) {
@@ -259,8 +271,12 @@ impl AuditWriter {
         self.degraded
     }
 
-    fn reopen_and_retry(&mut self, line: &[u8]) -> io::Result<()> {
-        self.file = open_log(&self.current_path)?;
+    fn reopen_and_retry(&mut self, line: &[u8]) -> Result<(), LineWriteFailure> {
+        // A failed open appends nothing, so retrying elsewhere stays safe.
+        self.file = open_log(&self.current_path).map_err(|error| LineWriteFailure {
+            error,
+            safe_to_retry: true,
+        })?;
         write_atomic_line(&mut self.file, line)
     }
 
@@ -268,16 +284,20 @@ impl AuditWriter {
         self.file = open_log(&self.fallback_path)?;
         self.current_path.clone_from(&self.fallback_path);
         self.degraded = true;
-        write_atomic_line(&mut self.file, line)?;
+        write_atomic_line(&mut self.file, line).map_err(|failure| failure.error)?;
         // The switch must be visible in both channels (PLAN section 5.15):
-        // note it inside the new log stream and on stderr, best-effort — a
-        // failing notice must not fail the successful failover itself.
-        let notice = format!(
-            "{{\"ev\":\"warning\",\"kind\":\"log_failover\",\"message\":\"JSONL log failed over from {} to {}\"}}\n",
-            self.primary_path.display(),
-            self.fallback_path.display()
-        );
-        let _ = write_atomic_line(&mut self.file, notice.as_bytes());
+        // note it inside the new log stream and on stderr. A rolled-back
+        // notice failure gets one reopen retry; an unrepairable partial or a
+        // failed retry closes the run so later events never follow torn JSON.
+        let notice = encode_event(&failover_notice(&self.primary_path, &self.fallback_path))
+            .map_err(io::Error::other)?;
+        if let Err(first) = write_atomic_line(&mut self.file, &notice) {
+            if !first.safe_to_retry {
+                return Err(first.error);
+            }
+            self.file = open_log(&self.fallback_path)?;
+            write_atomic_line(&mut self.file, &notice).map_err(|failure| failure.error)?;
+        }
         eprintln!(
             "bigcp: JSONL log failed over from {} to {}",
             self.primary_path.display(),
@@ -285,6 +305,28 @@ impl AuditWriter {
         );
         Ok(())
     }
+}
+
+fn failover_notice(primary: &Path, fallback: &Path) -> AuditEvent {
+    AuditEvent::Warning {
+        kind: "log_failover".to_owned(),
+        rel: None,
+        message: format!(
+            "JSONL log failed over from {} to {}",
+            primary.display(),
+            fallback.display()
+        ),
+    }
+}
+
+fn encode_event(event: &AuditEvent) -> Result<Vec<u8>, serde_json::Error> {
+    let envelope = Envelope {
+        ts: format_timestamp(OffsetDateTime::now_utc()),
+        event,
+    };
+    let mut line = serde_json::to_vec(&envelope)?;
+    line.push(b'\n');
+    Ok(line)
 }
 
 /// Returns a compact, audit-safe option summary.
@@ -316,11 +358,27 @@ fn open_log(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
-fn write_atomic_line(file: &mut File, line: &[u8]) -> io::Result<()> {
-    let before = file.seek(io::SeekFrom::End(0))?;
+struct LineWriteFailure {
+    error: io::Error,
+    /// True when no bytes were appended or a successful truncation restored
+    /// the exact pre-write length, so reopening the same path cannot append
+    /// after a torn JSON object.
+    safe_to_retry: bool,
+}
+
+fn write_atomic_line(file: &mut File, line: &[u8]) -> Result<(), LineWriteFailure> {
+    let before = file
+        .seek(io::SeekFrom::End(0))
+        .map_err(|error| LineWriteFailure {
+            error,
+            safe_to_retry: true,
+        })?;
     if let Err(error) = file.write_all(line) {
-        let _ = file.set_len(before);
-        return Err(error);
+        let safe_to_retry = file.set_len(before).is_ok();
+        return Err(LineWriteFailure {
+            error,
+            safe_to_retry,
+        });
     }
     Ok(())
 }
@@ -336,4 +394,56 @@ fn format_timestamp(timestamp: OffsetDateTime) -> String {
     timestamp
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| timestamp.unix_timestamp().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{encode_event, failover_notice};
+
+    #[test]
+    fn failover_notice_is_a_complete_escaped_event() {
+        let event = failover_notice(
+            Path::new(r#"C:\primary\odd"name.log"#),
+            Path::new(r"C:\fallback\audit.log"),
+        );
+        let encoded = encode_event(&event);
+        assert!(encoded.is_ok());
+        let parsed = encoded
+            .ok()
+            .and_then(|line| serde_json::from_slice::<serde_json::Value>(&line).ok());
+        assert!(parsed.as_ref().is_some_and(|value| {
+            value
+                .get("ts")
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+                && value.get("ev").and_then(serde_json::Value::as_str) == Some("warning")
+                && value.get("kind").and_then(serde_json::Value::as_str) == Some("log_failover")
+                && value
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|message| message.contains("odd\"name.log"))
+        }));
+    }
+
+    #[test]
+    fn profile_event_contains_only_effective_execution_settings() {
+        let encoded = encode_event(&super::AuditEvent::Profile {
+            source_class: "Nvme".to_owned(),
+            destination_class: "Hdd".to_owned(),
+            chunk_bytes: 8 * 1024 * 1024,
+            workers: 32,
+            same_physical_disk: false,
+        });
+        assert!(encoded.is_ok());
+        let parsed = encoded
+            .ok()
+            .and_then(|line| serde_json::from_slice::<serde_json::Value>(&line).ok());
+        assert!(parsed.as_ref().is_some_and(|value| {
+            value.get("workers").and_then(serde_json::Value::as_u64) == Some(32)
+                && value.get("streams").is_none()
+                && value.get("enumeration_threads").is_none()
+        }));
+    }
 }

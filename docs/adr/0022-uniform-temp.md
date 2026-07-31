@@ -1,6 +1,6 @@
 # ADR 0022: Use temp publication for every file
 
-**Status:** Accepted
+**Status:** Superseded by ADR 0030
 
 ## Context
 

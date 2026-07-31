@@ -110,7 +110,7 @@ struct CopyFlags {
     #[arg(long, value_parser = parse_profiles, value_name = "CLASS[,CLASS]")]
     profile: Option<(DeviceClass, DeviceClass)>,
 
-    /// Comma-separated overrides: chunk, streams, threads, mem,
+    /// Comma-separated overrides: chunk, threads, mem,
     /// large-threshold, checkpoint-threshold (sizes accept KiB/MiB/GiB).
     #[arg(long, value_parser = parse_tune, value_name = "KEY=VALUE,...")]
     tune: Option<TuneOptions>,
@@ -307,7 +307,6 @@ fn parse_tune(value: &str) -> Result<TuneOptions, String> {
             .ok_or_else(|| format!("tune item lacks '=': {item}"))?;
         match key {
             "chunk" => tune.chunk_bytes = Some(parse_size_usize(raw)?),
-            "streams" => tune.streams = Some(parse_positive(raw, key)?),
             "threads" => tune.threads = Some(parse_positive(raw, key)?),
             "mem" => tune.memory_bytes = Some(parse_size_usize(raw)?),
             "large-threshold" => tune.large_threshold = Some(parse_size(raw)?),
@@ -453,6 +452,12 @@ mod tests {
     #[test]
     fn zero_tuning_values_are_rejected() {
         let parsed = Cli::try_parse_from(["bigcp", "source", "destination", "--tune", "threads=0"]);
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn removed_nonfunctional_stream_tuning_is_rejected() {
+        let parsed = Cli::try_parse_from(["bigcp", "source", "destination", "--tune", "streams=2"]);
         assert!(parsed.is_err());
     }
 }

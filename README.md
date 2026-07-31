@@ -5,20 +5,20 @@ ReFS volumes on Windows 11 22H2 or later. It is optimized for both large-file
 streaming and directories containing many small files. Its reliability
 promise is the one that matters: **when a run completes, every reported
 success and failure is exactly true.** If a run is interrupted, re-running it
-detects and repairs everything unfinished — including partial files an
-interruption may leave at their final names (small files write directly for
-speed; because each is truncated when created, an interrupted partial is
-always shorter than its source and can never be mistaken for a finished
-copy). Very large files still go through opaque temporaries so resumed
-partials are verified, never trusted.
+detects and repairs everything unfinished — including partial plain files an
+interruption may leave at their final names (plain small files write directly
+for speed; an interrupted data write is shorter than its source, while a file
+whose whole unnamed payload landed is already a valid logical copy). Files
+with ADS/EAs, sparse files, and large files go through opaque temporaries so a
+multi-part logical file publishes atomically and resumed partials are verified,
+never trusted.
 
-The repository is currently **pre-1.0**. The engine, safety contract, and
-performance work are complete and measured (bigcp leads robocopy on every
-measured small-file cell with default settings; see `BENCHMARKS.md`). What
-separates this build from a 1.0 claim is validation evidence only — the
-final production-validation pass defined in PLAN §12.10, which runs on
-explicit owner request. Do not treat this build as v1.0 certified until it
-has run. Current evidence and status are summarized in
+The repository is currently **pre-1.0**. The ordinary-tree engine, safety
+contract, and measured performance work are implemented (bigcp leads robocopy
+on every measured small-file cell with default settings; see `BENCHMARKS.md`).
+A bounded fallback for exceptionally large single directories and the final
+production-validation pass in PLAN §12.10 remain before a 1.0 claim. Do not
+treat this build as v1.0 certified until those gates pass. Current evidence and status are summarized in
 [docs/PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md).
 
 ## Safety contract
@@ -28,10 +28,11 @@ has run. Current evidence and status are summarized in
 - A completed run's report is exact: every success and failure it states is
   true. Until a run reports success, treat the destination as in progress —
   an interrupted run may leave incomplete files that the next run replaces.
-- Large-file replacements are written to a new temporary, revalidated, then
-  atomically renamed. Small-file replacements overwrite in place (keeping
-  the destination file's permissions); if interrupted, the rerun replaces
-  them — the source is never touched, so nothing is ever lost.
+- Files with ADS/EAs, sparse files, and large files are written to a new
+  temporary, revalidated, then atomically renamed. Plain small-file
+  replacements overwrite in place (keeping the destination file's
+  permissions); if interrupted, the rerun replaces them — the source is never
+  touched, so nothing is ever lost.
 - FAT, exFAT, remote/mapped network volumes, UNC paths, and nested roots are
   rejected before tree copying.
 - A machine-wide exact-destination lock prevents two writers from targeting
@@ -89,7 +90,7 @@ xxh3-128 digest agrees.
 | `--dry-run` | Model changes; never create or mutate the destination tree. |
 | `--verify` | Read back only files written by this run. |
 | `--replace=false` | Report differing existing files without replacing them. |
-| `--flush` | Flush each final file after rename and metadata. |
+| `--flush` | Flush each completed file after data and metadata; large files are flushed after publication. |
 | `--include-system` | Include root OS artifacts excluded by default. |
 | `--skip-cloud` | Skip placeholders instead of hydrating them. |
 | `--no-sparse` | Write sparse source files densely. |
@@ -103,12 +104,12 @@ xxh3-128 digest agrees.
 
 Accepted profile classes are `auto`, `nvme`, `sata-ssd`, `usb-ssd`, `hdd`, and
 `unknown` (the conservative fallback profile). Advanced tune keys are
-`chunk`, `streams`, `threads`, `mem`, `large-threshold`, and
+`chunk`, `threads`, `mem`, `large-threshold`, and
 `checkpoint-threshold`; byte sizes accept `KiB`, `MiB`, or `GiB`. There are
-no queue-depth keys: large files stream through a strictly sequential
-pipeline, so there is no queue depth to tune.
+no stream-count or queue-depth keys: large files stream through one strictly
+sequential coordinator path, so those settings would not describe real work.
 Manual bounds are enforced in the core library as well as the CLI: workers are
-`1..=256`, concurrent streams `1..=16`, chunks `64 KiB..=64 MiB`, and thresholds
+`1..=256`, chunks `64 KiB..=64 MiB`, and thresholds
 must be positive. A `mem` budget must hold at least one large-threshold buffer
 and caps both chunk size and threshold-sized workers.
 
@@ -154,9 +155,10 @@ measured at **~3.4× on a 20,000-file workload** (BENCHMARKS.md):
   - **"Enable write caching on the device": CHECK IT.** This is where the
     speedup lives (Windows batches metadata into large flushes). The risk is
     bounded: if power fails or the drive is unplugged early, recently
-    written files are lost or incomplete — and re-running bigcp detects and
-    repairs exactly that. Always use **Safely Remove Hardware** before
-    unplugging.
+    written files can be lost or incomplete. A rerun repairs ordinary
+    size/mtime-visible damage; follow unsafe removal with standalone
+    `bigcp verify` because cache loss can occasionally preserve those fields.
+    Always use **Safely Remove Hardware** before unplugging.
   - **"Turn off Windows write-cache buffer flushing": LEAVE IT UNCHECKED.**
     That setting tells Windows the device is battery-backed and suppresses
     the flush commands NTFS relies on to keep its own journal consistent.
@@ -166,10 +168,11 @@ measured at **~3.4× on a 20,000-file workload** (BENCHMARKS.md):
 
 By default a completed run guarantees *logical* completion: recently written
 data can still sit in the OS or drive cache. Either run with `--flush`
-(per-file flush after rename and metadata) or use Windows "Safely Remove
+(per-file flush after data, publication where applicable, and metadata) or use Windows "Safely Remove
 Hardware" before unplugging an external destination. Unplugging without
-either can lose the tail of an otherwise successful copy; a rerun detects and
-repairs it, but only after the drive is reconnected.
+either can lose acknowledged data. Reconnect the drive, rerun, and then use
+standalone `bigcp verify`; if it reports a same-size/same-time mismatch, move
+or remove that destination object and rerun so bigcp can recreate it.
 
 ## FAQ
 
@@ -179,20 +182,21 @@ repairs it, but only after the drive is reconnected.
 - **Why did a rerun recopy a file I saw complete?** The run was interrupted
   after data landed but before metadata; the mismatch makes the rerun replace
   it with a fully finished copy. That is the crash-safety design working.
-- **What are `.bigcp-…part` files?** Opaque in-flight temps for large files.
-  In-process kills remove them automatically; a resumable large-file partial
-  persists on purpose and is verified before reuse. Anything the journal
+- **What are `.bigcp-…part` files?** Opaque in-flight temps for transactional
+  files (ADS/EA, sparse, or large). In-process kills remove them automatically;
+  a resumable large-file partial persists on purpose and is verified before reuse. Anything the journal
   cannot prove bigcp created is reported, never auto-deleted.
 - **A run was interrupted — can I trust the destination?** Not until a rerun
-  completes. Small files write directly to their final names for speed, so an
-  interruption can leave partial files there. They can never be mistaken for
-  finished copies (each file is truncated at creation, so a partial is always
-  shorter than its source), and re-running the same command finds and
-  replaces every one of them.
+  completes. Plain small files write directly to their final names for speed,
+  so an interruption can leave partial files there. They cannot be mistaken for a
+  completed data write: a mid-write file is shorter than its source; a file
+  that reached full size and exact completion metadata already contains its
+  complete unnamed payload. Re-running the same command finds and replaces
+  every detectable incomplete copy.
 - **Why is a second run on the same destination refused?** One run per exact
   destination root per machine, by design (run lock).
 - **Why NTFS/ReFS only, local volumes only?** See LIMITATIONS.md — the
-  restriction buys exact timestamps, stable file IDs, and atomic replaces.
+  restriction buys exact timestamps, stable file IDs, and transactional publication.
   Note that ReFS support is best-effort at v1 (code-reviewed, not yet
   certified by its dedicated test matrix); NTFS is the fully verified path,
   and `bigcp verify` validates any copy regardless of filesystem.

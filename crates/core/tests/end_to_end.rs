@@ -11,7 +11,8 @@ use bigcp_testkit::sandbox::{initialize_empty, validated_system_temp};
 use bigcp_testkit::{SandboxRoot, check_trees};
 use bigcp_win::{
     BasicMetadata, DestinationStream, DestinationTemp, ExtendedAttributes, SourceStream,
-    StreamInfo, clear_extended_attributes, read_extended_attributes, write_extended_attributes,
+    StreamInfo, clear_extended_attributes, is_sparse, metadata_at, read_extended_attributes,
+    write_extended_attributes,
 };
 
 const FIXTURE_WRITE_BUDGET: u64 = 16 * 1024 * 1024;
@@ -80,8 +81,10 @@ fn copy_rerun_and_both_verification_forms_converge() -> Result<(), Box<dyn std::
     let sparse_path = source.join("sparse.bin");
     let mut sparse = DestinationTemp::create(&source, "fixture", false)?;
     sparse.mark_sparse()?;
-    sparse.set_len(4 * 1024 * 1024)?;
-    sparse.seek(SeekFrom::Start(3 * 1024 * 1024))?;
+    // Deliberately below the 4 MiB worker threshold: sparse preservation is
+    // a storage-fidelity decision, not a large-file-only optimization.
+    sparse.set_len(1024 * 1024)?;
+    sparse.seek(SeekFrom::Start(768 * 1024))?;
     sparse.write_all(&vec![0x3c_u8; 4096])?;
     sparse.flush()?;
     sparse.commit(
@@ -132,6 +135,11 @@ fn copy_rerun_and_both_verification_forms_converge() -> Result<(), Box<dyn std::
         source_sparse_bytes, destination_sparse_bytes,
         "sparse logical content differs"
     );
+    assert!(
+        metadata_at(&destination.join("sparse.bin"))
+            .is_ok_and(|value| is_sparse(value.basic.attributes)),
+        "small sparse source lost its sparse destination representation"
+    );
     assert_eq!(first.run.exit, 0, "copy errors: {:?}", first.errors);
     assert_eq!(first.counters.failed, 0);
     assert_eq!(first.counters.copied_new, 3);
@@ -178,7 +186,7 @@ fn copy_rerun_and_both_verification_forms_converge() -> Result<(), Box<dyn std::
 }
 
 #[test]
-fn dry_run_never_creates_destination_and_replacement_is_atomic()
+fn dry_run_never_creates_destination_and_direct_replacement_converges()
 -> Result<(), Box<dyn std::error::Error>> {
     let allowed_temp = validated_system_temp()?;
     let lease = tempfile::Builder::new()
@@ -238,6 +246,73 @@ fn dry_run_never_creates_destination_and_replacement_is_atomic()
             .is_some_and(|value| !value.file_name().to_string_lossy().starts_with(".bigcp-"))),
         "completed replacement left an opaque temporary"
     );
+    Ok(())
+}
+
+#[test]
+fn replace_false_preserves_bytes_and_audits_the_withheld_change()
+-> Result<(), Box<dyn std::error::Error>> {
+    let sandbox = SandboxRoot::create_system_temp("replace-false")?;
+    let source = sandbox.child(Path::new("source"))?;
+    let destination = sandbox.child(Path::new("destination"))?;
+    fs::create_dir(&source)?;
+    fs::create_dir(&destination)?;
+    fs::write(source.join("different.txt"), b"new source bytes")?;
+    fs::write(destination.join("different.txt"), b"old")?;
+
+    let mut options = CopyOptions::new(source, destination.clone());
+    options.state_dir = Some(sandbox.child(Path::new("state"))?);
+    options.replace = false;
+    let report = run_copy(&options, &SilentObserver)?;
+
+    assert_eq!(report.run.exit, 0);
+    assert_eq!(report.counters.skipped_diff, 1);
+    assert_eq!(fs::read(destination.join("different.txt"))?, b"old");
+    let audit = fs::read_to_string(&report.run.log_path)?;
+    let withheld = audit.lines().find_map(|line| {
+        serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .filter(|event| {
+                event.get("ev").and_then(serde_json::Value::as_str) == Some("file")
+                    && event.get("action").and_then(serde_json::Value::as_str)
+                        == Some("skipped_diff")
+            })
+    });
+    assert!(withheld.as_ref().is_some_and(|event| {
+        event
+            .pointer("/replacement/old_size")
+            .and_then(serde_json::Value::as_u64)
+            == Some(3)
+            && event
+                .pointer("/replacement/differences")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|fields| fields.iter().any(|field| field == "size"))
+    }));
+    Ok(())
+}
+
+#[test]
+fn direct_replacement_handles_a_read_only_destination() -> Result<(), Box<dyn std::error::Error>> {
+    let sandbox = SandboxRoot::create_system_temp("read-only-replacement")?;
+    let source = sandbox.child(Path::new("source"))?;
+    let destination = sandbox.child(Path::new("destination"))?;
+    fs::create_dir(&source)?;
+    fs::create_dir(&destination)?;
+    fs::write(source.join("replace.txt"), b"replacement bytes")?;
+    let destination_file = destination.join("replace.txt");
+    fs::write(&destination_file, b"old")?;
+    let mut permissions = fs::metadata(&destination_file)?.permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(&destination_file, permissions)?;
+
+    let mut options = CopyOptions::new(source, destination);
+    options.state_dir = Some(sandbox.child(Path::new("state"))?);
+    let report = run_copy(&options, &SilentObserver)?;
+
+    assert_eq!(report.run.exit, 0, "errors: {:?}", report.errors);
+    assert_eq!(report.counters.copied_replaced, 1);
+    assert_eq!(fs::read(&destination_file)?, b"replacement bytes");
+    assert!(!fs::metadata(destination_file)?.permissions().readonly());
     Ok(())
 }
 

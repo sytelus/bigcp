@@ -1,6 +1,6 @@
 # ADR 0027: Complexity-control simplification
 
-**Status:** Accepted
+**Status:** Accepted; unbuffered-engine decision superseded by ADR 0028
 
 ## Context
 

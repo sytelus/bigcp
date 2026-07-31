@@ -4,6 +4,7 @@
 //! own immutable snapshots and distinct destination paths, return only a typed
 //! result plus actual-I/O counters, and never write audit state.
 
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use bigcp_win::StreamInfo;
@@ -12,6 +13,7 @@ use crossbeam_channel::{Receiver, Sender};
 use crate::engine::{EngineRequest, EngineResult, copy_file};
 use crate::error::{BigcpError, OperationError};
 use crate::model::{Counters, EntrySnapshot};
+use crate::phase::PhaseTracker;
 
 /// Replacement decision facts retained until coordinator finalization.
 pub(crate) struct ReplacementWork {
@@ -46,6 +48,8 @@ pub(crate) struct FileCopyJob {
     /// Streams at or above this size promote the file back to the
     /// coordinator before any write (see `EngineRequest::promote_threshold`).
     pub promote_threshold: Option<u64>,
+    /// Measurements owned by this run and shared with every worker.
+    pub phases: Arc<PhaseTracker>,
 }
 
 impl FileCopyJob {
@@ -73,6 +77,7 @@ impl FileCopyJob {
             // at the coordinator is responsive enough for this path.
             cancel: &|| false,
             promote_threshold: self.promote_threshold,
+            phases: &self.phases,
         };
         // A panicking engine call must still produce a completion: the
         // coordinator's blocking `receive` would otherwise deadlock forever

@@ -26,15 +26,21 @@ pass; stream, EA, and metadata handles must match those identities before any
 destination update.
 
 Plain files are classified from the joined snapshots. Stream discovery can
-promote a nominally small file with a large ADS. Small work enters a bounded
-fixed worker pool; large, sparse, and checkpoint-capable work stays on the
+promote a nominally small file with a large ADS. Plain small work enters a
+bounded fixed worker pool; auxiliary-data and sparse work uses the
+transactional engine, while large/checkpoint-capable work stays on the
 coordinator path. Workers receive immutable snapshots and distinct
 destinations. Only the coordinator mutates counters, audit, report aggregates,
 and journal state.
 
-Both data paths use `DestinationTemp` and the same finalizer. Large transfers
-are bounded synchronous streams today; checkpoint boundaries retain exact
-offset-ordered xxh3 snapshots. Channels and buffers have explicit caps.
+Plain small files use `DestinationFinal`: workers read and revalidate the
+source, then create or identity-check-and-truncate the final destination before
+one whole-buffer unnamed-stream write. Files with ADS/EAs, sparse files, and
+large/resumable files use `DestinationTemp` and atomic publication. Large
+transfers are bounded synchronous streams;
+checkpoint boundaries retain exact offset-ordered xxh3 snapshots. Both paths
+return the same `EngineResult` and only the coordinator records terminal
+outcomes. Channels and buffers have explicit caps.
 Known symbolic links are created through `CreateSymbolicLinkW` so Developer
 Mode can authorize unelevated creation; junction and opted-in unknown tags use
 the raw reparse control path. All are built under owned opaque sibling names.
@@ -65,14 +71,14 @@ future ports:
 
 - **UNC/network:** add a path/volume backend that returns network capabilities
   and a network profile; do not add SMB behavior to current local wrappers.
-- **Same-volume acceleration:** add a separately capability-gated stream
-  primitive behind the common finalizer. Classification, audit, and verify do
-  not change.
+- **Same-volume acceleration:** add a separately capability-gated transport
+  behind the existing result/accounting contract. Classification, audit, and
+  verification do not change.
 - **FAT/exFAT:** add a filesystem policy implementing timestamp projection,
   feature degradation, and size limits. The current exact NTFS/ReFS policy
   remains untouched.
 - **Linux/macOS/WSL:** replace `bigcp-win` with a platform facade providing
-  path identity, enumeration snapshots, temp publication, streams/xattrs,
+  path identity, enumeration snapshots, completion/publication, streams/xattrs,
   sparse extents, and reparse/link equivalents. Core owns no UTF-8 assumption;
   Windows paths remain lossless UTF-16 in audit keys.
 
@@ -85,8 +91,7 @@ and metadata guarantees.
 
 Device discovery uses official query-only IOCTLs: physical extents, bus type,
 seek penalty, sector sizes, and maximum transfer length. Static profiles choose
-per-side chunk size, stream cap, and
-small-file workers. Manual values are range checked; the memory override caps
+per-side chunk size and small-file workers. Manual values are range checked; the memory override caps
 both chunk size and the number of threshold-sized small-file workers.
 Same-disk extent overlap is reported.
 
@@ -100,8 +105,8 @@ cost on seek-penalty media. bigcp counters this structurally, exploiting the
 one thing a copier always knows that ordinary writers do not: the final size
 before the first byte. Dense large files are preallocated to their full source
 size at temp creation (`FileAllocationInfo`, never `SetFileValidData`), so the
-allocator reserves the whole run in one decision and concurrent streams cannot
-interleave each other's extents. Small files are read whole and written in a
+allocator reserves the whole run in one decision and later writers cannot
+interleave allocations into that file. Small files are read whole and written in a
 single shot — one allocation event, one extent (or MFT-resident storage).
 Sparse files are deliberately exempt: dense preallocation would destroy the
 holes being preserved, so their layout mirrors the source's own. This stance
@@ -114,13 +119,16 @@ regression that quietly drops preallocation.
 
 - No source write handles.
 - No arbitrary destination deletion primitive.
-- No direct final-name writes or in-place truncation.
+- Direct final-name writes are limited to plain small files; replacement
+  truncation follows same-handle validation of the classification snapshot
+  (identity, kind, size, mtime, attributes, reparse tag). ADS/EA, sparse,
+  and large files are transactional.
 - No unbounded channels.
 - No journal-powered skip.
 - No audit artifacts inside active trees.
 - No filesystem write probes during profiling.
 - No alternate product copy backend hidden behind an option.
 
-Known intentional differences from the frozen plan are recorded inline at
+Known intentional differences from the governing plan are recorded inline at
 their PLAN.md sections and in the ADRs (0027–0032); there is no separate
 deviations file.

@@ -1,14 +1,16 @@
 # Copy semantics (normative v1 contract)
 
-This document is the single user-facing normative copy contract. `PLAN.md` is
-the frozen engineering input; this file describes the implemented v1 behavior.
+This document is the single user-facing normative copy contract. `PLAN.md`
+contains the governing engineering design; this file describes the implemented
+pre-1.0 behavior intended for v1.
 
 ## Object equality and outcomes
 
 For an ordinary file, `Same` means exact unnamed-stream size and exact
 last-write `FILETIME`. Differences only in the copyable attribute mask or
 creation time are repaired without rewriting data. Any size or last-write
-difference is atomically replaced unless `--replace=false`. Destination-only
+difference is replaced unless `--replace=false`. Large-file publication is
+atomic; small-file replacement is direct and recoverable by rerun. Destination-only
 objects are extras and are never changed. A file/directory/reparse type conflict
 fails and is never auto-resolved.
 
@@ -36,24 +38,30 @@ Compression and filesystem/HSM-managed attributes follow destination policy.
 
 ## Completion and replacement
 
-Every file, including a new small file, follows one protocol:
+Every file starts by opening the source read-only and validating its enumeration
+snapshot. A replacement target is revalidated for identity, kind, size,
+last-write time, attributes, and reparse tag before mutation.
 
-1. Open the source read-only and validate its enumeration snapshot.
-2. Create a unique `.bigcp-<full-run-id>-<nonce>.part` sibling with
-   delete-on-close armed.
-3. Copy data, named streams, EAs, sparse layout, and destination DACL policy.
-4. Revalidate the source. For replacement or in-place metadata repair,
-   revalidate destination identity, kind, size, last-write time, attributes,
-   and reparse tag, then preserve a protected destination DACL when replacing.
-5. Clear delete-on-close, atomically rename to the final name, then set final
-   basic metadata (the ordering defeats NTFS name tunneling).
-6. With `--flush`, flush after rename and metadata; only then report `copied`.
+Plain small files with one unnamed stream and no EAs are read and
+source-revalidated before destination mutation. A new final name is created
+exclusively; a replacement is opened non-following, identity-checked on that
+same handle, and then truncated in place, preserving its security descriptor.
+The engine writes the one unnamed payload, revalidates the source, optionally
+flushes, and only then reports `copied`. A process kill can leave an incomplete
+final-named plain file, but a mid-write file is shorter than the source and a
+completed whole-buffer write has already completed its logical data.
 
-A crash before publication leaves no final-named partial. Checkpointed partials
-may persist under opaque names, but resume never trusts them: current source
-size/mtime, source and temporary filesystem identities, and the exact temp
-prefix digest must match before continuation. Legacy identity-less checkpoint
-records are parseable but intentionally restart from zero.
+Files with named streams or EAs, plus large, sparse, and checkpoint-capable
+files, use a unique
+`.bigcp-<full-run-id>-<nonce>.part` sibling with delete-on-close armed. After
+copy and source/target revalidation, a protected destination DACL is preserved,
+the temp is atomically published, final metadata is applied, and an optional
+flush completes before `copied`. This size-independent auxiliary-data routing
+prevents a partially written stream/EA set from becoming visible under the
+final name. Checkpointed partials may persist under opaque
+names, but resume never trusts them: current source size/mtime, source and
+temporary filesystem identities, and the exact temp-prefix digest must match.
+Legacy identity-less checkpoint records are parseable but restart from zero.
 
 ## Streams, EAs, sparse files, EFS, and reparse points
 

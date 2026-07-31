@@ -15,6 +15,21 @@ versioning once its 1.0 release gates are complete.
 
 ### Changed
 
+- 2026-07-30 comprehensive review: isolated phase metrics per run, made audit
+  failover events use the normal timestamped JSON serializer, validated small
+  replacement targets on the exact opened handle before truncation, restored
+  read-only attributes when a replacement retry fails, removed the
+  non-functional stream/enumeration profile knobs, and reconciled the public
+  contract and governing plan with the implemented completion model. Files
+  carrying ADS/EAs now use transactional temp publication regardless of size,
+  removing the direct path's crash window for partially written auxiliary data.
+- Review follow-up fixes: the audit stream fails closed when its fallback log
+  tears a line that cannot be rolled back (no append ever follows torn JSON in
+  the same file); the plain-small hot path drops its redundant path-based
+  destination probe — the same-handle check subsumes it, and a vanished
+  replacement target is still classified as a destination change; the MSVC
+  launcher discovers Visual Studio via `vswhere.exe` with SKU-path fallbacks,
+  fixing CI images that carry Enterprise instead of Build Tools.
 - Hardened checkpoint resume with source/temp filesystem identities,
   non-following temp opens, fail-closed journal version handling, and
   handle-bound cleanup that cannot delete a path replacement.

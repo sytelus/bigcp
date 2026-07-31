@@ -47,7 +47,7 @@ pub use path::{
 pub use reparse::{
     ReparseCopyError, ReparseCopyResult, ReparseData, copy_reparse, read_reparse_data,
 };
-pub use security::{ProtectedDacl, read_protected_dacl};
+pub use security::{ProtectedDacl, read_protected_dacl_checked};
 pub use sparse::AllocatedRange;
 pub use streams::{DestinationStream, SourceStream, StreamInfo, list_streams};
 pub use volume::{FileSystem, VolumeCapabilities, VolumeInfo, probe_volume};

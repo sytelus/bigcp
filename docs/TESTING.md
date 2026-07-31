@@ -51,7 +51,7 @@ Heavy tests are disabled by two independent mechanisms, both required:
 
 ```powershell
 $env:BIGCP_ALLOW_HEAVY_TESTS = '1'
-cmd.exe /d /c scripts\cargo-msvc.cmd test --workspace --all-targets -- --test-threads=1 --ignored
+cmd.exe /d /c scripts\cargo-msvc.cmd test --workspace --all-targets --locked -- --test-threads=1 --ignored
 ```
 
 **Permission protocol.** Anyone — human or AI agent — making a change that
@@ -75,7 +75,7 @@ if ([IO.Path]::GetPathRoot($testRoot) -notin $allowed) { throw 'test root must b
 New-Item -ItemType Directory -Path $testRoot -ErrorAction Stop | Out-Null
 $env:TEMP = $testRoot
 $env:TMP = $testRoot
-cmd.exe /d /c scripts\cargo-msvc.cmd test --workspace --all-targets -- --test-threads=1
+cmd.exe /d /c scripts\cargo-msvc.cmd test --workspace --all-targets --locked -- --test-threads=1
 ```
 
 The single test thread is conservative for filesystem timestamp behavior; the
@@ -87,8 +87,8 @@ created directory after its resolved path and marker are revalidated.
 
 ```powershell
 cmd.exe /d /c scripts\cargo-msvc.cmd fmt --all -- --check
-cmd.exe /d /c scripts\cargo-msvc.cmd clippy --workspace --all-targets -- -D warnings
-cmd.exe /d /c scripts\cargo-msvc.cmd test --workspace --all-targets
+cmd.exe /d /c scripts\cargo-msvc.cmd clippy --workspace --all-targets --locked -- -D warnings
+cmd.exe /d /c scripts\cargo-msvc.cmd test --workspace --all-targets --locked
 cargo deny check
 cargo audit
 ```
@@ -143,21 +143,20 @@ the sandbox.
 
 Identified by the 2026-07-29 review as the highest-value coverage within the
 VISION guidance, none requiring scale, hardware, or elevation: E19 root
-aliasing pre-flight; E41 `--replace=false` byte-preservation + `skipped_diff`
-detail; E20 locked destination; E12 junction copied-not-recursed; E13/E35 hard
+aliasing pre-flight; E20 locked destination; E12 junction copied-not-recursed; E13/E35 hard
 links; E04/E38 long paths; E05 reserved/trailing-dot names; E06 Unicode
 NFC/NFD + unpaired surrogates; E18 stale journal after destination deletion;
 E33 run-lock refusal at the run level.
 
 ## Suites not claimed by this initial implementation
 
-Full IOCP adversarial completion modeling, fault-site injection, exhaustive
-deterministic kill-point simulation plus bounded real-process chaos passes,
-elevated VHDX/ReFS cells (graceful operations only), CopyFile2/robocopy
-differential runs on bounded workloads, synthetic-enumeration scale simulation,
-and real-hardware throughput gates within bounded write budgets require
-dedicated work and hardware. They are explicitly release-blocking before a 1.0
-claim and run only on explicit owner request; see PLAN §12.10, §13.2, and
-`BENCHMARKS.md`. Hours-long
+Fault-site injection, exhaustive deterministic kill-point simulation plus
+bounded real-process chaos passes, emitted-instance schema validation,
+synthetic-enumeration scale simulation, and real-hardware throughput gates
+within bounded write budgets require dedicated work and hardware. They are
+release-blocking before a 1.0 claim and run only on explicit owner request;
+the elevated VHDX/ReFS matrix and differential OS-copy comparisons are
+post-v1 evidence, not 1.0 gates. See PLAN §12.10, §13.2, and `BENCHMARKS.md`.
+Hours-long
 soaks, million-entry real trees, and forced-disconnect tests are not deferred —
 they are prohibited (VISION) and will never run.

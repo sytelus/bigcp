@@ -116,7 +116,6 @@
           "source_class",
           "destination_class",
           "chunk_bytes",
-          "streams",
           "workers"
         ]
       }

@@ -7,7 +7,28 @@
 $ErrorActionPreference = 'Stop'
 $CargoArguments = $args
 
-$vsRoot = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\2022\BuildTools'
+# Discover the Visual Studio instance instead of hard-coding one SKU path:
+# local machines typically carry Build Tools while CI images carry Enterprise.
+# vswhere.exe is installed at this fixed path by every Visual Studio SKU; the
+# literal 2022 paths remain as a fallback for images without it.
+$vsRoot = $null
+$vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+if (Test-Path -LiteralPath $vswhere) {
+    $vsRoot = & $vswhere -latest -products * `
+        -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+        -property installationPath | Select-Object -First 1
+}
+if ([string]::IsNullOrWhiteSpace($vsRoot)) {
+    $vsRoot = @(
+        (Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\2022\BuildTools'),
+        (Join-Path $env:ProgramFiles 'Microsoft Visual Studio\2022\Enterprise'),
+        (Join-Path $env:ProgramFiles 'Microsoft Visual Studio\2022\Professional'),
+        (Join-Path $env:ProgramFiles 'Microsoft Visual Studio\2022\Community')
+    ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+}
+if ([string]::IsNullOrWhiteSpace($vsRoot)) {
+    throw 'No Visual Studio instance with the x64 VC tools was found (checked vswhere and the known 2022 install paths)'
+}
 $msvcRoot = Join-Path $vsRoot 'VC\Tools\MSVC'
 $msvc = Get-ChildItem -LiteralPath $msvcRoot -Directory |
     Sort-Object -Property Name -Descending |

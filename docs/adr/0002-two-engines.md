@@ -1,6 +1,6 @@
 # ADR 0002: Two transfer strategies, one semantic path
 
-**Status:** Accepted
+**Status:** Accepted; shared-finalizer detail superseded by ADR 0030
 
 ## Context
 

@@ -11,14 +11,15 @@ use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bigcp_win::{
     DestinationLock, DestinationStream, DirectoryEntry, FileSystem, ObjectKind, ObjectMetadata,
     SourceStream, VolumeInfo, absolute_extended, clear_extended_attributes_checked, copy_reparse,
     create_directory, display_path, enumerate_directory, final_path, is_cloud_placeholder,
-    is_compressed, is_same_or_descendant, list_streams, metadata_at, open_root, ordinal_case_key,
-    probe_volume, read_extended_attributes_checked, set_basic_at_checked,
+    is_compressed, is_same_or_descendant, is_sparse, list_streams, metadata_at, open_root,
+    ordinal_case_key, probe_volume, read_extended_attributes_checked, set_basic_at_checked,
     write_extended_attributes_checked,
 };
 use sha2::{Digest, Sha256};
@@ -34,6 +35,7 @@ use crate::error::{BigcpError, ErrorCategory, OperationError};
 use crate::journal::{Journal, JournalEvent, path_key};
 use crate::model::{Classification, Counters, EntrySnapshot, FileOutcome, RunSnapshot, RunState};
 use crate::options::CopyOptions;
+use crate::phase::PhaseTracker;
 use crate::report::{
     BottleneckSummary, ErrorSummary, ExtraSummary, FolderSummary, Hint, PhaseSummary,
     ReplacementSample, ReplacementSummary, RunInfo, RunReport, top_level,
@@ -104,7 +106,6 @@ pub fn run_copy(
         source_class: format!("{:?}", preflight.profile.source.class),
         destination_class: format!("{:?}", preflight.profile.destination.class),
         chunk_bytes: preflight.profile.chunk_bytes,
-        streams: preflight.profile.streams,
         workers: preflight.profile.workers,
         same_physical_disk: preflight.profile.same_physical_disk,
     })?;
@@ -203,6 +204,7 @@ pub fn run_copy(
         counters: Counters::default(),
         audit,
         stats: StatsTracker::new(),
+        phases: Arc::new(PhaseTracker::new()),
         errors: BTreeMap::new(),
         warnings: BTreeMap::new(),
         replacements: ReplacementSummary::default(),
@@ -249,9 +251,9 @@ pub fn run_copy(
         runner.audit.emit(&AuditEvent::Warning {
             kind: "phase_timing".to_owned(),
             rel: None,
-            message: crate::phase::summary(),
+            message: runner.phases.summary(),
         })?;
-        runner.observer.on_message(&crate::phase::summary());
+        runner.observer.on_message(&runner.phases.summary());
     }
 
     // An invariant breach must not abort before the report exists: the report
@@ -447,6 +449,7 @@ struct Runner<'a> {
     counters: Counters,
     audit: AuditWriter,
     stats: StatsTracker,
+    phases: Arc<PhaseTracker>,
     errors: BTreeMap<ErrorCategory, ErrorSummary>,
     warnings: BTreeMap<String, u64>,
     replacements: ReplacementSummary,
@@ -666,7 +669,7 @@ impl Runner<'_> {
         } else {
             HashMap::new()
         };
-        crate::phase::record(6, phase_timer.elapsed());
+        self.phases.record(6, phase_timer.elapsed());
         let mut seen_source = HashSet::new();
         let mut child_directories = Vec::new();
 
@@ -772,7 +775,7 @@ impl Runner<'_> {
             }
             // Includes any completions drained under backpressure — the
             // coordinator's whole per-entry serial cost is the number to beat.
-            crate::phase::record(7, phase_timer.elapsed());
+            self.phases.record(7, phase_timer.elapsed());
         }
         // No drain here: keeping worker jobs in flight across sibling
         // directories is where cross-directory pipelining comes from (the
@@ -1336,7 +1339,11 @@ impl Runner<'_> {
             let unnamed = source.metadata.size;
             let checkpoint_possible =
                 self.journal.is_some() && unnamed >= self.options.checkpoint_threshold();
-            if unnamed < self.options.large_threshold() && !checkpoint_possible {
+            let preserve_sparse = self.destination_supports_sparse
+                && !self.options.no_sparse
+                && is_sparse(source.metadata.basic.attributes);
+            if unnamed < self.options.large_threshold() && !checkpoint_possible && !preserve_sparse
+            {
                 let promote_threshold = if self.journal.is_some() {
                     self.options
                         .large_threshold()
@@ -1365,6 +1372,7 @@ impl Runner<'_> {
                     streams: None,
                     logical_bytes: unnamed,
                     promote_threshold: Some(promote_threshold),
+                    phases: Arc::clone(&self.phases),
                 };
                 return self.submit_small_job(job);
             }
@@ -1467,6 +1475,7 @@ impl Runner<'_> {
             known_streams: Some(&streams),
             cancel: &cancel_probe,
             promote_threshold: None,
+            phases: &self.phases,
         };
         let copy_started = Instant::now();
         let result = copy_file(&request, &mut counters, self.journal.as_mut());
@@ -1533,7 +1542,7 @@ impl Runner<'_> {
         }
         let phase_timer = Instant::now();
         let outcome = self.finish_copy(completed);
-        crate::phase::record(8, phase_timer.elapsed());
+        self.phases.record(8, phase_timer.elapsed());
         outcome
     }
 
@@ -1879,13 +1888,24 @@ impl Runner<'_> {
                         return Ok(());
                     }
                     let destination_path = self.destination_root.join(&relative);
-                    match bigcp_win::read_protected_dacl(&destination_path) {
+                    match bigcp_win::read_protected_dacl_checked(
+                        &destination_path,
+                        expected.metadata.identity,
+                    ) {
                         Ok(value) => protected_dacl = value,
                         Err(error) => {
                             self.counters.links_failed =
                                 self.counters.links_failed.saturating_add(1);
-                            let error =
-                                OperationError::from_io("read_dacl", relative.clone(), &error);
+                            let error = if error.kind() == std::io::ErrorKind::InvalidData {
+                                OperationError::from_io_as(
+                                    ErrorCategory::DestinationChanged,
+                                    "read_dacl",
+                                    relative.clone(),
+                                    &error,
+                                )
+                            } else {
+                                OperationError::from_io("read_dacl", relative.clone(), &error)
+                            };
                             self.record_link_event(
                                 &relative,
                                 "failed_link",

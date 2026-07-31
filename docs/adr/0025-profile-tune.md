@@ -1,6 +1,6 @@
 # ADR 0025: Consolidate tuning
 
-**Status:** Accepted
+**Status:** Accepted; non-functional stream fields removed by ADR 0033
 
 ## Context
 

@@ -77,7 +77,7 @@ pub enum FileOutcome {
         /// Optional xxh3-128 digest.
         digest: Option<String>,
     },
-    /// Atomic replacement of a differing file.
+    /// Replacement of a differing file through the selected completion path.
     CopiedReplaced {
         /// Logical bytes copied.
         bytes: u64,
@@ -166,7 +166,7 @@ pub struct Counters {
     pub files_discovered: u64,
     /// New files copied.
     pub copied_new: u64,
-    /// Existing files atomically replaced.
+    /// Existing files replaced through either completion protocol.
     pub copied_replaced: u64,
     /// Files skipped by the equality heuristic.
     pub skipped_same: u64,

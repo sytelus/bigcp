@@ -1,6 +1,6 @@
 # ADR 0004: Uniform temp and atomic publication
 
-**Status:** Accepted
+**Status:** Superseded for small files by ADR 0030; retained for large files
 
 ## Context
 

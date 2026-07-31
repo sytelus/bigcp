@@ -1,12 +1,16 @@
 # Verifies that the implementation task's three frozen inputs remain byte-identical.
-# Re-pinned 2026-07-29 after the owner removed /J from VISION.md's expressed
-# defaults and the plan adopted buffered streaming as the final engine
-# (ADR 0028). Re-pin only as the final step of an owner-approved doc change.
+# Re-pinned 2026-07-30 after the owner-authorized full-repository review
+# reconciled PLAN.md and LIMITATIONS.md with the shipped plain-direct and
+# transactional completion protocols plus the remaining pre-1.0 scaling gap,
+# and again after the owner-approved review fixes (same-handle-only direct
+# revalidation wording and the section 6.2 pseudocode variable fix).
+# VISION.md is unchanged.
+# Re-pin only as the final step of an owner-approved documentation change.
 $ErrorActionPreference = 'Stop'
 $Expected = @{
-    'PLAN.md' = '958A34C8BD930C0FD4BDD7AC1FFE63DCCD6E4280BCBDA53664A5973725420C8E'
+    'PLAN.md' = 'BAA627C4626D6C7B793E327E9E085495D20209B6183800B1C014D0DA75899C86'
     'VISION.md' = 'C6446CDF4485E4D0D17118B34BBA1D0E44140FA45F674F6889ACD8374C417FDC'
-    'LIMITATIONS.md' = '6F633A233E0E160DCD2E26A7056168BF407046B51B0AF303F0ADFEBDCD0538D3'
+    'LIMITATIONS.md' = 'DA26CD222BECEF0B6ED4F175FB6298ECD96C0D5FE60062DAF4926BAFBC426863'
 }
 
 foreach ($entry in $Expected.GetEnumerator()) {

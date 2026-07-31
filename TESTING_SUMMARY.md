@@ -1,8 +1,63 @@
 # Implementation testing and drive-safety summary
 
-Date: 2026-07-28
+Latest review: 2026-07-30
 
-## Outcome
+## 2026-07-30 full-repository review validation
+
+The owner-authorized full review passed every routine quality gate after the
+code, tests, comments, governing documents, ADRs, and public log schema were
+reconciled. The final serial workspace suite ran only below this new C: system
+temporary root:
+
+`C:\Users\shitals\AppData\Local\Temp\bigcp-review-final2-4704384698344bb4b8f99242e8c42cce`
+
+All 83 tests passed with zero failures: 4 CLI, 27 core unit, 14 core
+end-to-end, 8 testkit safety, 2 TUI, and 28 Windows-boundary tests. New cases
+cover direct-replacement identity mismatch without truncation, identity-checked
+protected-DACL capture, read-only direct replacement, `--replace=false` audit
+facts, sub-threshold sparse-file fidelity, failover-event JSON escaping, run
+isolation for phase timings, and rejection of the removed non-functional
+`streams` tuning key. The full-fidelity end-to-end fixture also exercises the
+new transactional routing for sub-threshold ADS/EA files.
+
+The post-change gates were:
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`
+- `cargo test --workspace --all-targets --locked -- --test-threads=1`
+- warning-denied `cargo doc --workspace --no-deps --locked`
+- `cargo build --workspace --release --locked`
+- `cargo deny check` (advisories, bans, licenses, and sources all passed;
+  informational transitive duplicate-version warnings remain for `hashbrown`
+  and `syn`)
+- `cargo audit` against 1,174 current RustSec advisories (no vulnerability
+  finding across 146 locked dependencies)
+- the repository's frozen-input, test-storage-safety, Markdown-link, JSON,
+  whitespace, and unsafe-code-rationale checks
+
+The optimized binaries then completed the bounded `e00-smoke.yaml` workflow in:
+
+`C:\Users\shitals\AppData\Local\Temp\bigcp-release-final2-d7186f35e3cc47a494e9b9a492145917`
+
+It generated 3 directories, 5 files, and 78,848 logical bytes; copied and
+read-back-verified all five; converged to five skips on rerun; passed standalone
+full verification and the independent nine-object oracle with zero mismatches
+or extras; reopened the saved report; and left a parseable 29-event JSONL log.
+
+This review intentionally updated `PLAN.md` and `LIMITATIONS.md` to describe the
+shipped mixed direct/temp completion protocols and the still-open bounded
+huge-directory fallback. `VISION.md` remained byte-identical. The
+owner-approved review fixes then adjusted `PLAN.md` once more (same-handle-only
+direct revalidation wording; a pseudocode variable fix), and the governing hash
+guard was re-pinned to:
+
+| File | SHA-256 |
+|---|---|
+| `PLAN.md` | `BAA627C4626D6C7B793E327E9E085495D20209B6183800B1C014D0DA75899C86` |
+| `VISION.md` | `C6446CDF4485E4D0D17118B34BBA1D0E44140FA45F674F6889ACD8374C417FDC` |
+| `LIMITATIONS.md` | `DA26CD222BECEF0B6ED4F175FB6298ECD96C0D5FE60062DAF4926BAFBC426863` |
+
+## 2026-07-28 initial implementation outcome
 
 The implementation passed its routine Windows quality, unit, integration,
 release-build, supply-chain, and executable smoke gates. All filesystem tests
@@ -270,8 +325,8 @@ directory; the historical `.bigcp.*.tmp` pattern mentioned in earlier sections
 predates the current single opaque `.bigcp-….part` scheme. No test in this
 pass — added, changed, or retained — mounts, formats, fills, dismounts,
 benchmarks, forces disconnects, or issues raw operations against any drive,
-and scale/device-loss behavior remains validated by simulation and fault
-injection only.
+and scale/device-loss behavior still requires the planned simulation and fault
+injection harnesses; it was not reproduced on real devices.
 
 ## 2026-07-29 owner-approved one-time evidence run
 

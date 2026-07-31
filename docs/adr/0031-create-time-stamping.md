@@ -1,6 +1,6 @@
 # ADR 0031: Create-time timestamp stamping and destination-led worker counts
 
-**Status:** Accepted
+**Status:** Accepted; late auxiliary stamp branch superseded by ADR 0034
 
 ## Context
 
@@ -18,11 +18,13 @@ worker composition let one low-confidence Unknown-profiled side drag a
    immediately at create: Windows freezes automatic last-write updates on a
    handle once times are explicitly set (pinned by the
    `create_time_stamp_survives_writes_in_sandbox` regression test), so the
-   stamp coalesces into the create's MFT window. Files carrying ADS or EAs
-   stamp at finish — the freeze is per-handle and sub-opened stream/EA
-   handles would re-bump it. Crash repair rides the size check:
-   truncate-at-create makes every interrupted partial shorter than its
-   source (I5 wording updated).
+   stamp coalesces into the create's MFT window. ADR 0034 later routed files
+   carrying ADS or EAs through transactional temp publication, so the direct
+   path now always uses this create-time stamp. Crash repair rides the size
+   check: every
+   mid-write interruption is shorter than the source; once the full unnamed
+   payload and early metadata have landed, the ordinary file content is
+   already valid (I5 wording updated).
 2. HDD-destination small-file workers: 8 → 32, by measurement (31.5 s →
    19.1 s on the bounded workload) — many outstanding closes overlap in the
    device queue.
@@ -34,5 +36,7 @@ worker composition let one low-confidence Unknown-profiled side drag a
 Defaults beat robocopy on every measured small-file cell (external HDD:
 17.7–18.0 s vs 23.1–24.5 s). Registered follow-ups: a dedicated
 close-finalizer stage (the deleted H1, now benchmark-justified) and the
-D:-NVMe Unknown-profiling defect. Reverting any part of this ADR requires
-re-running the BENCHMARKS.md workloads that justified it.
+D:-NVMe Unknown-profiling defect. Both were later resolved: the close-finalizer
+measured parity-to-worse and stayed retired, while positive no-seek-penalty
+evidence now classifies unrecognized VMD/RAID buses as SSD. Reverting any part
+of this ADR requires re-running the BENCHMARKS.md workloads that justified it.

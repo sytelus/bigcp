@@ -27,11 +27,9 @@ pub enum DeviceClass {
 pub struct TuneOptions {
     /// Streaming chunk bytes.
     pub chunk_bytes: Option<usize>,
-    /// Concurrent large-file streams.
-    pub streams: Option<usize>,
     /// Small-file worker count.
     pub threads: Option<usize>,
-    /// Buffer-pool memory budget.
+    /// Copy-buffer memory budget used to cap workers and chunks.
     pub memory_bytes: Option<usize>,
     /// Small/large engine threshold.
     pub large_threshold: Option<u64>,

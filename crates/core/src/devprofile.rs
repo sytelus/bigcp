@@ -19,12 +19,8 @@ pub struct SideProfile {
     pub confidence: String,
     /// Preferred chunk bytes.
     pub chunk_bytes: usize,
-    /// Preferred concurrent streams.
-    pub streams: usize,
     /// Small-file workers.
     pub workers: usize,
-    /// Enumeration workers.
-    pub enumeration_threads: usize,
 }
 
 /// Composed source/destination profile used by engines.
@@ -36,9 +32,7 @@ pub struct CopyProfile {
     pub destination: SideProfile,
     /// Chunk clamped by both adapters.
     pub chunk_bytes: usize,
-    /// Concurrent streams clamped by the slower side.
-    pub streams: usize,
-    /// Small-file workers from the slower side.
+    /// Composed small-file worker count (destination-led, source-HDD-capped).
     pub workers: usize,
     /// True when source and destination extent sets intersect.
     pub same_physical_disk: bool,
@@ -96,14 +90,6 @@ pub fn select_copy_profile(
             "profile chunk size must be positive".to_owned(),
         ));
     }
-    let streams = tune
-        .streams
-        .unwrap_or_else(|| source.streams.min(destination.streams));
-    if streams == 0 {
-        return Err(BigcpError::Invalid(
-            "profile stream count must be positive".to_owned(),
-        ));
-    }
     let same_physical_disk = !source_info.disk_numbers.is_empty()
         && source_info
             .disk_numbers
@@ -125,7 +111,6 @@ pub fn select_copy_profile(
         source,
         destination,
         chunk_bytes,
-        streams,
         workers,
         same_physical_disk,
     })
@@ -139,13 +124,6 @@ fn validate_tuning(tune: &TuneOptions) -> Result<(), BigcpError> {
     {
         return Err(BigcpError::Invalid(
             "small-file worker count must be in 1..=256".to_owned(),
-        ));
-    }
-    if let Some(streams) = tune.streams
-        && !(1..=16).contains(&streams)
-    {
-        return Err(BigcpError::Invalid(
-            "concurrent stream count must be in 1..=16".to_owned(),
         ));
     }
     if let Some(chunk) = tune.chunk_bytes
@@ -190,38 +168,26 @@ fn side_profile(
         "low"
     }
     .to_owned();
-    let (chunk_bytes, streams, workers, enumeration_threads) = match class {
-        DeviceClass::Nvme => (
-            8 * 1024 * 1024,
-            if cores >= 8 { 4 } else { 2 },
-            (4 * cores).min(64),
-            cores.min(16),
-        ),
-        DeviceClass::SataSsd => (8 * 1024 * 1024, 2, 32, 8),
-        DeviceClass::UsbSsd => (4 * 1024 * 1024, 2, 16, 8),
-        // Seek-penalty media get large sequential chunks and a single large
-        // stream. Small-file workers stay HIGH on an HDD destination
+    let (chunk_bytes, workers) = match class {
+        DeviceClass::Nvme => (8 * 1024 * 1024, (4 * cores).min(64)),
+        DeviceClass::SataSsd => (8 * 1024 * 1024, 32),
+        DeviceClass::UsbSsd => (4 * 1024 * 1024, 16),
+        // Seek-penalty media get large sequential chunks. Small-file workers
+        // stay HIGH on an HDD destination
         // (measured 2026-07-29, BENCHMARKS.md): small-file cost there is
         // metadata-bound — per-file CloseHandle is a ~2.3 ms write-through
         // round-trip on Quick-removal USB — and 32 outstanding closes
         // overlap in the device queue (19.1 s vs 31.5 s with 8 workers on
         // the 20k-file workload, beating robocopy). Reading from an HDD
         // source stays conservative (seek-bound, unmeasured).
-        DeviceClass::Hdd => (
-            16 * 1024 * 1024,
-            1,
-            if source { 4 } else { 32 },
-            if source { 2 } else { 4 },
-        ),
-        DeviceClass::Auto | DeviceClass::Unknown => (4 * 1024 * 1024, 1, 4, 4),
+        DeviceClass::Hdd => (16 * 1024 * 1024, if source { 4 } else { 32 }),
+        DeviceClass::Auto | DeviceClass::Unknown => (4 * 1024 * 1024, 4),
     };
     SideProfile {
         class,
         confidence,
         chunk_bytes,
-        streams,
         workers,
-        enumeration_threads,
     }
 }
 
@@ -316,10 +282,6 @@ mod tests {
         for tune in [
             TuneOptions {
                 threads: Some(0),
-                ..TuneOptions::default()
-            },
-            TuneOptions {
-                streams: Some(17),
                 ..TuneOptions::default()
             },
             TuneOptions {

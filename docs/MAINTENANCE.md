@@ -6,7 +6,7 @@
 |---|---|
 | `crates/win/src/path.rs`, `metadata.rs`, `volume.rs`, `device.rs`, `lock.rs`, `util.rs` | Lossless paths, handle identity, 256 KiB enumeration, supported-volume and query-only device facts, run lock, shared error helpers. |
 | `crates/win/src/file.rs`, `streams.rs`, `ea.rs`, `sparse.rs`, `reparse.rs`, `security.rs` | Read-only source and capability-bearing destination primitives; the only unsafe boundary. |
-| `crates/core/src/model.rs`, `options.rs`, `classify.rs`, `copy.rs`, `worker.rs`, `engine.rs` | Work model, validated options, join, terminal outcomes, bounded scheduling, streaming, sparse/ADS copy, common finalizer. |
+| `crates/core/src/model.rs`, `options.rs`, `classify.rs`, `copy.rs`, `worker.rs`, `engine.rs` | Work model, validated options, join, terminal outcomes, bounded scheduling, direct-plain-small and transactional auxiliary/sparse/large copy. |
 | `crates/core/src/journal.rs`, `audit.rs`, `report.rs`, `stats.rs`, `devprofile.rs` | Resume hints, public artifacts, throughput windows, static profiles. |
 | `crates/core/src/verify.rs` | Post-copy and standalone verification. |
 | `crates/tui` | Immutable-snapshot live UI and saved report browser. |
@@ -19,9 +19,9 @@
 |---|---|---|
 | I1 | Source handles are read-only. | `SourceFile`/`SourceStream` choke points; unsafe denied outside `win`. |
 | I2 | Never delete an unowned destination. | Delete-on-close is bound to the created handle; resumed temps require journaled file identity; no path-delete fallback or mirror/purge command. |
-| I3 | Never truncate a replacement in place. | Replacement always constructs a sibling temp. |
-| I4 | `copied` only follows commit. | `EngineResult` is returned after rename, metadata, optional flush, and close. |
-| I5 | Final names never contain partial file data. | Uniform temp/rename; end-to-end atomic replacement test. |
+| I3 | Every replacement preserves the old destination until safe commitment, except the documented direct-plain-small rerun window. | ADS/EA, sparse, and large files use sibling temps; plain small files validate the destination snapshot on the exact opened handle before truncation. |
+| I4 | `copied` only follows data, metadata, optional flush, and close/publication. | Both engines return `EngineResult` only after their completion protocol succeeds. |
+| I5 | Multi-part logical files and large-file final names never contain partial data; interrupted direct plain-file work is repairable by rerun. | Transactional ADS/EA/sparse/large coverage plus direct-plain-small interruption/rerun tests. |
 | I6 | Counters reconcile. | `Counters::reconcile` at run end and unit tests. |
 | I7 | Every per-object failure is auditable. | Typed `OperationError`, coordinator-only outcome/audit ownership. |
 | I8 | Journal never creates a skip. | Journal API exposes checkpoints only; every-byte torn-tail test. |
@@ -96,11 +96,12 @@ replacements, warnings, grouped failures, extras, hints, and verification.
 - **EA:** opaque extended-attribute set copied via the backup stream protocol.
 - **Join:** case-insensitive matching of one source and destination directory
   listing without per-source-item destination stats.
-- **Engine:** a bounded file transfer strategy; both paths share one finalizer.
+- **Engine:** a bounded file transfer strategy; both paths share result and
+  accounting contracts but have distinct completion protocols.
 - **Watermark:** contiguous temp prefix eligible for a checkpoint.
-- **QD:** queue depth — in-flight I/O count per device side; always 1 per
-  stream in the shipped sequential engine (aggregate parallelism comes from
-  streams and workers).
+- **QD:** queue depth — in-flight I/O count per device side; the shipped
+  large-file loop issues one synchronous request at a time. Small-file
+  parallelism comes from the worker pool.
 - **MTL:** adapter-reported maximum transfer length used to clamp chunks.
 - **VDL:** valid data length; bigcp never uses `SetFileValidData`.
 - **UASP/BOT:** USB storage transports; BOT-like uncertainty selects a

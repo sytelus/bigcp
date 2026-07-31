@@ -1,6 +1,6 @@
 # ADR 0030: Direct final-name writes for small files
 
-**Status:** Accepted
+**Status:** Accepted; auxiliary-data detail superseded by ADR 0034
 
 ## Context
 
@@ -15,15 +15,17 @@ the throughput goal: meet or exceed robocopy by default, automatically.
 
 ## Decision
 
-Small files (all streams below the large threshold) write **directly to
+Plain small files (the unnamed stream below the large threshold, no EAs) write **directly to
 their final name** via the new `DestinationFinal` primitive: create (or
 truncate-in-place for replacements, which preserves the existing security
-descriptor), write every stream, write EAs, then — strictly last — stamp
-the source timestamps and attributes. The mtime-last ordering is the
-load-bearing discipline: an interrupted partial can never match the exact
-size+mtime skip heuristic, so the next run classifies it Different and
-replaces it. Large files keep temp+rename: the cost is amortized to ~0 and
-checkpointed resume requires a temp identity to verify.
+descriptor), write the one unnamed stream, and finish. ADR 0031 moved the
+timestamp operation to create time; its regression test proves the timestamp
+survives writes on the same handle, while a mid-write file's shorter size still
+forces repair. ADR 0034 subsequently routed all ADS/EA-bearing files through
+temp publication so a logical file's auxiliary data cannot be exposed
+partially. Large and auxiliary-data files keep temp+rename: the cost is
+amortized for large files, rare for auxiliary data, and checkpointed resume
+requires a temp identity to verify.
 
 The large threshold default moves from 4 MiB (citation) to 16 MiB
 (measurement: the direct path ran 8 MiB files ~1.85× faster than the temp
@@ -36,9 +38,8 @@ conflation entirely — is registered as designed future work.
 
 Small-file throughput measured 0.8–0.87× robocopy `/MT:32` after this
 change (from 0.45×), with the remaining gap under investigation. Invariants
-I3/I5 are rescoped to the large path; the run-level invariant becomes
-"kill at any instant → a re-run converges to a correct tree", which the
-chaos suite asserts end-to-end. Mid-run and post-interrupt destinations may
-contain partial files at final names — stated plainly in LIMITATIONS.md
-and the README, with "don't consume the destination until the run reports
-success" guidance.
+I3/I5 are rescoped to the transactional and direct paths. Mid-run and
+post-interrupt destinations may contain partial **plain** files at final names
+— stated plainly in LIMITATIONS.md and the README, with "don't consume the
+destination until the run reports success" guidance. Files with auxiliary
+data are structurally excluded from that window by ADR 0034.

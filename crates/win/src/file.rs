@@ -2,9 +2,10 @@
 //!
 //! Source handles are constructed read-only. Destination writes flow through
 //! exactly two sanctioned primitives: `DestinationTemp` (opaque self-deleting
-//! temporary published by atomic rename — large files, whose partials are
-//! resume assets) and `DestinationFinal` (direct final-name writer — small
-//! files, whose crash contract is rerun-repair, ADR 0030).
+//! temporary published by atomic rename — large, sparse, or
+//! auxiliary-data-bearing files, whose partials must remain hidden) and
+//! `DestinationFinal` (direct final-name writer — plain small files, whose
+//! crash contract is rerun-repair, ADR 0030/0034).
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, Write};
@@ -435,42 +436,39 @@ impl Read for DestinationTemp {
     }
 }
 
-/// Direct final-name destination writer for the small-file path (ADR 0030).
+/// Direct final-name destination writer for plain small files (ADR 0030/0034).
 ///
 /// This deliberately publishes bytes under the real name while writing —
 /// the crash contract for small files is rerun-repair, not atomic
 /// publication: an interrupted write may leave a partial file at the final
-/// name, and the engine calls [`DestinationFinal::finish`] (which stamps the
-/// source timestamps) only after the last data byte, so a partial can never
-/// satisfy the exact size+mtime skip heuristic — the next run replaces it.
+/// name. Routing limits this primitive to a single unnamed stream with no EAs:
+/// an interruption before its whole-buffer write completes leaves a shorter
+/// file, while a full write has already completed the logical payload.
 pub struct DestinationFinal {
     file: File,
-    path: PathBuf,
 }
 
 impl DestinationFinal {
-    /// Opens the final name directly. With `replace` an existing destination
-    /// is truncated in place (which preserves its security descriptor);
-    /// without it an existing name fails with `AlreadyExists`. A reparse
-    /// point at the name is never opened through nor written.
+    /// Opens the final name directly. With `expected`, the existing
+    /// destination snapshot is checked on the opened handle before it is
+    /// truncated in place (which preserves its security descriptor); without
+    /// it an existing name fails with `AlreadyExists`. A reparse point at the
+    /// name is never opened through nor written.
     ///
-    /// When `stamp` is provided, source timestamps and attributes are set
-    /// **immediately at create** — inside the same hot MFT window as the
-    /// create itself, which on write-through (Quick-removal) USB volumes
+    /// Source timestamps and attributes are set **immediately at create** —
+    /// inside the same hot MFT window as the create itself, which on
+    /// write-through (Quick-removal) USB volumes
     /// eliminates the separate ~2 ms metadata round-trip that dominated the
     /// small-file benchmark. Windows documents that an explicit last-write
     /// set stops automatic updates on this handle, so subsequent data
     /// writes leave the stamped times intact; crash repair is carried by
-    /// the size check (files are truncated at create, so any interrupted
-    /// partial is shorter than its source and reclassifies on rerun).
-    /// Callers pass `None` (and stamp via [`DestinationFinal::finish`])
-    /// when early attributes would break them — e.g. a read-only source
-    /// whose named streams or EAs still need write sub-opens.
+    /// the size check (a mid-write interruption is shorter than its source
+    /// and reclassifies on rerun).
     pub fn create(
         path: &Path,
-        replace: bool,
+        expected: Option<&ObjectMetadata>,
         encrypted: bool,
-        stamp: Option<BasicMetadata>,
+        stamp: BasicMetadata,
     ) -> io::Result<Self> {
         let mut options = OpenOptions::new();
         options
@@ -482,8 +480,10 @@ impl DestinationFinal {
             .access_mode(GENERIC_WRITE | FILE_READ_ATTRIBUTES)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-        if replace {
-            options.create(true).truncate(true);
+        if expected.is_some() {
+            // Do not request truncation in OpenOptions: Windows truncates as
+            // part of the open, before callers can prove that the path still
+            // names the object classified by the coordinator.
         } else {
             options.create_new(true);
         }
@@ -498,23 +498,23 @@ impl DestinationFinal {
                 "destination name is not a plain file",
             ));
         }
-        if let Some(stamp) = stamp {
-            set_basic_by_handle(&file, stamp)?;
+        if let Some(expected) = expected {
+            if metadata.identity != expected.identity
+                || metadata.kind != expected.kind
+                || metadata.size != expected.size
+                || metadata.basic.last_write_time != expected.basic.last_write_time
+                || metadata.basic.attributes != expected.basic.attributes
+                || metadata.reparse_tag != expected.reparse_tag
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "destination identity or metadata changed before replacement",
+                ));
+            }
+            file.set_len(0)?;
         }
-        Ok(Self {
-            file,
-            path: path.to_path_buf(),
-        })
-    }
-
-    /// Creates one named stream on the final file.
-    pub fn create_stream(&self, stream: &StreamInfo) -> io::Result<DestinationStream> {
-        DestinationStream::create(&self.path, stream, true)
-    }
-
-    /// Writes the opaque EA blob onto the final file.
-    pub fn write_extended_attributes(&self, attributes: &ExtendedAttributes) -> io::Result<()> {
-        write_to_file(&self.file, attributes)
+        set_basic_by_handle(&file, stamp)?;
+        Ok(Self { file })
     }
 
     /// Reports current basic attributes (EFS state check).
@@ -522,12 +522,8 @@ impl DestinationFinal {
         Ok(metadata_from_file(&self.file)?.basic.attributes)
     }
 
-    /// Completes the file: stamps metadata now when it was not stamped at
-    /// create (the read-only-with-aux fallback), optionally flushes, closes.
-    pub fn finish(self, late_stamp: Option<BasicMetadata>, flush: bool) -> io::Result<()> {
-        if let Some(metadata) = late_stamp {
-            set_basic_by_handle(&self.file, metadata)?;
-        }
+    /// Completes the file by optionally flushing and closing its handle.
+    pub fn finish(self, flush: bool) -> io::Result<()> {
         if flush {
             self.file.sync_all()?;
         }
@@ -919,13 +915,13 @@ mod destination_final_tests {
             last_write_time: 131_000_000_000_000_002,
             attributes: 0x20,
         };
-        let file = DestinationFinal::create(&path, false, false, Some(stamp));
+        let file = DestinationFinal::create(&path, None, false, stamp);
         assert!(file.is_ok());
         let Some(mut file) = file.ok() else {
             return;
         };
         assert!(file.write_all(&[0xAB_u8; 8192]).is_ok());
-        assert!(file.finish(None, false).is_ok());
+        assert!(file.finish(false).is_ok());
         let observed = metadata_at(&path);
         assert!(observed.is_ok());
         assert!(
@@ -934,6 +930,32 @@ mod destination_final_tests {
                 .is_some_and(|value| value.basic.last_write_time == stamp.last_write_time
                     && value.basic.creation_time == stamp.creation_time),
             "explicit stamp did not survive data writes"
+        );
+    }
+
+    #[test]
+    fn replacement_identity_mismatch_does_not_truncate() {
+        let sandbox = tempfile::tempdir();
+        assert!(sandbox.is_ok());
+        let Some(sandbox) = sandbox.ok() else {
+            return;
+        };
+        let expected_path = sandbox.path().join("expected.bin");
+        let replacement_path = sandbox.path().join("replacement.bin");
+        assert!(std::fs::write(&expected_path, b"expected").is_ok());
+        assert!(std::fs::write(&replacement_path, b"must survive").is_ok());
+        let expected = metadata_at(&expected_path);
+        assert!(expected.is_ok());
+        let Some(expected) = expected.ok() else {
+            return;
+        };
+
+        let result =
+            DestinationFinal::create(&replacement_path, Some(&expected), false, expected.basic);
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read(&replacement_path).ok(),
+            Some(b"must survive".to_vec())
         );
     }
 }

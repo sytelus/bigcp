@@ -15,10 +15,11 @@ use windows_sys::Win32::Security::{
     PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, READ_CONTROL,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL,
 };
 
+use crate::metadata::{FileIdentity, metadata_from_file};
 use crate::util::bool_result;
 
 /// Opaque security descriptor owning a protected explicit DACL.
@@ -57,14 +58,32 @@ impl Drop for ProtectedDacl {
     }
 }
 
-/// Reads a destination DACL only when it carries explicit protection.
-pub fn read_protected_dacl(path: &Path) -> io::Result<Option<ProtectedDacl>> {
+/// Reads a protected DACL only when the non-following handle still names the
+/// expected destination object.
+pub fn read_protected_dacl_checked(
+    path: &Path,
+    expected_identity: FileIdentity,
+) -> io::Result<Option<ProtectedDacl>> {
+    let file = open_for_dacl(path)?;
+    if metadata_from_file(&file)?.identity != expected_identity {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "destination identity changed before DACL capture",
+        ));
+    }
+    read_protected_dacl_from_file(&file)
+}
+
+fn open_for_dacl(path: &Path) -> io::Result<std::fs::File> {
     let mut options = OpenOptions::new();
     options
-        .access_mode(READ_CONTROL)
+        .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
-    let file = options.open(path)?;
+    options.open(path)
+}
+
+fn read_protected_dacl_from_file(file: &std::fs::File) -> io::Result<Option<ProtectedDacl>> {
     let mut dacl = std::ptr::null_mut();
     let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     // SAFETY: all requested output pointers are valid. Unrequested owner,
@@ -109,5 +128,36 @@ fn win32_status(status: WIN32_ERROR) -> io::Result<()> {
         Ok(())
     } else {
         Err(io::Error::from_raw_os_error(status.cast_signed()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_protected_dacl_checked;
+    use crate::metadata::metadata_at;
+
+    #[test]
+    fn checked_dacl_read_rejects_a_replaced_path() {
+        let sandbox = tempfile::tempdir();
+        assert!(sandbox.is_ok());
+        let Some(sandbox) = sandbox.ok() else {
+            return;
+        };
+        let expected_path = sandbox.path().join("expected.bin");
+        let observed_path = sandbox.path().join("observed.bin");
+        assert!(std::fs::write(&expected_path, b"expected").is_ok());
+        assert!(std::fs::write(&observed_path, b"observed").is_ok());
+        let expected = metadata_at(&expected_path);
+        assert!(expected.is_ok());
+        let Some(expected) = expected.ok() else {
+            return;
+        };
+
+        let error = read_protected_dacl_checked(&observed_path, expected.identity).err();
+        assert!(error.is_some_and(|value| value.kind() == std::io::ErrorKind::InvalidData));
+        assert_eq!(
+            std::fs::read(&observed_path).ok(),
+            Some(b"observed".to_vec())
+        );
     }
 }
