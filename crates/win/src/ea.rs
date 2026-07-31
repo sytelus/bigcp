@@ -31,6 +31,12 @@ const MAX_EA_PAYLOAD_BYTES: u64 = 1024 * 1024;
 pub struct ExtendedAttributes(Vec<u8>);
 
 impl ExtendedAttributes {
+    /// Constructs an empty EA set without issuing a filesystem query.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self(Vec::new())
+    }
+
     /// Builds a validated EA set from raw name/value byte pairs.
     ///
     /// EA names are byte strings in the Win32 API. They must be non-empty,

@@ -11,6 +11,7 @@ pub mod copy;
 pub mod devprofile;
 mod engine;
 pub mod error;
+mod filesystem;
 pub mod journal;
 pub mod model;
 pub mod options;

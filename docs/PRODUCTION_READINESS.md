@@ -18,6 +18,10 @@ by the governing plan.
   post-order directory metadata finalization.
 - File, directory, ADS, EA, sparse-data, symlink, junction, rerun, dry-run,
   cancellation, report-fallback, and both verification paths.
+- Isolated NTFS/ReFS and FAT/exFAT destination policies: exact strict-volume
+  comparison, FAT-family timestamp/attribute projection and file-size limit,
+  capability-gated ADS/EA/sparse/EFS/ACL behavior, explicit degradation
+  acceptance, and projected verification reporting.
 - Exact terminal counter reconciliation and a durably synchronized `run_end`.
 - Structurally confined, budgeted tests under a new validated temporary root
   on a whitelisted drive; only the system drive and the code-checkout drive
@@ -36,10 +40,6 @@ lifespan-reducing writes, no machine-stability impact — see PLAN §12.0):
 - Sans-I/O and injected-fault coverage for every completion and Win32 fault
   site, exhaustive **deterministic kill-point simulation**, and bounded
   (minutes-scale) real-process chaos passes.
-- Disposable VHDX coverage for NTFS and ReFS using **graceful operations only**
-  (create, mount, test, clean dismount of test-owned virtual disks), including
-  elevated publication, low-space, and capability probes. Device-loss behavior
-  is validated by fault injection only — never by forced detach of any kind.
 - **Bounded** workloads (W1s/W2s-class), differential OS-copy comparison, and
   topology-matched performance runs on scratch-designated storage;
   million-entry behavior via synthetic enumeration simulation, never real trees.
@@ -55,6 +55,18 @@ lifespan-reducing writes, no machine-stability impact — see PLAN §12.0):
   remains suitable for ordinary trees, but million-entry directories are not
   certified.
 
+## Additional filesystem-certification evidence
+
+Disposable VHDX coverage for NTFS, ReFS, FAT32, and exFAT uses **graceful
+operations only** (create, mount, test, clean dismount of test-owned virtual
+disks), including elevated publication, low-space, capability probes,
+FAT-family fallbacks, degradation accounting, and projected verification.
+Device-loss behavior is validated by fault injection only—never by forced
+detach of any kind. ADRs 0029/0035 permit these filesystems to remain explicitly
+best-effort and not matrix-certified at v1; this evidence is required before
+making a matrix-certification claim, but it is not silently treated as a v1
+release pass.
+
 No release process may reinterpret an unrun gate as a pass.
 `TESTING_SUMMARY.md` records dated evidence; intentional differences from
-the governing plan are recorded inline in PLAN.md and in ADRs 0027–0034.
+the governing plan are recorded inline in PLAN.md and in ADRs 0027–0035.

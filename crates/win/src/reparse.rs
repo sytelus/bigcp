@@ -117,6 +117,8 @@ pub fn copy_reparse(
     raw: bool,
     flush: bool,
     protected_dacl: Option<&ProtectedDacl>,
+    destination_metadata: BasicMetadata,
+    posix_unlink_rename: bool,
 ) -> Result<ReparseCopyResult, ReparseCopyError> {
     let source_before = source_result(metadata_at(source))?;
     if !same_reparse_snapshot(&source_before, expected_source) {
@@ -177,9 +179,10 @@ pub fn copy_reparse(
     temp.commit(
         destination,
         expected_destination.is_some(),
-        expected_source.basic,
+        destination_metadata,
         flush,
         protected_dacl,
+        posix_unlink_rename,
     )?;
     Ok(ReparseCopyResult {
         tag: data.tag,
@@ -389,6 +392,7 @@ impl ReparseTemp {
         metadata: BasicMetadata,
         flush: bool,
         protected_dacl: Option<&ProtectedDacl>,
+        posix_unlink_rename: bool,
     ) -> io::Result<()> {
         let file = self
             .file
@@ -398,7 +402,7 @@ impl ReparseTemp {
             dacl.apply_to(&file)?;
         }
         set_delete_on_close(&file, false)?;
-        if let Err(error) = rename_by_handle(&file, destination, replace) {
+        if let Err(error) = rename_by_handle(&file, destination, replace, posix_unlink_rename) {
             let _ = set_delete_on_close(&file, true);
             self.file = Some(file);
             return Err(error);

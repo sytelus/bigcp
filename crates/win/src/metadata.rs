@@ -12,13 +12,17 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 
+use windows_sys::Win32::Foundation::{
+    ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED,
+};
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
-    FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_ID_EXTD_DIR_INFO, FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo,
-    FileBasicInfo, FileIdExtdDirectoryInfo, FileIdInfo, FileStandardInfo,
-    GetFileInformationByHandleEx,
+    BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_BOTH_DIR_INFO, FILE_ID_EXTD_DIR_INFO, FILE_ID_INFO,
+    FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo, FileBasicInfo,
+    FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo, FileIdExtdDirectoryInfo, FileIdInfo,
+    FileStandardInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
 };
 use windows_sys::Win32::System::SystemServices::{IO_REPARSE_TAG_CLOUD, IO_REPARSE_TAG_CLOUD_MASK};
 
@@ -134,7 +138,6 @@ pub fn metadata_from_file(file: &File) -> io::Result<ObjectMetadata> {
     let raw = file.as_raw_handle().cast();
     let mut basic = FILE_BASIC_INFO::default();
     let mut standard = FILE_STANDARD_INFO::default();
-    let mut identity = FILE_ID_INFO::default();
     let mut tag = FILE_ATTRIBUTE_TAG_INFO::default();
 
     // SAFETY: every output points to a properly aligned initialized structure,
@@ -152,19 +155,16 @@ pub fn metadata_from_file(file: &File) -> io::Result<ObjectMetadata> {
             (&raw mut standard).cast(),
             size_u32::<FILE_STANDARD_INFO>()?,
         ))?;
-        bool_result(GetFileInformationByHandleEx(
-            raw,
-            FileIdInfo,
-            (&raw mut identity).cast(),
-            size_u32::<FILE_ID_INFO>()?,
-        ))?;
-        bool_result(GetFileInformationByHandleEx(
-            raw,
-            FileAttributeTagInfo,
-            (&raw mut tag).cast(),
-            size_u32::<FILE_ATTRIBUTE_TAG_INFO>()?,
-        ))?;
+        if basic.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            bool_result(GetFileInformationByHandleEx(
+                raw,
+                FileAttributeTagInfo,
+                (&raw mut tag).cast(),
+                size_u32::<FILE_ATTRIBUTE_TAG_INFO>()?,
+            ))?;
+        }
     }
+    let identity = identity_from_file(file)?;
 
     let is_cloud = tag.ReparseTag & !IO_REPARSE_TAG_CLOUD_MASK
         == IO_REPARSE_TAG_CLOUD & !IO_REPARSE_TAG_CLOUD_MASK;
@@ -177,10 +177,7 @@ pub fn metadata_from_file(file: &File) -> io::Result<ObjectMetadata> {
     };
 
     Ok(ObjectMetadata {
-        identity: FileIdentity {
-            volume_serial: identity.VolumeSerialNumber,
-            file_id: identity.FileId.Identifier,
-        },
+        identity,
         kind,
         size: nonnegative_u64(standard.EndOfFile, "negative file size")?,
         allocation_size: nonnegative_u64(standard.AllocationSize, "negative allocation size")?,
@@ -207,17 +204,7 @@ pub fn enumerate_directory(path: &Path) -> io::Result<Vec<DirectoryEntry>> {
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
     let directory = options.open(path)?;
-    let mut directory_identity = FILE_ID_INFO::default();
-    // SAFETY: the output is aligned and initialized, and directory remains
-    // open for the call.
-    unsafe {
-        bool_result(GetFileInformationByHandleEx(
-            directory.as_raw_handle().cast(),
-            FileIdInfo,
-            (&raw mut directory_identity).cast(),
-            size_u32::<FILE_ID_INFO>()?,
-        ))?;
-    }
+    let directory_identity = identity_from_file(&directory)?;
 
     // u64 backing gives the Win32 records their required eight-byte alignment.
     let word_count = ENUMERATION_BUFFER_BYTES.div_ceil(size_of::<u64>());
@@ -239,6 +226,13 @@ pub fn enumerate_directory(path: &Path) -> io::Result<Vec<DirectoryEntry>> {
             let error = last_error();
             if error.raw_os_error() == Some(ERROR_NO_MORE_FILES) {
                 break;
+            }
+            if entries.is_empty() && unsupported_information_class(&error) {
+                return enumerate_directory_legacy(
+                    &directory,
+                    path,
+                    directory_identity.volume_serial,
+                );
             }
             return Err(error);
         }
@@ -300,7 +294,7 @@ pub fn enumerate_directory(path: &Path) -> io::Result<Vec<DirectoryEntry>> {
                     name,
                     metadata: ObjectMetadata {
                         identity: FileIdentity {
-                            volume_serial: directory_identity.VolumeSerialNumber,
+                            volume_serial: directory_identity.volume_serial,
                             file_id: record.FileId.Identifier,
                         },
                         kind,
@@ -342,6 +336,190 @@ pub fn enumerate_directory(path: &Path) -> io::Result<Vec<DirectoryEntry>> {
     Ok(entries)
 }
 
+/// Enumerates through the older 64-bit-ID information class used by FAT
+/// drivers that reject `FileIdExtdDirectoryInfo`. This remains a single
+/// directory query stream: FAT support does not regress to one handle-open
+/// syscall per child.
+fn enumerate_directory_legacy(
+    directory: &File,
+    path: &Path,
+    volume_serial: u64,
+) -> io::Result<Vec<DirectoryEntry>> {
+    let word_count = ENUMERATION_BUFFER_BYTES.div_ceil(size_of::<u64>());
+    let mut buffer = vec![0_u64; word_count];
+    let mut entries = Vec::new();
+    let mut restart = true;
+    loop {
+        // SAFETY: buffer is writable and eight-byte aligned; directory stays
+        // open throughout the enumeration sequence.
+        let succeeded = unsafe {
+            GetFileInformationByHandleEx(
+                directory.as_raw_handle().cast(),
+                if restart {
+                    FileIdBothDirectoryRestartInfo
+                } else {
+                    FileIdBothDirectoryInfo
+                },
+                buffer.as_mut_ptr().cast(),
+                u32::try_from(buffer.len() * size_of::<u64>())
+                    .map_err(|_| io::Error::other("enumeration buffer is too large"))?,
+            )
+        };
+        restart = false;
+        if succeeded == 0 {
+            let error = last_error();
+            if error.raw_os_error() == Some(ERROR_NO_MORE_FILES) {
+                break;
+            }
+            return Err(error);
+        }
+
+        let byte_len = buffer.len() * size_of::<u64>();
+        let mut offset = 0_usize;
+        loop {
+            if offset
+                .checked_add(size_of::<FILE_ID_BOTH_DIR_INFO>())
+                .is_none_or(|end| end > byte_len)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "legacy directory enumeration returned a truncated record",
+                ));
+            }
+            if !offset.is_multiple_of(size_of::<u64>()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "legacy directory enumeration returned a misaligned record",
+                ));
+            }
+            // SAFETY: fixed record and alignment were checked above.
+            let record = unsafe {
+                &*buffer
+                    .as_ptr()
+                    .add(offset / size_of::<u64>())
+                    .cast::<FILE_ID_BOTH_DIR_INFO>()
+            };
+            let name_bytes = usize::try_from(record.FileNameLength)
+                .map_err(|_| io::Error::other("file name length does not fit address space"))?;
+            if name_bytes % size_of::<u16>() != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "legacy directory enumeration returned an odd UTF-16 byte length",
+                ));
+            }
+            let name_offset = offset + std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
+            if name_offset
+                .checked_add(name_bytes)
+                .is_none_or(|end| end > byte_len)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "legacy directory enumeration returned a truncated file name",
+                ));
+            }
+            // SAFETY: the name bounds and two-byte alignment were checked.
+            let name_slice = unsafe {
+                std::slice::from_raw_parts(record.FileName.as_ptr(), name_bytes / size_of::<u16>())
+            };
+            let name = OsString::from_wide(name_slice);
+            if name != "." && name != ".." {
+                // FAT/exFAT do not support reparse points. Preserving the
+                // attribute classification still fails safely if a third-
+                // party driver returns one through this legacy class.
+                let kind = classify_kind(record.FileAttributes, 0);
+                let mut file_id = [0_u8; 16];
+                file_id[..8].copy_from_slice(&record.FileId.to_le_bytes());
+                entries.push(DirectoryEntry {
+                    path: path.join(&name),
+                    name,
+                    metadata: ObjectMetadata {
+                        identity: FileIdentity {
+                            volume_serial,
+                            file_id,
+                        },
+                        kind,
+                        size: nonnegative_u64(record.EndOfFile, "negative file size")?,
+                        allocation_size: nonnegative_u64(
+                            record.AllocationSize,
+                            "negative allocation size",
+                        )?,
+                        ea_size: record.EaSize,
+                        basic: BasicMetadata {
+                            creation_time: record.CreationTime,
+                            last_access_time: record.LastAccessTime,
+                            last_write_time: record.LastWriteTime,
+                            attributes: record.FileAttributes,
+                        },
+                        reparse_tag: (kind == ObjectKind::Reparse).then_some(0),
+                    },
+                });
+            }
+            if record.NextEntryOffset == 0 {
+                break;
+            }
+            let next = usize::try_from(record.NextEntryOffset)
+                .map_err(|_| io::Error::other("directory record offset is too large"))?;
+            if next < size_of::<FILE_ID_BOTH_DIR_INFO>()
+                || offset
+                    .checked_add(next)
+                    .is_none_or(|value| value >= byte_len)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "legacy directory enumeration returned an invalid record offset",
+                ));
+            }
+            offset += next;
+        }
+    }
+    Ok(entries)
+}
+
+fn identity_from_file(file: &File) -> io::Result<FileIdentity> {
+    let raw = file.as_raw_handle().cast();
+    let mut identity = FILE_ID_INFO::default();
+    // SAFETY: output is aligned and initialized; the file owns a valid handle.
+    let extended = unsafe {
+        bool_result(GetFileInformationByHandleEx(
+            raw,
+            FileIdInfo,
+            (&raw mut identity).cast(),
+            size_u32::<FILE_ID_INFO>()?,
+        ))
+    };
+    match extended {
+        Ok(()) => Ok(FileIdentity {
+            volume_serial: identity.VolumeSerialNumber,
+            file_id: identity.FileId.Identifier,
+        }),
+        Err(error) if unsupported_information_class(&error) => {
+            let mut legacy = BY_HANDLE_FILE_INFORMATION::default();
+            // SAFETY: output is aligned and initialized; the handle stays live.
+            unsafe {
+                bool_result(GetFileInformationByHandle(raw, &raw mut legacy))?;
+            }
+            let id = (u64::from(legacy.nFileIndexHigh) << 32) | u64::from(legacy.nFileIndexLow);
+            let mut file_id = [0_u8; 16];
+            file_id[..8].copy_from_slice(&id.to_le_bytes());
+            Ok(FileIdentity {
+                volume_serial: u64::from(legacy.dwVolumeSerialNumber),
+                file_id,
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn unsupported_information_class(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(code)
+            if code == ERROR_INVALID_FUNCTION.cast_signed()
+                || code == ERROR_NOT_SUPPORTED.cast_signed()
+                || code == ERROR_INVALID_PARAMETER.cast_signed()
+    )
+}
+
 fn classify_kind(attributes: u32, reparse_tag: u32) -> ObjectKind {
     let is_cloud = reparse_tag & !IO_REPARSE_TAG_CLOUD_MASK
         == IO_REPARSE_TAG_CLOUD & !IO_REPARSE_TAG_CLOUD_MASK;
@@ -366,8 +544,9 @@ fn nonnegative_u64(value: i64, message: &'static str) -> io::Result<u64> {
 /// Re-exports the last Win32 error for focused wrapper tests.
 #[cfg(test)]
 mod tests {
-    use super::{ObjectKind, enumerate_directory, metadata_at};
+    use super::{ObjectKind, enumerate_directory, metadata_at, unsupported_information_class};
     use std::fs;
+    use std::io;
 
     #[test]
     fn enumerates_only_inside_system_temp_sandbox() {
@@ -390,5 +569,17 @@ mod tests {
 
         let metadata = metadata_at(&child);
         assert!(metadata.is_ok());
+    }
+
+    #[test]
+    fn legacy_identity_fallback_is_limited_to_unsupported_information_classes() {
+        for code in [1, 50, 87] {
+            assert!(unsupported_information_class(
+                &io::Error::from_raw_os_error(code)
+            ));
+        }
+        assert!(!unsupported_information_class(
+            &io::Error::from_raw_os_error(5)
+        ));
     }
 }

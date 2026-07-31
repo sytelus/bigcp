@@ -6,8 +6,10 @@ pre-1.0 behavior intended for v1.
 
 ## Object equality and outcomes
 
-For an ordinary file, `Same` means exact unnamed-stream size and exact
-last-write `FILETIME`. Differences only in the copyable attribute mask or
+For an ordinary file, `Same` means exact unnamed-stream size and last-write
+time equal under the destination filesystem policy: exact `FILETIME` on
+NTFS/ReFS, within the representable 2-second interval on FAT, and within the
+10-millisecond interval on exFAT. Differences only in the destination-copyable attribute mask or
 creation time are repaired without rewriting data. Any size or last-write
 difference is replaced unless `--replace=false`. Large-file publication is
 atomic; small-file replacement is direct and recoverable by rerun. Destination-only
@@ -27,9 +29,9 @@ and never claim modeled work was completed.
 
 | Object | Preserved |
 |---|---|
-| File | Unnamed bytes; named `$DATA` streams; EA blob; creation and last-write time; `READONLY`, `HIDDEN`, `SYSTEM`, `ARCHIVE`, `NOT_CONTENT_INDEXED`. |
-| Directory | Existence; named `$DATA` streams; EA blob; the same times and attribute mask, applied post-order; root metadata included. |
-| Symlink/junction | Link target/reparse payload and tag; named `$DATA` streams; EA blob; copied basic metadata. |
+| File | Unnamed bytes always; named `$DATA` streams and EA blob when supported; creation and last-write time at destination granularity; `READONLY`, `HIDDEN`, `SYSTEM`, `ARCHIVE`, plus `NOT_CONTENT_INDEXED` where supported. |
+| Directory | Existence; supported named `$DATA` streams and EA blob; the same projected times and attribute mask, applied post-order; root metadata included. |
+| Symlink/junction | Link target/reparse payload and tag on capable destinations; supported named `$DATA` streams and EA blob; projected basic metadata. FAT/exFAT cannot represent links, so the object fails. |
 
 Last-access time is written best-effort but informational in verification
 because reads legitimately change it. Sparse allocation is preserved when
@@ -42,17 +44,19 @@ Every file starts by opening the source read-only and validating its enumeration
 snapshot. A replacement target is revalidated for identity, kind, size,
 last-write time, attributes, and reparse tag before mutation.
 
-Plain small files with one unnamed stream and no EAs are read and
+Plain small files with one destination-representable unnamed stream and no
+destination-representable EAs are read and
 source-revalidated before destination mutation. A new final name is created
 exclusively; a replacement is opened non-following, identity-checked on that
 same handle, and then truncated in place, preserving its security descriptor.
-The engine writes the one unnamed payload, revalidates the source, optionally
-flushes, and only then reports `copied`. A process kill can leave an incomplete
+The engine writes the one unnamed payload, revalidates the source, restamps it
+after data I/O on FAT-family destinations, optionally flushes, and only then
+reports `copied`. A process kill can leave an incomplete
 final-named plain file, but a mid-write file is shorter than the source and a
 completed whole-buffer write has already completed its logical data.
 
-Files with named streams or EAs, plus large, sparse, and checkpoint-capable
-files, use a unique
+Files with destination-representable named streams or EAs, plus large, sparse,
+and checkpoint-capable files, use a unique
 `.bigcp-<full-run-id>-<nonce>.part` sibling with delete-on-close armed. After
 copy and source/target revalidation, a protected destination DACL is preserved,
 the temp is atomically published, final metadata is applied, and an optional
@@ -71,6 +75,11 @@ owner to the journal-aware streaming path and successfully copied file ADS
 bytes are included in logical copy accounting. EA transfer uses separate
 synchronous buffered handles through `BackupRead`/`BackupWrite`.
 
+When a destination cannot represent named streams or EAs, their source counts
+are reported as dropped and they do not force the transactional path. A source
+volume that advertises neither capability is never queried for it. This keeps
+the ordinary FAT/exFAT data path fast without weakening capable destinations.
+
 Every source/destination named-stream handle is non-following and must report
 the expected base-object identity before I/O. Directory EA and final metadata
 updates perform the same identity check on the handle used for mutation.
@@ -86,12 +95,17 @@ EFS source data is read as plaintext. The destination is asked to encrypt; a
 failure is an explicit `efs_downgrade` warning. Symbolic links are recreated
 with Windows' unprivileged-create flag (when Developer Mode permits it), while
 junctions use their reparse payload. Unknown tags fail unless `--raw-reparse`
-is given.
+is given. On FAT/exFAT, all reparse objects fail rather than being followed or
+flattened. FAT's 4,294,967,295-byte file limit is checked before destination
+mutation.
 
 ## Roots, exclusions, and audit artifacts
 
 Roots are resolved through handles. Equal/nested roots, UNC paths, remote
-volumes, and non-NTFS/ReFS filesystems fail preflight. An existing destination
+volumes, and filesystems other than NTFS, ReFS, FAT/FAT32, and exFAT fail
+preflight. A real FAT/exFAT destination requires one explicit acceptance before
+copy work (`--accept-degraded-filesystem` or the interactive default-no
+startup confirmation). An existing destination
 root is pinned. A missing destination is created component-by-component except
 in dry-run, where only its nearest existing ancestor is pinned.
 
@@ -110,11 +124,15 @@ new work is claimed.
 There are exactly two verification forms:
 
 - `--verify` hashes source buffers during copy, then rereads destination files
-  written by that run, including named streams and EAs.
+  written by that run, including destination-representable named streams, EAs,
+  attributes, and timestamps.
 - `bigcp verify SRC DST` reads both entire trees and compares shape, types,
-  bytes, all named data streams (including streams on links), EA blobs,
-  required metadata, directory/root fields, and raw reparse buffers. Extras
-  and omissions fail.
+  bytes, all destination-representable named data streams (including streams
+  on links), EA blobs, required metadata, directory/root fields, and raw
+  reparse buffers. Extras and omissions fail. On FAT/exFAT the comparison is
+  explicitly projected: success validates every representable field, while
+  warnings/counters describe unsupported source features that could not be
+  preserved.
 
 xxh3-128 detects accidental corruption; it is not a cryptographic integrity
 mechanism. Verification bypasses no honest drive-internal cache guarantee.

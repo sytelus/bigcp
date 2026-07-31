@@ -1,7 +1,9 @@
 # bigcp
 
-`bigcp` is a reliability-first, high-throughput tree copier for local NTFS and
-ReFS volumes on Windows 11 22H2 or later. It is optimized for both large-file
+`bigcp` is a reliability-first, high-throughput tree copier for local NTFS,
+ReFS, FAT/FAT32, and exFAT volumes on Windows 11 22H2 or later. NTFS/ReFS use
+the strict full-fidelity path; FAT-family destinations use an explicit,
+reduced-fidelity policy. It is optimized for both large-file
 streaming and directories containing many small files. Its reliability
 promise is the one that matters: **when a run completes, every reported
 success and failure is exactly true.** If a run is interrupted, re-running it
@@ -33,16 +35,20 @@ treat this build as v1.0 certified until those gates pass. Current evidence and 
   replacements overwrite in place (keeping the destination file's
   permissions); if interrupted, the rerun replaces them — the source is never
   touched, so nothing is ever lost.
-- FAT, exFAT, remote/mapped network volumes, UNC paths, and nested roots are
-  rejected before tree copying.
+- A real FAT/exFAT destination requires one default-no confirmation before any
+  copy work, or `--accept-degraded-filesystem` for deliberate scripted use.
+  UDF/third-party filesystems, remote/mapped volumes, UNC paths, and nested
+  roots are rejected before tree copying.
 - A machine-wide exact-destination lock prevents two writers from targeting
   the same root.
 - Every terminal outcome is written to versioned JSONL and reconciled in the
   final report.
 
-The skip heuristic is exact unnamed-stream size plus exact last-write
-`FILETIME`. It deliberately avoids reading already-matching files. Run
-`bigcp verify` when an authoritative content/ADS/EA/tree comparison is needed.
+The skip heuristic is unnamed-stream size plus last-write time at the
+destination filesystem's representation: exact `FILETIME` on NTFS/ReFS,
+2 seconds on FAT, and 10 milliseconds on exFAT. It deliberately avoids reading
+already-matching files. Run `bigcp verify` when an authoritative comparison of
+content and every destination-representable field is needed.
 
 ## Build
 
@@ -67,6 +73,9 @@ bigcp C:\source D:\destination
 
 # Script-friendly copy and post-copy read-back of files written in this run
 bigcp C:\source D:\destination --plain --verify
+
+# Noninteractive copy to an intentionally reduced-fidelity FAT/exFAT target
+bigcp C:\source E:\destination --plain --accept-degraded-filesystem
 
 # Forecast destination changes without writing the destination tree
 bigcp C:\source D:\destination --dry-run --plain
@@ -96,6 +105,7 @@ xxh3-128 digest agrees.
 | `--no-sparse` | Write sparse source files densely. |
 | `--raw-reparse` | Opt into verbatim unknown reparse buffers. |
 | `--fresh` | Ignore prior partial checkpoints. |
+| `--accept-degraded-filesystem` | Accept FAT/exFAT destination losses without an interactive startup confirmation. |
 | `--profile CLASS[,CLASS]` | Force static source/destination device classes. |
 | `--tune key=value,...` | Override bounded advanced settings. |
 | `--analyze` | Collect bounded live-run insight (size-class timings, top-20 slowest copies, finer stat samples) into the log and report. |
@@ -126,12 +136,22 @@ and caps both chunk size and threshold-sized workers.
 
 ## Fidelity and limits
 
-Data, named `$DATA` streams (including those on directories and links), EAs,
-creation/last-write times, and the user-owned attribute mask are preserved.
+On NTFS/ReFS, data, named `$DATA` streams (including those on directories and
+links), EAs, creation/last-write times, and the user-owned attribute mask are
+preserved where the destination advertises support.
 Directory metadata is finalized post-order. Symlinks and junctions retain
 their targets without traversal. Source ACLs, owner, SACL,
 compression, hard-link topology, and system-managed attributes are not copied.
 Existing explicitly protected destination DACLs are preserved on replacement.
+
+FAT/exFAT cannot represent several of those features. bigcp preserves unnamed
+data and `READONLY`/`HIDDEN`/`SYSTEM`/`ARCHIVE`, projects timestamps to the
+destination granularity and supported date range, copies sparse files densely, and explicitly counts
+and warns about dropped ADS/EAs, expanded sparse files, and EFS state. Links fail instead of being
+followed or flattened. FAT also rejects files larger than 4,294,967,295 bytes
+before opening a destination; timestamps outside the driver's FAT-family date
+range fail rather than being silently invented. Verification on these filesystems validates the
+projected contract; it does not claim unsupported metadata survived.
 See [LIMITATIONS.md](LIMITATIONS.md) and the normative
 [docs/SEMANTICS.md](docs/SEMANTICS.md).
 
@@ -176,9 +196,10 @@ or remove that destination object and rerun so bigcp can recreate it.
 
 ## FAQ
 
-- **Why was my file "skipped"?** Its destination twin matched on size, exact
-  last-write time, attributes, and EA size. Run `bigcp verify SRC DST` for a
-  full content comparison.
+- **Why was my file "skipped"?** Its destination twin matched on size,
+  destination-representable last-write time, attributes, and EA size. Run
+  `bigcp verify SRC DST` for a content comparison of the projected destination
+  contract.
 - **Why did a rerun recopy a file I saw complete?** The run was interrupted
   after data landed but before metadata; the mismatch makes the rerun replace
   it with a fully finished copy. That is the crash-safety design working.
@@ -195,10 +216,11 @@ or remove that destination object and rerun so bigcp can recreate it.
   every detectable incomplete copy.
 - **Why is a second run on the same destination refused?** One run per exact
   destination root per machine, by design (run lock).
-- **Why NTFS/ReFS only, local volumes only?** See LIMITATIONS.md — the
-  restriction buys exact timestamps, stable file IDs, and transactional publication.
-  Note that ReFS support is best-effort at v1 (code-reviewed, not yet
-  certified by its dedicated test matrix); NTFS is the fully verified path,
-  and `bigcp verify` validates any copy regardless of filesystem.
+- **Why does FAT/exFAT require acceptance?** Those filesystems cannot preserve
+  NTFS streams, EAs, ACLs, sparse layout, EFS state, or links, and FAT has a
+  4 GiB-minus-1-byte file limit. The one-time startup warning makes that loss a
+  deliberate choice. NTFS/ReFS retain exact timestamps and their existing
+  capability-based fast path. Local-only remains a separate safety boundary;
+  network filesystems are unsupported.
 
 Licensed under either Apache-2.0 or MIT, at your option.

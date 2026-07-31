@@ -2,6 +2,7 @@
 
 #![deny(unsafe_code)]
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
@@ -19,7 +20,7 @@ use clap::{Args, Parser, Subcommand};
 #[command(
     name = "bigcp",
     version,
-    about = "Reliable, high-throughput local NTFS/ReFS tree copy for Windows 11",
+    about = "Reliable, high-throughput local NTFS/ReFS/FAT/exFAT tree copy for Windows 11",
     disable_help_subcommand = true
 )]
 struct Cli {
@@ -105,6 +106,10 @@ struct CopyFlags {
     /// Ignore prior checkpoints and start new partials.
     #[arg(long)]
     fresh: bool,
+
+    /// Accept timestamp/metadata degradation on FAT or exFAT destinations.
+    #[arg(long)]
+    accept_degraded_filesystem: bool,
 
     /// Device class (auto|nvme|sata-ssd|usb-ssd|hdd|unknown), or "SRC,DST".
     #[arg(long, value_parser = parse_profiles, value_name = "CLASS[,CLASS]")]
@@ -203,9 +208,16 @@ fn execute(cli: Cli) -> Result<u8, (u8, String)> {
             let destination = cli
                 .destination
                 .ok_or_else(|| (5, "copy requires SRC and DST; see --help".to_owned()))?;
-            warn_quick_removal_destination(
+            let accept_degraded_filesystem = confirm_preflight_warnings(
+                &source,
                 &destination,
-                stdout_is_terminal() && !cli.flags.plain && !cli.flags.quiet && !cli.flags.dry_run,
+                std::io::stdin().is_terminal()
+                    && stdout_is_terminal()
+                    && !cli.flags.plain
+                    && !cli.flags.quiet
+                    && !cli.flags.dry_run,
+                cli.flags.accept_degraded_filesystem,
+                cli.flags.dry_run,
             )?;
             let mut options = CopyOptions::new(source, destination);
             options.dry_run = cli.flags.dry_run;
@@ -218,6 +230,7 @@ fn execute(cli: Cli) -> Result<u8, (u8, String)> {
             options.analyze = cli.flags.analyze;
             options.raw_reparse = cli.flags.raw_reparse;
             options.fresh = cli.flags.fresh;
+            options.accept_degraded_filesystem = accept_degraded_filesystem;
             options.state_dir = cli.flags.state_dir;
             options.log_path = cli.flags.log;
             options.report_path = cli.flags.report;
@@ -254,6 +267,7 @@ fn reject_copy_only_flags(flags: &CopyFlags) -> Result<(), (u8, String)> {
         || flags.analyze
         || flags.raw_reparse
         || flags.fresh
+        || flags.accept_degraded_filesystem
         || flags.profile.is_some()
         || flags.tune.is_some()
         || flags.state_dir.is_some()
@@ -366,58 +380,107 @@ fn exit_for_error(error: &bigcp_core::BigcpError) -> u8 {
     }
 }
 
-/// Warns — and in an interactive terminal, confirms — before copying onto a
-/// destination whose device write cache is disabled (the Quick-removal
-/// policy), which was measured at ~3.4x slower for metadata-heavy small-file
-/// workloads (BENCHMARKS.md 2026-07-29; ADR 0032). Detection failures stay
-/// silent, non-interactive runs only warn, and bigcp never changes the
-/// policy itself.
-fn warn_quick_removal_destination(
+/// Emits all known pre-copy filesystem/device warnings and prompts at most
+/// once. FAT-family fidelity loss requires explicit acceptance (interactive
+/// `yes` or `--accept-degraded-filesystem`); Quick-removal remains a warning
+/// with an interactive opt-out. Detection failures stay silent and bigcp
+/// never changes device policy itself (ADR 0032/0035).
+fn confirm_preflight_warnings(
+    source: &std::path::Path,
     destination: &std::path::Path,
     interactive: bool,
-) -> Result<(), (u8, String)> {
-    let mut probe = destination.to_path_buf();
-    let volume = loop {
+    accepted_degradation: bool,
+    dry_run: bool,
+) -> Result<bool, (u8, String)> {
+    // `GetVolumePathNameW` is most reliable with an absolute path. Resolve
+    // lexically here so a relative, not-yet-created FAT destination can still
+    // receive its one interactive acceptance instead of reaching the core
+    // gate without a way to answer it.
+    let source_probe = std::path::absolute(source).unwrap_or_else(|_| source.to_path_buf());
+    let source_volume = bigcp_win::probe_volume(&source_probe).ok();
+    let mut probe = std::path::absolute(destination).unwrap_or_else(|_| destination.to_path_buf());
+    let destination_volume = loop {
         match bigcp_win::probe_volume(&probe) {
             Ok(volume) => break volume,
             Err(_) => {
                 if !probe.pop() {
-                    return Ok(());
+                    return Ok(accepted_degradation);
                 }
             }
         }
     };
-    let device = bigcp_win::profile_device(&volume);
-    if device.write_cache_enabled != Some(false) {
-        return Ok(());
+    let degraded = destination_volume.filesystem.is_fat_family();
+    if degraded {
+        let source_name = source_volume
+            .as_ref()
+            .map_or("source", |volume| volume.filesystem.name());
+        eprintln!(
+            "warning: copying from {source_name} to {} requires reduced-fidelity semantics.\n  Creation and last-write times use the destination's coarser, range-limited representation;\n  only READONLY, HIDDEN, SYSTEM, and ARCHIVE attributes are representable. Named streams,\n  EAs, sparse layout, EFS state, ACLs, and reparse points cannot be preserved. Reparse\n  objects fail without being followed.{}",
+            destination_volume.filesystem.name(),
+            if destination_volume.filesystem.maximum_file_size().is_some() {
+                " FAT files larger than 4 GiB minus 1 byte fail before writing."
+            } else {
+                ""
+            }
+        );
     }
-    eprintln!(
-        "warning: the destination drive has write caching disabled (Windows 'Quick removal' \
+    let device = bigcp_win::profile_device(&destination_volume);
+    let quick_removal = device.write_cache_enabled == Some(false);
+    if quick_removal {
+        eprintln!(
+            "warning: the destination drive has write caching disabled (Windows 'Quick removal' \
          policy).\n  Copies with many small files run several times slower this way (~3.4x \
          measured).\n  To speed it up: Device Manager > the drive > Policies > 'Better \
          performance', and check\n  'Enable write caching on the device'. Leave 'Turn off \
          Windows write-cache buffer flushing'\n  UNCHECKED — that setting risks filesystem \
          corruption on power loss, which a re-run cannot\n  repair. With caching on, always \
          use Safely Remove Hardware before unplugging."
-    );
-    if interactive {
-        eprint!("Continue with the current policy? [Y/n] ");
+        );
+    }
+
+    let needs_degradation_confirmation = degraded && !accepted_degradation && !dry_run;
+    if needs_degradation_confirmation && !interactive {
+        return Err((
+            5,
+            "FAT/exFAT destination requires confirmation, but no interactive prompt is available; pass --accept-degraded-filesystem after reviewing the warning"
+                .to_owned(),
+        ));
+    }
+    if interactive && (needs_degradation_confirmation || quick_removal) {
+        if needs_degradation_confirmation {
+            eprint!("Continue with reduced filesystem fidelity? [y/N] ");
+        } else {
+            eprint!("Continue with the current drive policy? [Y/n] ");
+        }
         let mut answer = String::new();
-        if std::io::stdin().read_line(&mut answer).is_ok()
-            && answer.trim_start().to_ascii_lowercase().starts_with('n')
-        {
+        let read = std::io::stdin().read_line(&mut answer);
+        let accepted =
+            read.is_ok() && prompt_answer_accepted(&answer, needs_degradation_confirmation);
+        if !accepted {
             return Err((
                 5,
-                "aborted before any copying: adjust the drive policy and run again".to_owned(),
+                "aborted before any copying; no destination-tree changes were made".to_owned(),
             ));
         }
+        if needs_degradation_confirmation {
+            return Ok(true);
+        }
     }
-    Ok(())
+    Ok(accepted_degradation)
+}
+
+fn prompt_answer_accepted(answer: &str, degradation_confirmation: bool) -> bool {
+    let normalized = answer.trim().to_ascii_lowercase();
+    if degradation_confirmation {
+        matches!(normalized.as_str(), "y" | "yes")
+    } else {
+        !normalized.starts_with('n')
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, execute};
+    use super::{Cli, Command, execute, prompt_answer_accepted};
     use clap::Parser;
 
     #[test]
@@ -459,5 +522,41 @@ mod tests {
     fn removed_nonfunctional_stream_tuning_is_rejected() {
         let parsed = Cli::try_parse_from(["bigcp", "source", "destination", "--tune", "streams=2"]);
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn degraded_filesystem_acceptance_is_copy_only_and_explicit() {
+        let copy = Cli::try_parse_from([
+            "bigcp",
+            "source",
+            "destination",
+            "--accept-degraded-filesystem",
+        ]);
+        assert!(copy.is_ok_and(|value| value.flags.accept_degraded_filesystem));
+
+        let verify = Cli::try_parse_from([
+            "bigcp",
+            "--accept-degraded-filesystem",
+            "verify",
+            "source",
+            "destination",
+        ]);
+        assert!(verify.is_ok());
+        let Some(verify) = verify.ok() else {
+            return;
+        };
+        assert!(execute(verify).is_err_and(|(code, message)| {
+            code == 5 && message.contains("copy flags are not accepted")
+        }));
+    }
+
+    #[test]
+    fn degradation_prompt_defaults_no_while_quick_removal_defaults_yes() {
+        assert!(!prompt_answer_accepted("", true));
+        assert!(!prompt_answer_accepted("maybe", true));
+        assert!(prompt_answer_accepted("YES", true));
+
+        assert!(prompt_answer_accepted("", false));
+        assert!(!prompt_answer_accepted("no", false));
     }
 }

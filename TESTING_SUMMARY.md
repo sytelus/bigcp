@@ -2,6 +2,63 @@
 
 Latest review: 2026-07-30
 
+## 2026-07-30 FAT/FAT32/exFAT support validation
+
+The owner-authorized filesystem-policy change passed every routine gate after
+FAT/FAT32 and exFAT support, documentation, and ADR 0035 landed. The full
+serial suite ran only below this new C: system-temporary root:
+
+`C:\Users\shitals\AppData\Local\Temp\bigcp-fat-exfat-cf85c24844ef4bb985ebe5ead955505b`
+
+All 95 tests passed with zero failures: 6 CLI, 34 core unit, 14 core
+end-to-end, 8 testkit safety, 2 TUI, and 31 Windows-boundary tests. New cases
+pin FAT/exFAT timestamp and attribute projection, FAT's exact file-size
+boundary, strict NTFS tick equality, projected-report serialization, the
+default-no degradation prompt, explicit copy-only acceptance, fast routing
+when an unrepresentable large ADS is dropped, and the narrow Win32 error sets
+that authorize legacy identity/enumeration/rename fallback. The unchanged 14
+end-to-end cases continue to exercise the strict NTFS copy/rerun/ADS/EA/sparse/
+link/cancellation/audit contract.
+
+The post-change gates were:
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`
+- `cargo test --workspace --all-targets --locked -- --test-threads=1`
+- warning-denied `cargo doc --workspace --no-deps --locked`
+- `cargo build --workspace --release --locked`
+- `cargo deny check` (advisories, bans, licenses, and sources passed; the
+  existing informational `hashbrown` and `syn` duplicate-version warnings
+  remain)
+- `cargo audit` against 1,174 RustSec advisories (no vulnerability across 146
+  locked dependencies)
+- the frozen/governing-input and automated test-storage safety checks
+
+The optimized NTFS smoke workflow ran in:
+
+`C:\Users\shitals\AppData\Local\Temp\bigcp-fat-exfat-smoke-c672d729ac794a73bf6e540b65df5b25`
+
+It generated 3 directories, 5 files, and 78,848 logical bytes; proved dry-run
+left the destination absent; copied and same-run verified all five; converged
+to five skips on rerun; passed standalone verification and the independent
+nine-object oracle with zero mismatches/extras; and reopened the saved report.
+The report identifies NTFS and marks this strict verification as
+`projected: false`.
+
+This session was not elevated and had no `New-VHD`/`Mount-VHD` cmdlets, so the
+disposable FAT32/exFAT/ReFS VHDX matrix did not run. No disk was mounted,
+formatted, dismounted, or otherwise modified. The implementation is therefore
+explicitly not FAT/exFAT matrix-certified; `LIMITATIONS.md`, PLAN §12.5, ADR
+0035, and `docs/PRODUCTION_READINESS.md` preserve that evidence boundary.
+
+The owner-approved governing documents were re-pinned to:
+
+| File | SHA-256 |
+|---|---|
+| `PLAN.md` | `19C964E77CF5363F36F8F664CE79341E6F94CBEDB86117AFF6203BB37DE0A427` |
+| `VISION.md` | `FCB948161642B8519AED534C05183713180C4405B0A8DB20A1AB122A4F898C5B` |
+| `LIMITATIONS.md` | `EAD3C7E22F2F760CA4AC213E82CBFDB34EDDC249092CD18669A0D507DBC1B72D` |
+
 ## 2026-07-30 full-repository review validation
 
 The owner-authorized full review passed every routine quality gate after the

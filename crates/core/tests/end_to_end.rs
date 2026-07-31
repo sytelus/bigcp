@@ -97,6 +97,7 @@ fn copy_rerun_and_both_verification_forms_converge() -> Result<(), Box<dyn std::
             attributes: 0,
         },
         false,
+        true,
     )?;
     let expected_file_logical_bytes = fs::metadata(&small)?
         .len()

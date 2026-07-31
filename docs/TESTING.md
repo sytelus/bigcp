@@ -15,8 +15,8 @@ source-like user data.
 
 Routine tests must not mount, format, dismount, fill, benchmark, or issue raw
 operations to any drive. No cable-removal test is routine. VHDX and hardware
-matrices are manual future gates and require a separate disposable fixture;
-they were not run during initial implementation.
+matrices are manual gates and require a separate disposable fixture; they are
+never part of the default test command.
 
 Write budgets:
 
@@ -122,6 +122,24 @@ They use Developer Mode when available and skip link creation on hosts that do
 not authorize the source fixture; they never target an existing file outside
 the sandbox.
 
+## Elevated filesystem matrix
+
+FAT32/exFAT and ReFS certification uses only newly created, uniquely named
+VHDX files in a separately approved scratch directory. The operator must be
+an administrator and must validate the VHD path and the mounted disk identity
+before initializing or formatting it. Existing disks, partitions, drive
+letters, and user data are never matrix targets. Each virtual disk is mounted,
+tested, cleanly dismounted, and then the test-owned VHDX may be removed.
+
+The FAT-family cells cover acceptance bypass, direct-small and transactional
+large paths, timestamp comparison boundaries, `READONLY`/`HIDDEN`/`SYSTEM`/
+`ARCHIVE`, ADS/EA drops, dense sparse expansion, link rejection, FAT's
+4,294,967,295-byte limit (primarily through a synthetic boundary test), rerun
+convergence, projected verification, and the identity/enumeration/rename
+fallbacks selected by the mounted driver. This matrix is not routine CI and
+must be recorded in `TESTING_SUMMARY.md`; absence of that evidence means the
+filesystem is implemented but not matrix-certified.
+
 ## Adding a test
 
 1. State its fresh-write ceiling in the test or scenario.
@@ -155,8 +173,9 @@ bounded real-process chaos passes, emitted-instance schema validation,
 synthetic-enumeration scale simulation, and real-hardware throughput gates
 within bounded write budgets require dedicated work and hardware. They are
 release-blocking before a 1.0 claim and run only on explicit owner request;
-the elevated VHDX/ReFS matrix and differential OS-copy comparisons are
-post-v1 evidence, not 1.0 gates. See PLAN §12.10, §13.2, and `BENCHMARKS.md`.
+the elevated NTFS/ReFS/FAT32/exFAT VHDX matrix and differential OS-copy
+comparisons are post-v1/matrix-certification evidence under ADRs 0029/0035.
+See PLAN §12.10, §13.2, and `BENCHMARKS.md`.
 Hours-long
 soaks, million-entry real trees, and forced-disconnect tests are not deferred —
 they are prohibited (VISION) and will never run.

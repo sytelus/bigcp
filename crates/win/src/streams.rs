@@ -30,6 +30,19 @@ pub struct StreamInfo {
 }
 
 impl StreamInfo {
+    /// Constructs the ordinary unnamed data stream without querying ADS.
+    ///
+    /// FAT-family volumes do not support named streams, so callers can avoid
+    /// an unsupported discovery syscall while retaining the shared engine's
+    /// stream-oriented accounting.
+    #[must_use]
+    pub fn unnamed(size: u64) -> Self {
+        Self {
+            name: OsString::from("::$DATA"),
+            size,
+        }
+    }
+
     /// Returns true for the ordinary unnamed data stream.
     #[must_use]
     pub fn is_unnamed(&self) -> bool {

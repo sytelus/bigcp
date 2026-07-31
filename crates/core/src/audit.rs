@@ -342,6 +342,7 @@ pub fn option_summary(options: &CopyOptions) -> serde_json::Value {
         "no_sparse": options.no_sparse,
         "raw_reparse": options.raw_reparse,
         "fresh": options.fresh,
+        "accept_degraded_filesystem": options.accept_degraded_filesystem,
         "source_profile": options.source_profile,
         "destination_profile": options.destination_profile,
         "tune": options.tune,

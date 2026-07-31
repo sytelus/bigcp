@@ -7,6 +7,15 @@ versioning once its 1.0 release gates are complete.
 
 ### Added
 
+- Local FAT/FAT32 and exFAT source/destination support behind an isolated
+  filesystem policy. FAT-family copies preserve representable unnamed data,
+  timestamps, and attributes; report unsupported feature loss explicitly;
+  enforce FAT's file-size ceiling before writes; and verify the projected
+  destination contract. Real reduced-fidelity copies require one startup
+  acceptance or `--accept-degraded-filesystem` for noninteractive use.
+- Fast FAT-family Win32 fallbacks for legacy 64-bit file identity, one-pass
+  directory enumeration, and handle-bound legacy rename when a driver rejects
+  the newer information classes.
 - Initial pre-1.0 Windows implementation: safe Win32 boundary, NTFS/ReFS
   preflight, iterative join, bounded workers, atomic temp publication,
   stream/EA/sparse/reparse handling, CRC journal, JSONL audit, JSON report,
@@ -15,6 +24,13 @@ versioning once its 1.0 release gates are complete.
 
 ### Changed
 
+- FAT/exFAT support leaves the NTFS/ReFS hot path strict: exact timestamp
+  equality, 128-bit identity enumeration, capability-gated POSIX rename, and
+  no FAT-only final restamp. Unsupported destination ADS/EAs no longer promote
+  ordinary files onto the transactional path, avoiding needless FAT/exFAT I/O.
+- Updated VISION, PLAN, LIMITATIONS, the normative semantics, design,
+  production/testing guidance, schemas, and ADR history for the new filesystem
+  contract; ADR 0035 supersedes the NTFS/ReFS-only ADR 0020.
 - 2026-07-30 comprehensive review: isolated phase metrics per run, made audit
   failover events use the normal timestamped JSON serializer, validated small
   replacement targets on the exact opened handle before truncation, restored

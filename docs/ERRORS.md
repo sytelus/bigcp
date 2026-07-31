@@ -2,9 +2,9 @@
 
 This table is a hand-maintained mirror of `crates/core/src/error.rs` (no
 generator exists yet — PLAN §14.1's generated form is release work); any change
-to the code table must update this file in the same commit. The `fs_limit`
-category is currently reserved: on NTFS/ReFS-only volumes no shipped path
-produces it, and capability shortfalls surface as warnings instead.
+to the code table must update this file in the same commit. Optional
+capability shortfalls surface as explicit warnings; hard representation limits
+use `fs_limit` before destination mutation.
 
 | Category | Typical condition | Resolution hint |
 |---|---|---|
@@ -14,7 +14,7 @@ produces it, and capability shortfalls surface as warnings instead.
 | `space` | Disk full (39/112). | Free destination space, then rerun to resume. |
 | `media` | CRC/device I/O error (23/1117). | Stop and check drive health first. |
 | `device_gone` | Device unavailable (433/1167). | Reconnect and rerun to resume. |
-| `fs_limit` | Destination lacks a required feature. | Use capable NTFS/ReFS storage. |
+| `fs_limit` | A required object cannot be represented (for example a link on FAT/exFAT) or a file exceeds FAT's 4,294,967,295-byte limit. | Use NTFS/ReFS/exFAT as appropriate, or omit the unsupported source object. |
 | `source_changed` | Source identity/size/mtime changed. | Quiesce source writers and rerun. |
 | `destination_changed` | Target changed after classification or a new-name collision occurred (80/183). | Stop destination writers and rerun. |
 | `unsupported_reparse` | Unknown link/filter tag. | Use `--raw-reparse` only with the owning filter and understood risk. |

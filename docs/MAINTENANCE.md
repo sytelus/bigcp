@@ -4,9 +4,9 @@
 
 | Area | Responsibility |
 |---|---|
-| `crates/win/src/path.rs`, `metadata.rs`, `volume.rs`, `device.rs`, `lock.rs`, `util.rs` | Lossless paths, handle identity, 256 KiB enumeration, supported-volume and query-only device facts, run lock, shared error helpers. |
+| `crates/win/src/path.rs`, `metadata.rs`, `volume.rs`, `device.rs`, `lock.rs`, `util.rs` | Lossless paths, 128/64-bit handle identity, fast/fallback 256 KiB enumeration, supported-volume and query-only device facts, run lock, shared error helpers. |
 | `crates/win/src/file.rs`, `streams.rs`, `ea.rs`, `sparse.rs`, `reparse.rs`, `security.rs` | Read-only source and capability-bearing destination primitives; the only unsafe boundary. |
-| `crates/core/src/model.rs`, `options.rs`, `classify.rs`, `copy.rs`, `worker.rs`, `engine.rs` | Work model, validated options, join, terminal outcomes, bounded scheduling, direct-plain-small and transactional auxiliary/sparse/large copy. |
+| `crates/core/src/model.rs`, `options.rs`, `filesystem.rs`, `classify.rs`, `copy.rs`, `worker.rs`, `engine.rs` | Work model, validated options, immutable destination filesystem policy, join, terminal outcomes, bounded scheduling, direct-plain-small and transactional auxiliary/sparse/large copy. |
 | `crates/core/src/journal.rs`, `audit.rs`, `report.rs`, `stats.rs`, `devprofile.rs` | Resume hints, public artifacts, throughput windows, static profiles. |
 | `crates/core/src/verify.rs` | Post-copy and standalone verification. |
 | `crates/tui` | Immutable-snapshot live UI and saved report browser. |
@@ -29,7 +29,7 @@
 | I10 | No source-tree writes. | All write constructors accept destination/audit paths; preflight audit containment. |
 | I11 | Destination mutations revalidate targets. | Identity/kind/size/mtime/attributes/reparse-tag snapshot before repair/replacement; directory stream, EA, and metadata updates recheck identity on their write handle. |
 | I12 | One writer per exact destination. | Global mutex with exact-root hash. |
-| I13 | Resume verifies the prefix. | Source/temp identities, source size/mtime, prefix reread, and exact xxh3 boundary digest must all match. |
+| I13 | Resume verifies the prefix. | Source/temp identities (128-bit or driver-backed legacy 64-bit), source size/mtime, prefix reread, and exact xxh3 boundary digest must all match. |
 
 Changes to an invariant require a focused test and an ADR. The current suite is
 not a substitute for the plan's future fault-injection and chaos release gates.
@@ -64,8 +64,8 @@ declared write budget. Update `docs/TESTING.md` and a bounded example YAML.
 
 ### Change copy semantics
 
-Update `docs/SEMANTICS.md`, add an ADR, review `LIMITATIONS.md` (do not edit the
-frozen input for ordinary implementation work), update schemas, and run the
+Update `docs/SEMANTICS.md`, add an ADR, review `LIMITATIONS.md` (governing-file
+edits require explicit owner authorization and refreshed frozen hashes), update schemas, and run the
 independent oracle. A finalizer or journal change also requires future chaos
 coverage before release.
 
@@ -114,6 +114,9 @@ replacements, warnings, grouped failures, extras, hints, and verification.
   rename to override it.
 - **Oracle:** independent, simple full-tree comparator in `bigcp-testkit`.
 - **Breaker:** stop-dispatch policy for device loss or capacity exhaustion.
+- **Filesystem policy:** one immutable destination contract for timestamp and
+  attribute representation, hard limits, and post-write metadata behavior;
+  optional operations remain driven by probed capability flags.
 - **FMEA:** explicit failure-mode/effect analysis behind crash invariants.
 - **Reparse point:** filesystem object carrying a tagged buffer (symlink,
   junction, cloud placeholder); never traversed, copied by tag policy.
@@ -128,8 +131,8 @@ replacements, warnings, grouped failures, extras, hints, and verification.
 
 ## Release checklist
 
-1. Ensure `git status` contains only intended changes and frozen inputs are
-   byte-identical.
+1. Ensure `git status` contains only intended changes and governing inputs
+   match the reviewed hashes in the frozen-input checker.
 2. Run format check, clippy `-D warnings`, full tests in a validated C: sandbox,
    `cargo deny check`, and `cargo audit`.
 3. Confirm both JSON schema files parse and carry the expected `$id`/version

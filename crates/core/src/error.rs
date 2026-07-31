@@ -175,7 +175,7 @@ fn hint_for(category: ErrorCategory) -> &'static str {
         ErrorCategory::Media => "Check the drive and its health before re-running",
         ErrorCategory::DeviceGone => "Reconnect the device and re-run to resume",
         ErrorCategory::FsLimit => {
-            "Use an NTFS or ReFS destination that supports this object feature"
+            "Use a destination filesystem that supports this object type, feature, or size"
         }
         ErrorCategory::SourceChanged => "Quiesce source writers and re-run",
         ErrorCategory::DestinationChanged => "Stop other destination writers and re-run",

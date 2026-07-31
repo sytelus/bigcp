@@ -65,6 +65,13 @@ pub struct CopyOptions {
     pub raw_reparse: bool,
     /// Ignore prior journal checkpoints.
     pub fresh: bool,
+    /// Explicitly accept fidelity projection on a FAT-family destination.
+    ///
+    /// The CLI sets this after its one-time interactive confirmation or when
+    /// `--accept-degraded-filesystem` is supplied. Library callers must make
+    /// the same decision explicitly; dry-runs are exempt because they write
+    /// nothing.
+    pub accept_degraded_filesystem: bool,
     /// Optional audit state directory.
     pub state_dir: Option<PathBuf>,
     /// Optional JSONL log path.
@@ -96,6 +103,7 @@ impl CopyOptions {
             analyze: false,
             raw_reparse: false,
             fresh: false,
+            accept_degraded_filesystem: false,
             state_dir: None,
             log_path: None,
             report_path: None,

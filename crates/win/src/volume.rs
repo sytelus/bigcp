@@ -1,4 +1,4 @@
-//! Volume capability probing and the NTFS/ReFS/local-volume pre-flight gate.
+//! Volume capability probing and the supported-local-volume pre-flight gate.
 
 use std::ffi::OsString;
 use std::io;
@@ -10,8 +10,9 @@ use windows_sys::Win32::Storage::FileSystem::{
     GetVolumePathNameW,
 };
 use windows_sys::Win32::System::SystemServices::{
-    FILE_NAMED_STREAMS, FILE_SUPPORTS_BLOCK_REFCOUNTING, FILE_SUPPORTS_ENCRYPTION,
-    FILE_SUPPORTS_EXTENDED_ATTRIBUTES, FILE_SUPPORTS_REPARSE_POINTS, FILE_SUPPORTS_SPARSE_FILES,
+    FILE_NAMED_STREAMS, FILE_PERSISTENT_ACLS, FILE_SUPPORTS_BLOCK_REFCOUNTING,
+    FILE_SUPPORTS_ENCRYPTION, FILE_SUPPORTS_EXTENDED_ATTRIBUTES, FILE_SUPPORTS_POSIX_UNLINK_RENAME,
+    FILE_SUPPORTS_REPARSE_POINTS, FILE_SUPPORTS_SPARSE_FILES,
 };
 use windows_sys::Win32::System::WindowsProgramming::{DRIVE_NO_ROOT_DIR, DRIVE_REMOTE};
 
@@ -24,6 +25,40 @@ pub enum FileSystem {
     Ntfs,
     /// Microsoft Resilient File System.
     Refs,
+    /// The classic FAT family (FAT12, FAT16, or FAT32).
+    Fat,
+    /// Microsoft Extended FAT.
+    ExFat,
+}
+
+impl FileSystem {
+    /// Stable user-facing filesystem name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Ntfs => "NTFS",
+            Self::Refs => "ReFS",
+            Self::Fat => "FAT/FAT32",
+            Self::ExFat => "exFAT",
+        }
+    }
+
+    /// Whether this filesystem requires representational degradation.
+    #[must_use]
+    pub const fn is_fat_family(self) -> bool {
+        matches!(self, Self::Fat | Self::ExFat)
+    }
+
+    /// Maximum representable unnamed-stream size, when bounded below `u64`.
+    #[must_use]
+    pub const fn maximum_file_size(self) -> Option<u64> {
+        match self {
+            // FAT directory entries carry a 32-bit byte length. The all-ones
+            // value is the largest byte count that can be represented.
+            Self::Fat => Some(4_294_967_295),
+            Self::Ntfs | Self::Refs | Self::ExFat => None,
+        }
+    }
 }
 
 /// Capability flags queried from the mounted destination.
@@ -41,6 +76,10 @@ pub struct VolumeCapabilities {
     pub reparse_points: bool,
     /// Block-refcounting support, used only for the same-volume ReFS hint.
     pub block_refcounting: bool,
+    /// Persistent security descriptor / ACL support.
+    pub persistent_acls: bool,
+    /// POSIX-style unlink/rename support for replacement publication.
+    pub posix_unlink_rename: bool,
 }
 
 /// Immutable facts used by pre-flight, tuning, and reports.
@@ -125,11 +164,17 @@ pub fn probe_volume(path: &Path) -> io::Result<VolumeInfo> {
         FileSystem::Ntfs
     } else if filesystem_name.eq_ignore_ascii_case("ReFS") {
         FileSystem::Refs
+    } else if filesystem_name.eq_ignore_ascii_case("FAT")
+        || filesystem_name.eq_ignore_ascii_case("FAT32")
+    {
+        FileSystem::Fat
+    } else if filesystem_name.eq_ignore_ascii_case("exFAT") {
+        FileSystem::ExFat
     } else {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             format!(
-                "bigcp supports NTFS and ReFS volumes only; found {filesystem_name}. Reformat the volume or use robocopy for legacy media"
+                "bigcp supports NTFS, ReFS, FAT/FAT32, and exFAT local volumes; found {filesystem_name}"
             ),
         ));
     };
@@ -174,6 +219,8 @@ pub fn probe_volume(path: &Path) -> io::Result<VolumeInfo> {
             encryption: flags & FILE_SUPPORTS_ENCRYPTION != 0,
             reparse_points: flags & FILE_SUPPORTS_REPARSE_POINTS != 0,
             block_refcounting: flags & FILE_SUPPORTS_BLOCK_REFCOUNTING != 0,
+            persistent_acls: flags & FILE_PERSISTENT_ACLS != 0,
+            posix_unlink_rename: flags & FILE_SUPPORTS_POSIX_UNLINK_RENAME != 0,
         },
     })
 }
@@ -198,8 +245,20 @@ mod tests {
         };
         assert!(matches!(
             info.filesystem,
-            FileSystem::Ntfs | FileSystem::Refs
+            FileSystem::Ntfs | FileSystem::Refs | FileSystem::Fat | FileSystem::ExFat
         ));
         assert!(info.cluster_size > 0);
+    }
+
+    #[test]
+    fn fat_size_limit_is_explicit_and_exfat_is_not_artificially_capped() {
+        assert_eq!(
+            FileSystem::Fat.maximum_file_size(),
+            Some(u64::from(u32::MAX))
+        );
+        assert_eq!(FileSystem::ExFat.maximum_file_size(), None);
+        assert!(FileSystem::Fat.is_fat_family());
+        assert!(FileSystem::ExFat.is_fat_family());
+        assert!(!FileSystem::Ntfs.is_fat_family());
     }
 }

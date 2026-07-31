@@ -2,9 +2,9 @@
 //!
 //! Plain small files are fully read and source-revalidated before the
 //! destination is touched, then written directly to their final name
-//! (rerun-repair crash contract, ADR 0030). Files with auxiliary streams or
-//! EAs and all large files use an opaque temporary so one logical file is
-//! published atomically (ADR 0034).
+//! (rerun-repair crash contract, ADR 0030). Files with destination-representable
+//! auxiliary streams or EAs and all large files use an opaque temporary so one
+//! logical file is published atomically (ADRs 0034/0035).
 
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -66,6 +66,10 @@ pub struct EngineRequest<'a> {
     pub flush: bool,
     /// Whether the destination can represent named streams.
     pub destination_supports_streams: bool,
+    /// Whether source stream discovery is meaningful on this filesystem.
+    pub source_supports_streams: bool,
+    /// Whether source EA reads are meaningful on this filesystem.
+    pub source_supports_eas: bool,
     /// Whether the destination volume advertises extended-attribute support.
     pub destination_supports_eas: bool,
     /// Composed profile chunk bytes.
@@ -76,6 +80,14 @@ pub struct EngineRequest<'a> {
     pub checkpoint_threshold: u64,
     /// Whether the destination advertises EFS support.
     pub destination_supports_encryption: bool,
+    /// Whether protected destination DACLs can exist and need preservation.
+    pub destination_supports_persistent_acls: bool,
+    /// Whether publication can use POSIX unlink/rename semantics.
+    pub destination_supports_posix_unlink_rename: bool,
+    /// Source metadata projected to fields the destination can represent.
+    pub destination_metadata: bigcp_win::BasicMetadata,
+    /// Whether data writes require a final FAT-family metadata restamp.
+    pub destination_requires_post_write_stamp: bool,
     /// Graceful-cancel probe checked between chunks so very large files do
     /// not delay a requested stop until they finish (the in-flight temp
     /// self-deletes or resumes from its last verified checkpoint).
@@ -112,8 +124,12 @@ pub fn copy_file(
     request.phases.record(0, timer.elapsed());
 
     let discovered_streams;
+    let synthetic_streams;
     let streams = if let Some(streams) = request.known_streams {
         streams
+    } else if !request.source_supports_streams {
+        synthetic_streams = vec![StreamInfo::unnamed(request.source_snapshot.metadata.size)];
+        &synthetic_streams
     } else {
         let timer = std::time::Instant::now();
         discovered_streams = list_streams(request.source_path)
@@ -121,11 +137,14 @@ pub fn copy_file(
         request.phases.record(1, timer.elapsed());
         &discovered_streams
     };
-    let largest_stream = streams
-        .iter()
-        .map(|stream| stream.size)
-        .max()
-        .unwrap_or(request.source_snapshot.metadata.size);
+    let routing = route_streams(
+        streams,
+        request.source_snapshot.metadata.size,
+        request.destination_supports_streams,
+        journal.is_some(),
+        request.checkpoint_threshold,
+    );
+    let largest_stream = routing.largest_representable;
     if let Some(threshold) = request.promote_threshold
         && largest_stream >= threshold
     {
@@ -138,13 +157,13 @@ pub fn copy_file(
             "stream set requires coordinator streaming",
         ));
     }
-    let checkpoint_eligible = journal.is_some()
-        && streams
-            .iter()
-            .any(|stream| stream.size >= request.checkpoint_threshold);
+    let checkpoint_eligible = routing.checkpoint_eligible;
     let should_hash =
         request.verify || largest_stream >= request.large_threshold || checkpoint_eligible;
-    let extended_attributes = (request.source_snapshot.metadata.ea_size > 0)
+    let source_has_eas =
+        request.source_supports_eas && request.source_snapshot.metadata.ea_size > 0;
+    let eas_dropped = source_has_eas && !request.destination_supports_eas;
+    let extended_attributes = (source_has_eas && request.destination_supports_eas)
         .then(|| {
             read_extended_attributes_checked(
                 request.source_path,
@@ -153,8 +172,10 @@ pub fn copy_file(
         })
         .transpose()
         .map_err(|error| source_open_error("read_ea", request.relative_path, &error))?;
-    let has_auxiliary_data =
-        extended_attributes.is_some() || streams.iter().any(|stream| !stream.is_unnamed());
+    let named_streams = routing.named_streams;
+    let named_streams_dropped = routing.named_streams_dropped;
+    let has_representable_auxiliary_data = extended_attributes.is_some()
+        || (request.destination_supports_streams && named_streams > 0);
     if request.preserve_sparse && is_sparse(request.source_snapshot.metadata.basic.attributes) {
         copy_sparse(
             request,
@@ -162,14 +183,22 @@ pub fn copy_file(
             &mut source,
             streams,
             extended_attributes.as_ref(),
+            eas_dropped,
             should_hash,
             journal.as_deref_mut(),
         )
     } else if largest_stream < request.large_threshold
         && !checkpoint_eligible
-        && !has_auxiliary_data
+        && !has_representable_auxiliary_data
     {
-        copy_plain_small(request, counters, &mut source, should_hash)
+        copy_plain_small(
+            request,
+            counters,
+            &mut source,
+            should_hash,
+            named_streams_dropped,
+            eas_dropped,
+        )
     } else {
         copy_streamed(
             request,
@@ -177,9 +206,54 @@ pub fn copy_file(
             &mut source,
             streams,
             extended_attributes.as_ref(),
+            eas_dropped,
             should_hash,
             journal.as_deref_mut(),
         )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StreamRouting {
+    largest_representable: u64,
+    checkpoint_eligible: bool,
+    named_streams: usize,
+    named_streams_dropped: u32,
+}
+
+/// Computes routing only from streams the destination can represent. A large
+/// ADS that will be dropped must not promote an otherwise-small FAT/exFAT file
+/// to the transactional/checkpoint path.
+fn route_streams(
+    streams: &[StreamInfo],
+    unnamed_size: u64,
+    destination_supports_streams: bool,
+    journal_available: bool,
+    checkpoint_threshold: u64,
+) -> StreamRouting {
+    let representable = streams
+        .iter()
+        .filter(|stream| destination_supports_streams || stream.is_unnamed());
+    let largest_representable = representable
+        .clone()
+        .map(|stream| stream.size)
+        .max()
+        .unwrap_or(unnamed_size);
+    let checkpoint_eligible = journal_available
+        && representable
+            .clone()
+            .any(|stream| stream.size >= checkpoint_threshold);
+    let named_streams = streams.iter().filter(|stream| !stream.is_unnamed()).count();
+    let named_streams_dropped = if destination_supports_streams {
+        0
+    } else {
+        u32::try_from(named_streams).unwrap_or(u32::MAX)
+    };
+    StreamRouting {
+        largest_representable,
+        checkpoint_eligible,
+        named_streams,
+        named_streams_dropped,
     }
 }
 
@@ -189,6 +263,7 @@ fn copy_sparse(
     source: &mut SourceFile,
     streams: &[StreamInfo],
     extended_attributes: Option<&bigcp_win::ExtendedAttributes>,
+    source_eas_dropped: bool,
     should_hash: bool,
     mut journal: Option<&mut Journal>,
 ) -> Result<EngineResult, OperationError> {
@@ -371,7 +446,7 @@ fn copy_sparse(
         journal.as_deref_mut(),
     )?;
     journal_degraded |= named.journal_degraded;
-    let eas_dropped = copy_eas(request, &temp, extended_attributes)?;
+    copy_eas(request, &temp, extended_attributes)?;
     post_read_validate(request, source)?;
     let dacl = precommit_validate(request)?;
     if let Some(dacl) = &dacl {
@@ -382,18 +457,19 @@ fn copy_sparse(
     temp.commit(
         request.destination_path,
         request.replacement_snapshot.is_some(),
-        request.source_snapshot.metadata.basic,
+        request.destination_metadata,
         request.flush,
+        request.destination_supports_posix_unlink_rename,
     )
     .map_err(|error| operation_error("commit", request.relative_path, &error))?;
     Ok(EngineResult {
         bytes: logical_size.saturating_add(named.bytes),
         digest: hasher.map(|value| format!("xxh3:{:032x}", value.digest128())),
         stream_digests: named.digests,
-        ea_digest: (request.verify && !eas_dropped)
+        ea_digest: (request.verify && !source_eas_dropped)
             .then(|| digest_bytes(extended_attributes.map_or(&[], |value| value.as_bytes()))),
         streams_dropped: named.dropped,
-        eas_dropped,
+        eas_dropped: source_eas_dropped,
         journal_degraded,
         efs_downgraded,
         checkpoint_used,
@@ -417,6 +493,8 @@ fn copy_plain_small(
     counters: &mut Counters,
     source: &mut SourceFile,
     should_hash: bool,
+    streams_dropped: u32,
+    eas_dropped: bool,
 ) -> Result<EngineResult, OperationError> {
     let expected = usize::try_from(request.source_snapshot.metadata.size).map_err(|_| {
         OperationError::semantic(
@@ -501,16 +579,21 @@ fn copy_plain_small(
     post_read_validate(request, source)?;
     let timer = std::time::Instant::now();
     destination
-        .finish(request.flush)
+        .finish(
+            request.flush,
+            request
+                .destination_requires_post_write_stamp
+                .then_some(request.destination_metadata),
+        )
         .map_err(|error| operation_error("flush", request.relative_path, &error))?;
     request.phases.record(5, timer.elapsed());
     Ok(EngineResult {
         bytes: bytes.len() as u64,
         digest: should_hash.then(|| digest_bytes(&bytes)),
         stream_digests: Vec::new(),
-        ea_digest: request.verify.then(|| digest_bytes(&[])),
-        streams_dropped: 0,
-        eas_dropped: false,
+        ea_digest: (request.verify && !eas_dropped).then(|| digest_bytes(&[])),
+        streams_dropped,
+        eas_dropped,
         journal_degraded: false,
         efs_downgraded,
         checkpoint_used: false,
@@ -524,7 +607,7 @@ fn create_final(request: &EngineRequest<'_>) -> Result<DestinationFinal, Operati
     let expected = request
         .replacement_snapshot
         .map(|snapshot| &snapshot.metadata);
-    let stamp = request.source_snapshot.metadata.basic;
+    let stamp = request.destination_metadata;
     match DestinationFinal::create(request.destination_path, expected, encrypted, stamp) {
         Ok(value) => Ok(value),
         Err(error)
@@ -606,6 +689,7 @@ fn copy_streamed(
     source: &mut SourceFile,
     streams: &[StreamInfo],
     extended_attributes: Option<&bigcp_win::ExtendedAttributes>,
+    source_eas_dropped: bool,
     should_hash: bool,
     mut journal: Option<&mut Journal>,
 ) -> Result<EngineResult, OperationError> {
@@ -723,7 +807,7 @@ fn copy_streamed(
         journal.as_deref_mut(),
     )?;
     journal_degraded |= named.journal_degraded;
-    let eas_dropped = copy_eas(request, &temp, extended_attributes)?;
+    copy_eas(request, &temp, extended_attributes)?;
     post_read_validate(request, source)?;
     let dacl = precommit_validate(request)?;
     if let Some(dacl) = &dacl {
@@ -734,18 +818,19 @@ fn copy_streamed(
     temp.commit(
         request.destination_path,
         request.replacement_snapshot.is_some(),
-        request.source_snapshot.metadata.basic,
+        request.destination_metadata,
         request.flush,
+        request.destination_supports_posix_unlink_rename,
     )
     .map_err(|error| operation_error("commit", request.relative_path, &error))?;
     Ok(EngineResult {
         bytes: total.saturating_add(named.bytes),
         digest: hasher.map(|value| format!("xxh3:{:032x}", value.digest128())),
         stream_digests: named.digests,
-        ea_digest: (request.verify && !eas_dropped)
+        ea_digest: (request.verify && !source_eas_dropped)
             .then(|| digest_bytes(extended_attributes.map_or(&[], |value| value.as_bytes()))),
         streams_dropped: named.dropped,
-        eas_dropped,
+        eas_dropped: source_eas_dropped,
         journal_degraded,
         efs_downgraded,
         checkpoint_used,
@@ -877,6 +962,9 @@ fn ensure_base_checkpoint_for_named(
     base_hasher: Option<&Xxh3>,
     journal: &mut Option<&mut Journal>,
 ) -> Result<bool, OperationError> {
+    if !request.destination_supports_streams {
+        return Ok(false);
+    }
     let named_is_resumable = streams
         .iter()
         .any(|stream| !stream.is_unnamed() && stream.size >= request.checkpoint_threshold);
@@ -995,15 +1083,12 @@ fn copy_eas(
     request: &EngineRequest<'_>,
     temp: &DestinationTemp,
     attributes: Option<&bigcp_win::ExtendedAttributes>,
-) -> Result<bool, OperationError> {
+) -> Result<(), OperationError> {
     if let Some(attributes) = attributes {
-        if !request.destination_supports_eas {
-            return Ok(true);
-        }
         temp.write_extended_attributes(attributes)
             .map_err(|error| operation_error("write_ea", request.relative_path, &error))?;
     }
-    Ok(false)
+    Ok(())
 }
 
 /// Requests EFS on a new temp only when the source is encrypted and the
@@ -1292,6 +1377,9 @@ fn precommit_validate(
     let Some(expected) = request.replacement_snapshot else {
         return Ok(None);
     };
+    if !request.destination_supports_persistent_acls {
+        return Ok(None);
+    }
     read_protected_dacl_checked(request.destination_path, expected.metadata.identity).map_err(
         |error| {
             if error.kind() == std::io::ErrorKind::InvalidData {
@@ -1438,5 +1526,44 @@ fn source_open_error(
         )
     } else {
         operation_error(operation, relative_path, error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+
+    use bigcp_win::StreamInfo;
+
+    use super::{StreamRouting, route_streams};
+
+    #[test]
+    fn dropped_large_ads_does_not_promote_or_checkpoint_plain_data() {
+        let streams = [
+            StreamInfo::unnamed(4 * 1024),
+            StreamInfo {
+                name: OsString::from(":large:$DATA"),
+                size: 8 * 1024 * 1024,
+            },
+        ];
+
+        assert_eq!(
+            route_streams(&streams, 4 * 1024, false, true, 1024 * 1024),
+            StreamRouting {
+                largest_representable: 4 * 1024,
+                checkpoint_eligible: false,
+                named_streams: 1,
+                named_streams_dropped: 1,
+            }
+        );
+        assert_eq!(
+            route_streams(&streams, 4 * 1024, true, true, 1024 * 1024),
+            StreamRouting {
+                largest_representable: 8 * 1024 * 1024,
+                checkpoint_eligible: true,
+                named_streams: 1,
+                named_streams_dropped: 0,
+            }
+        );
     }
 }

@@ -5,20 +5,26 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use bigcp_win::{
-    BasicMetadata, COPYABLE_ATTRIBUTES, ObjectKind, SourceFile, SourceStream, StreamInfo,
-    absolute_extended, enumerate_directory, final_path, is_same_or_descendant, list_streams,
-    metadata_at, open_root, ordinal_case_key, probe_volume, read_extended_attributes,
-    read_reparse_data,
+    BasicMetadata, ObjectKind, SourceFile, SourceStream, StreamInfo, absolute_extended,
+    enumerate_directory, final_path, is_same_or_descendant, list_streams, metadata_at, open_root,
+    ordinal_case_key, probe_volume, read_extended_attributes, read_reparse_data,
 };
 use xxhash_rust::xxh3::Xxh3;
 
 use crate::error::{BigcpError, ErrorCategory, OperationError};
+use crate::filesystem::FilesystemPolicy;
 use crate::model::Counters;
 use crate::options::VerifyOptions;
 use crate::report::VerificationSummary;
 
 const MISMATCH_SAMPLE_LIMIT: usize = 100;
 type DigestedFile = (u64, String, Vec<(StreamInfo, String)>, String);
+
+#[derive(Clone, Copy)]
+struct VerificationFeatures {
+    streams: bool,
+    eas: bool,
+}
 
 /// One file and source digest captured during a copy run.
 pub struct VerificationTarget {
@@ -40,29 +46,45 @@ pub struct VerificationTarget {
 
 /// Re-reads only files written during this run.
 #[must_use]
-pub fn verify_written_targets(
+pub(crate) fn verify_written_targets(
     targets: &[VerificationTarget],
     counters: &mut Counters,
+    policy: FilesystemPolicy,
 ) -> VerificationSummary {
     let mut summary = VerificationSummary {
         mode: "copied".to_owned(),
+        destination_filesystem: Some(policy.filesystem().name().to_owned()),
+        projected: policy.is_degraded(),
         ..VerificationSummary::default()
     };
     for target in targets {
-        match digest_file_streams_and_eas(&target.destination_path, counters) {
+        match digest_file_streams_and_eas(
+            &target.destination_path,
+            counters,
+            VerificationFeatures {
+                streams: policy.supports_streams(),
+                eas: policy.supports_eas(),
+            },
+        ) {
             Ok((size, digest, streams, ea_digest)) => match metadata_at(&target.destination_path) {
                 Ok(metadata) => {
-                    if metadata.basic.last_access_time != target.expected_metadata.last_access_time
-                    {
+                    if !policy.last_access_equal(
+                        metadata.basic.last_access_time,
+                        target.expected_metadata.last_access_time,
+                    ) {
                         summary.last_access_differences =
                             summary.last_access_differences.saturating_add(1);
                     }
-                    let metadata_matches = metadata.basic.creation_time
-                        == target.expected_metadata.creation_time
-                        && metadata.basic.last_write_time
-                            == target.expected_metadata.last_write_time
-                        && metadata.basic.attributes & COPYABLE_ATTRIBUTES
-                            == target.expected_metadata.attributes & COPYABLE_ATTRIBUTES;
+                    let metadata_matches = policy.creation_equal(
+                        target.expected_metadata.creation_time,
+                        metadata.basic.creation_time,
+                    ) && policy.last_write_equal(
+                        target.expected_metadata.last_write_time,
+                        metadata.basic.last_write_time,
+                    ) && policy.attributes_equal(
+                        target.expected_metadata.attributes,
+                        metadata.basic.attributes,
+                    );
                     if size == target.expected_size
                         && digest == target.expected_digest
                         && streams == target.expected_streams
@@ -143,12 +165,27 @@ pub fn run_standalone_verify(options: &VerifyOptions) -> Result<VerificationSumm
             "verification roots must be distinct, non-nested trees".to_owned(),
         ));
     }
-    probe_volume(&source).map_err(|error| BigcpError::io("probe verify source", error))?;
-    probe_volume(&destination)
+    let source_volume =
+        probe_volume(&source).map_err(|error| BigcpError::io("probe verify source", error))?;
+    let destination_volume = probe_volume(&destination)
         .map_err(|error| BigcpError::io("probe verify destination", error))?;
+    let policy = FilesystemPolicy::new(
+        destination_volume.filesystem,
+        destination_volume.capabilities,
+    );
+    let source_features = VerificationFeatures {
+        streams: source_volume.capabilities.named_streams,
+        eas: source_volume.capabilities.extended_attributes,
+    };
+    let destination_features = VerificationFeatures {
+        streams: destination_volume.capabilities.named_streams,
+        eas: destination_volume.capabilities.extended_attributes,
+    };
 
     let mut summary = VerificationSummary {
         mode: "full".to_owned(),
+        destination_filesystem: Some(destination_volume.filesystem.name().to_owned()),
+        projected: policy.is_degraded(),
         ..VerificationSummary::default()
     };
     let mut counters = Counters::default();
@@ -163,19 +200,31 @@ pub fn run_standalone_verify(options: &VerifyOptions) -> Result<VerificationSumm
             "verification roots must both resolve to real directories".to_owned(),
         ));
     }
-    if source_root_metadata.basic.last_access_time
-        != destination_root_metadata.basic.last_access_time
-    {
+    if !policy.last_access_equal(
+        source_root_metadata.basic.last_access_time,
+        destination_root_metadata.basic.last_access_time,
+    ) {
         summary.last_access_differences = summary.last_access_differences.saturating_add(1);
     }
-    let root_metadata_equal = source_root_metadata.basic.creation_time
-        == destination_root_metadata.basic.creation_time
-        && source_root_metadata.basic.last_write_time
-            == destination_root_metadata.basic.last_write_time
-        && source_root_metadata.basic.attributes & COPYABLE_ATTRIBUTES
-            == destination_root_metadata.basic.attributes & COPYABLE_ATTRIBUTES;
-    let root_aux_equal = directory_aux_equal(&source, &destination, &mut counters, true)
-        .map_err(|error| BigcpError::io("verify root streams or EAs", error))?;
+    let root_metadata_equal = policy.creation_equal(
+        source_root_metadata.basic.creation_time,
+        destination_root_metadata.basic.creation_time,
+    ) && policy.last_write_equal(
+        source_root_metadata.basic.last_write_time,
+        destination_root_metadata.basic.last_write_time,
+    ) && policy.attributes_equal(
+        source_root_metadata.basic.attributes,
+        destination_root_metadata.basic.attributes,
+    );
+    let root_aux_equal = directory_aux_equal(
+        &source,
+        &destination,
+        &mut counters,
+        true,
+        source_features,
+        destination_features,
+    )
+    .map_err(|error| BigcpError::io("verify root streams or EAs", error))?;
     if root_metadata_equal && root_aux_equal {
         summary.passed = summary.passed.saturating_add(1);
     } else {
@@ -235,15 +284,20 @@ pub fn run_standalone_verify(options: &VerifyOptions) -> Result<VerificationSumm
                 );
                 continue;
             }
-            let metadata_equal = source_entry.metadata.basic.creation_time
-                == destination_entry.metadata.basic.creation_time
-                && source_entry.metadata.basic.last_write_time
-                    == destination_entry.metadata.basic.last_write_time
-                && source_entry.metadata.basic.attributes & COPYABLE_ATTRIBUTES
-                    == destination_entry.metadata.basic.attributes & COPYABLE_ATTRIBUTES;
-            if source_entry.metadata.basic.last_access_time
-                != destination_entry.metadata.basic.last_access_time
-            {
+            let metadata_equal = policy.creation_equal(
+                source_entry.metadata.basic.creation_time,
+                destination_entry.metadata.basic.creation_time,
+            ) && policy.last_write_equal(
+                source_entry.metadata.basic.last_write_time,
+                destination_entry.metadata.basic.last_write_time,
+            ) && policy.attributes_equal(
+                source_entry.metadata.basic.attributes,
+                destination_entry.metadata.basic.attributes,
+            );
+            if !policy.last_access_equal(
+                source_entry.metadata.basic.last_access_time,
+                destination_entry.metadata.basic.last_access_time,
+            ) {
                 summary.last_access_differences = summary.last_access_differences.saturating_add(1);
             }
             match source_entry.metadata.kind {
@@ -256,6 +310,8 @@ pub fn run_standalone_verify(options: &VerifyOptions) -> Result<VerificationSumm
                         &destination_entry.path,
                         &mut counters,
                         true,
+                        source_features,
+                        destination_features,
                     ) {
                         Ok(aux_equal) if metadata_equal && aux_equal => {
                             summary.passed = summary.passed.saturating_add(1);
@@ -291,6 +347,8 @@ pub fn run_standalone_verify(options: &VerifyOptions) -> Result<VerificationSumm
                         destination_entry.metadata.size,
                         metadata_equal,
                         &mut counters,
+                        source_features,
+                        destination_features,
                     );
                     match result {
                         Ok(()) => summary.passed = summary.passed.saturating_add(1),
@@ -316,6 +374,8 @@ pub fn run_standalone_verify(options: &VerifyOptions) -> Result<VerificationSumm
                         &destination_entry.path,
                         &mut counters,
                         true,
+                        source_features,
+                        destination_features,
                     );
                     match (reparse_state, auxiliary_state) {
                         (Ok(reparse_equal), Ok(auxiliary_equal)) => {
@@ -364,6 +424,8 @@ fn verify_file_pair(
     destination_size: u64,
     metadata_equal: bool,
     counters: &mut Counters,
+    source_features: VerificationFeatures,
+    destination_features: VerificationFeatures,
 ) -> Result<(), String> {
     if source_size != destination_size {
         return Err(format!(
@@ -373,11 +435,21 @@ fn verify_file_pair(
     if !metadata_equal {
         return Err("copied metadata differs".to_owned());
     }
-    let (_, source_digest, source_streams, source_eas) =
-        digest_file_streams_and_eas(source, counters)
-            .map_err(|error| format!("could not be verified (read failed: {error})"))?;
+    let comparison_features = VerificationFeatures {
+        streams: destination_features.streams,
+        eas: destination_features.eas,
+    };
+    let (_, source_digest, source_streams, source_eas) = digest_file_streams_and_eas(
+        source,
+        counters,
+        VerificationFeatures {
+            streams: comparison_features.streams && source_features.streams,
+            eas: comparison_features.eas && source_features.eas,
+        },
+    )
+    .map_err(|error| format!("could not be verified (read failed: {error})"))?;
     let (_, destination_digest, destination_streams, destination_eas) =
-        digest_file_streams_and_eas(destination, counters)
+        digest_file_streams_and_eas(destination, counters, comparison_features)
             .map_err(|error| format!("could not be verified (read failed: {error})"))?;
     if source_digest != destination_digest
         || source_streams != destination_streams
@@ -429,13 +501,22 @@ fn digest_file(path: &Path, counters: &mut Counters) -> Result<(u64, String), Op
 fn digest_file_streams_and_eas(
     path: &Path,
     counters: &mut Counters,
+    features: VerificationFeatures,
 ) -> Result<DigestedFile, OperationError> {
     let before = metadata_at(path)
         .map_err(|error| OperationError::from_io("verify_stat", path.to_path_buf(), &error))?;
     let (size, digest) = digest_file(path, counters)?;
-    let named = digest_named_streams(path, counters, false)?;
-    let attributes = read_extended_attributes(path)
-        .map_err(|error| OperationError::from_io("verify_ea", path.to_path_buf(), &error))?;
+    let named = if features.streams {
+        digest_named_streams(path, counters, false)?
+    } else {
+        Vec::new()
+    };
+    let attributes = if features.eas {
+        read_extended_attributes(path)
+            .map_err(|error| OperationError::from_io("verify_ea", path.to_path_buf(), &error))?
+    } else {
+        bigcp_win::ExtendedAttributes::empty()
+    };
     let ea_digest = format!(
         "xxh3:{:032x}",
         xxhash_rust::xxh3::xxh3_128(attributes.as_bytes())
@@ -507,13 +588,32 @@ fn directory_aux_equal(
     destination: &Path,
     counters: &mut Counters,
     open_reparse: bool,
+    source_features: VerificationFeatures,
+    destination_features: VerificationFeatures,
 ) -> std::io::Result<bool> {
-    let source_streams = digest_named_streams(source, counters, open_reparse)
-        .map_err(|error| std::io::Error::other(error.to_string()))?;
-    let destination_streams = digest_named_streams(destination, counters, open_reparse)
-        .map_err(|error| std::io::Error::other(error.to_string()))?;
-    Ok(source_streams == destination_streams
-        && read_extended_attributes(source)? == read_extended_attributes(destination)?)
+    let source_streams = if destination_features.streams && source_features.streams {
+        digest_named_streams(source, counters, open_reparse)
+            .map_err(|error| std::io::Error::other(error.to_string()))?
+    } else {
+        Vec::new()
+    };
+    let destination_streams = if destination_features.streams {
+        digest_named_streams(destination, counters, open_reparse)
+            .map_err(|error| std::io::Error::other(error.to_string()))?
+    } else {
+        Vec::new()
+    };
+    let source_eas = if destination_features.eas && source_features.eas {
+        read_extended_attributes(source)?
+    } else {
+        bigcp_win::ExtendedAttributes::empty()
+    };
+    let destination_eas = if destination_features.eas {
+        read_extended_attributes(destination)?
+    } else {
+        bigcp_win::ExtendedAttributes::empty()
+    };
+    Ok(source_streams == destination_streams && source_eas == destination_eas)
 }
 
 fn push_mismatch(summary: &mut VerificationSummary, message: String) {

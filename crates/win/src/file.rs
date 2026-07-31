@@ -15,7 +15,10 @@ use std::os::windows::io::{AsRawHandle, IntoRawHandle};
 use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
-use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED,
+    GENERIC_READ, GENERIC_WRITE,
+};
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_ALLOCATION_INFO, FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_COMPRESSED,
     FILE_ATTRIBUTE_ENCRYPTED, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NORMAL,
@@ -24,7 +27,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_SPARSE_FILE, FILE_ATTRIBUTE_SYSTEM, FILE_BASIC_INFO, FILE_DISPOSITION_INFO,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_SEQUENTIAL_SCAN,
     FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FILE_WRITE_ATTRIBUTES, FileAllocationInfo, FileBasicInfo, FileDispositionInfo,
+    FILE_WRITE_ATTRIBUTES, FileAllocationInfo, FileBasicInfo, FileDispositionInfo, FileRenameInfo,
     FileRenameInfoEx, FlushFileBuffers, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     MoveFileExW, SetFileInformationByHandle,
 };
@@ -47,6 +50,12 @@ pub const COPYABLE_ATTRIBUTES: u32 = FILE_ATTRIBUTE_READONLY
     | FILE_ATTRIBUTE_SYSTEM
     | FILE_ATTRIBUTE_ARCHIVE
     | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED;
+
+/// Attributes representable by FAT and exFAT directory entries.
+pub const FAT_COPYABLE_ATTRIBUTES: u32 = FILE_ATTRIBUTE_READONLY
+    | FILE_ATTRIBUTE_HIDDEN
+    | FILE_ATTRIBUTE_SYSTEM
+    | FILE_ATTRIBUTE_ARCHIVE;
 
 /// Returns whether enumeration attributes describe a compressed source.
 #[must_use]
@@ -376,6 +385,7 @@ impl DestinationTemp {
         replace: bool,
         metadata: BasicMetadata,
         flush: bool,
+        posix_unlink_rename: bool,
     ) -> io::Result<()> {
         let file = self
             .file
@@ -386,7 +396,7 @@ impl DestinationTemp {
         // flushing deliberately happens *after* rename+metadata so the final
         // state is what gets flushed (PLAN section 4.3 step 5).
         set_delete_on_close(&file, false)?;
-        if let Err(error) = rename_by_handle(&file, final_path, replace) {
+        if let Err(error) = rename_by_handle(&file, final_path, replace, posix_unlink_rename) {
             if !self.persistent {
                 let _ = set_delete_on_close(&file, true);
             }
@@ -523,7 +533,14 @@ impl DestinationFinal {
     }
 
     /// Completes the file by optionally flushing and closing its handle.
-    pub fn finish(self, flush: bool) -> io::Result<()> {
+    pub fn finish(self, flush: bool, final_stamp: Option<BasicMetadata>) -> io::Result<()> {
+        if let Some(metadata) = final_stamp {
+            // FAT-family filesystems can update archive/time fields while
+            // data is written. Restamp only those destinations after the
+            // payload lands; NTFS/ReFS keep the measured create-time-only
+            // fast path by passing None.
+            set_basic_by_handle(&self.file, metadata)?;
+        }
         if flush {
             self.file.sync_all()?;
         }
@@ -636,7 +653,12 @@ pub(crate) fn set_delete_on_close(file: &File, enabled: bool) -> io::Result<()> 
     }
 }
 
-pub(crate) fn rename_by_handle(file: &File, final_path: &Path, replace: bool) -> io::Result<()> {
+pub(crate) fn rename_by_handle(
+    file: &File,
+    final_path: &Path,
+    replace: bool,
+    posix_unlink_rename: bool,
+) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
 
     let name: Vec<u16> = final_path.as_os_str().encode_wide().collect();
@@ -655,9 +677,12 @@ pub(crate) fn rename_by_handle(file: &File, final_path: &Path, replace: bool) ->
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename buffer overflow"))?;
     let mut buffer = vec![0_u64; total.div_ceil(size_of::<u64>())];
     let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-    let mut flags = FILE_RENAME_FLAG_POSIX_SEMANTICS | FILE_RENAME_FLAG_IGNORE_READONLY_ATTRIBUTE;
+    let mut flags = FILE_RENAME_FLAG_IGNORE_READONLY_ATTRIBUTE;
     if replace {
         flags |= FILE_RENAME_FLAG_REPLACE_IF_EXISTS;
+    }
+    if posix_unlink_rename {
+        flags |= FILE_RENAME_FLAG_POSIX_SEMANTICS;
     }
     // SAFETY: buffer is large enough for the fixed fields plus every UTF-16
     // code unit. info is naturally aligned because the allocator aligns Vec.
@@ -667,15 +692,45 @@ pub(crate) fn rename_by_handle(file: &File, final_path: &Path, replace: bool) ->
         (*info).FileNameLength = u32::try_from(name_bytes)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "rename path is too long"))?;
         std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
-        bool_result(SetFileInformationByHandle(
+        let extended = bool_result(SetFileInformationByHandle(
             file.as_raw_handle().cast(),
             FileRenameInfoEx,
             buffer.as_ptr().cast(),
             u32::try_from(total).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidInput, "rename buffer overflow")
             })?,
-        ))
+        ));
+        match extended {
+            Ok(()) => Ok(()),
+            Err(error) if unsupported_rename_class(&error) => {
+                // Classic FAT drivers may reject FileRenameInfoEx. The
+                // legacy information class is still handle-bound and atomic;
+                // it merely lacks POSIX replacement semantics. The exclusive
+                // destination-tree contract makes that weaker sharing model
+                // sufficient.
+                (*info).Anonymous.ReplaceIfExists = replace;
+                bool_result(SetFileInformationByHandle(
+                    file.as_raw_handle().cast(),
+                    FileRenameInfo,
+                    buffer.as_ptr().cast(),
+                    u32::try_from(total).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "rename buffer overflow")
+                    })?,
+                ))
+            }
+            Err(error) => Err(error),
+        }
     }
+}
+
+fn unsupported_rename_class(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(code)
+            if code == ERROR_INVALID_FUNCTION.cast_signed()
+                || code == ERROR_NOT_SUPPORTED.cast_signed()
+                || code == ERROR_INVALID_PARAMETER.cast_signed()
+    )
 }
 
 pub(crate) fn set_basic_by_handle(file: &File, metadata: BasicMetadata) -> io::Result<()> {
@@ -716,11 +771,23 @@ fn size_u32<T>() -> io::Result<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DestinationTemp, SourceFile};
+    use super::{DestinationTemp, SourceFile, unsupported_rename_class};
     use crate::metadata::BasicMetadata;
     use std::fs;
     use std::io::{Read, Write};
     use std::os::windows::fs::symlink_file;
+
+    #[test]
+    fn legacy_rename_fallback_does_not_hide_real_io_errors() {
+        for code in [1, 50, 87] {
+            assert!(unsupported_rename_class(
+                &std::io::Error::from_raw_os_error(code)
+            ));
+        }
+        assert!(!unsupported_rename_class(
+            &std::io::Error::from_raw_os_error(5)
+        ));
+    }
 
     #[test]
     fn uncommitted_temp_is_deleted_by_its_handle() {
@@ -834,6 +901,7 @@ mod tests {
                 attributes: 0,
             },
             false,
+            true,
         );
         assert!(result.is_err());
         assert!(fs::symlink_metadata(&final_path).is_ok_and(|value| value.is_symlink()));
@@ -864,7 +932,10 @@ mod tests {
             last_write_time: 0,
             attributes: 0,
         };
-        assert!(temp.commit(&final_path, false, metadata, false).is_ok());
+        assert!(
+            temp.commit(&final_path, false, metadata, false, true)
+                .is_ok()
+        );
         assert_eq!(fs::read(final_path).ok(), Some(b"complete".to_vec()));
     }
 
@@ -921,7 +992,7 @@ mod destination_final_tests {
             return;
         };
         assert!(file.write_all(&[0xAB_u8; 8192]).is_ok());
-        assert!(file.finish(false).is_ok());
+        assert!(file.finish(false, None).is_ok());
         let observed = metadata_at(&path);
         assert!(observed.is_ok());
         assert!(

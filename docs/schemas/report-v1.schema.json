@@ -80,6 +80,14 @@
         "destination": {
           "type": "string"
         },
+        "source_filesystem": {
+          "type": "string",
+          "description": "Filesystem family probed for the source root."
+        },
+        "destination_filesystem": {
+          "type": "string",
+          "description": "Filesystem family whose representation policy governed the destination."
+        },
         "log_path": {
           "type": "string"
         },
@@ -130,7 +138,38 @@
       "type": [
         "object",
         "null"
-      ]
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "copied",
+            "full"
+          ]
+        },
+        "destination_filesystem": {
+          "type": "string"
+        },
+        "projected": {
+          "type": "boolean",
+          "description": "True when verification used FAT-family destination-representable semantics."
+        },
+        "passed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "mismatches": {
+          "type": "array"
+        },
+        "last_access_differences": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": true
     },
     "integrity": {
       "enum": [

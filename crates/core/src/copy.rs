@@ -32,6 +32,7 @@ use crate::classify::classify;
 use crate::devprofile::{CopyProfile, select_copy_profile};
 use crate::engine::{EngineRequest, copy_file};
 use crate::error::{BigcpError, ErrorCategory, OperationError};
+use crate::filesystem::FilesystemPolicy;
 use crate::journal::{Journal, JournalEvent, path_key};
 use crate::model::{Classification, Counters, EntrySnapshot, FileOutcome, RunSnapshot, RunState};
 use crate::options::CopyOptions;
@@ -85,6 +86,10 @@ pub fn run_copy(
 ) -> Result<RunReport, BigcpError> {
     observer.on_message("pre-flight: resolving and pinning roots");
     let preflight = preflight(options)?;
+    let destination_policy = FilesystemPolicy::new(
+        preflight.destination_volume.filesystem,
+        preflight.destination_volume.capabilities,
+    );
     let run_id = Uuid::new_v4().simple().to_string();
     let started_at = OffsetDateTime::now_utc();
     let started = format_time(started_at);
@@ -120,6 +125,23 @@ pub fn run_copy(
             message: "destination device reports write caching disabled (Quick-removal policy); \
                       metadata-heavy workloads measured ~3.4x slower under it"
                 .to_owned(),
+        })?;
+    }
+    if destination_policy.is_degraded() {
+        let message = format!(
+            "{} destination: timestamps and attributes are projected to a coarse, range-limited representation; named streams, EAs, sparse layout, EFS, ACLs, and reparse points cannot be preserved{}",
+            destination_policy.filesystem().name(),
+            if destination_policy.maximum_file_size().is_some() {
+                "; files larger than 4 GiB minus 1 byte fail"
+            } else {
+                ""
+            }
+        );
+        observer.on_message(&message);
+        audit.emit(&AuditEvent::Warning {
+            kind: "degraded_filesystem".to_owned(),
+            rel: None,
+            message,
         })?;
     }
 
@@ -192,13 +214,9 @@ pub fn run_copy(
         run_id: &run_id,
         source_root: &preflight.source,
         destination_root: &preflight.destination,
-        destination_supports_streams: preflight.destination_volume.capabilities.named_streams,
-        destination_supports_eas: preflight
-            .destination_volume
-            .capabilities
-            .extended_attributes,
-        destination_supports_sparse: preflight.destination_volume.capabilities.sparse_files,
-        destination_supports_encryption: preflight.destination_volume.capabilities.encryption,
+        source_supports_streams: preflight.source_volume.capabilities.named_streams,
+        source_supports_eas: preflight.source_volume.capabilities.extended_attributes,
+        destination_policy,
         chunk_bytes: preflight.profile.chunk_bytes,
         source_is_volume_root: same_path(&preflight.source, &preflight.source_volume.root)?,
         counters: Counters::default(),
@@ -222,6 +240,9 @@ pub fn run_copy(
         small_jobs_outstanding: 0,
         last_snapshot: Instant::now(),
     };
+    if destination_policy.is_degraded() {
+        runner.increment_warning("degraded_filesystem");
+    }
     runner.publish(RunState::Copying);
     runner.copy_tree(root_metadata, preflight.destination_exists)?;
     if let Some(point) = runner.stats.maybe_roll(Duration::ZERO) {
@@ -237,6 +258,7 @@ pub fn run_copy(
         Some(verify_written_targets(
             &runner.verification_targets,
             &mut runner.counters,
+            destination_policy,
         ))
     } else {
         None
@@ -367,6 +389,8 @@ pub fn run_copy(
             destination: display_path(&preflight.destination)
                 .to_string_lossy()
                 .into_owned(),
+            source_filesystem: preflight.source_volume.filesystem.name().to_owned(),
+            destination_filesystem: preflight.destination_volume.filesystem.name().to_owned(),
             log_path: runner.audit.path().to_path_buf(),
             report_path: preflight.report_path.clone(),
         },
@@ -440,10 +464,9 @@ struct Runner<'a> {
     run_id: &'a str,
     source_root: &'a Path,
     destination_root: &'a Path,
-    destination_supports_streams: bool,
-    destination_supports_eas: bool,
-    destination_supports_sparse: bool,
-    destination_supports_encryption: bool,
+    source_supports_streams: bool,
+    source_supports_eas: bool,
+    destination_policy: FilesystemPolicy,
     chunk_bytes: usize,
     source_is_volume_root: bool,
     counters: Counters,
@@ -997,13 +1020,16 @@ impl Runner<'_> {
             }
             Err(error) => Err(error),
         };
-        let auxiliary_result = if source_metadata.ea_size > 0 && !self.destination_supports_eas {
-            self.increment_warning("ea_dropped");
-            self.audit.emit(&AuditEvent::Warning {
-                kind: "ea_dropped".to_owned(),
-                rel: Some(AuditPath::from_path(relative)),
-                message: "destination volume does not advertise directory EA support".to_owned(),
-            })?;
+        let auxiliary_result = if !self.destination_policy.supports_eas() {
+            if source_metadata.ea_size > 0 {
+                self.increment_warning("ea_dropped");
+                self.audit.emit(&AuditEvent::Warning {
+                    kind: "ea_dropped".to_owned(),
+                    rel: Some(AuditPath::from_path(relative)),
+                    message: "destination volume does not advertise directory EA support"
+                        .to_owned(),
+                })?;
+            }
             stream_result
         } else {
             stream_result.and_then(|()| {
@@ -1011,42 +1037,46 @@ impl Runner<'_> {
                     || destination_metadata.is_some_and(|metadata| metadata.ea_size > 0)
                     || relative.as_os_str().is_empty()
                 {
-                    read_extended_attributes_checked(source, current_source_metadata.identity)
-                        .map_err(|error| source_access_error("read_dir_ea", relative, &error))
-                        .and_then(|source_eas| {
-                            let destination_eas = read_extended_attributes_checked(
-                                destination,
-                                expected_destination.identity,
-                            )
-                            .map_err(|error| {
-                                destination_access_error("read_dir_ea", relative, &error)
-                            })?;
-                            if source_eas == destination_eas {
+                    let source_eas = if self.source_supports_eas {
+                        read_extended_attributes_checked(source, current_source_metadata.identity)
+                            .map_err(|error| source_access_error("read_dir_ea", relative, &error))
+                    } else {
+                        Ok(bigcp_win::ExtendedAttributes::empty())
+                    };
+                    source_eas.and_then(|source_eas| {
+                        let destination_eas = read_extended_attributes_checked(
+                            destination,
+                            expected_destination.identity,
+                        )
+                        .map_err(|error| {
+                            destination_access_error("read_dir_ea", relative, &error)
+                        })?;
+                        if source_eas == destination_eas {
+                            Ok(())
+                        } else {
+                            if !destination_eas.is_empty() {
+                                clear_extended_attributes_checked(
+                                    destination,
+                                    expected_destination.identity,
+                                )
+                                .map_err(|error| {
+                                    destination_access_error("clear_dir_ea", relative, &error)
+                                })?;
+                            }
+                            if source_eas.is_empty() {
                                 Ok(())
                             } else {
-                                if !destination_eas.is_empty() {
-                                    clear_extended_attributes_checked(
-                                        destination,
-                                        expected_destination.identity,
-                                    )
-                                    .map_err(|error| {
-                                        destination_access_error("clear_dir_ea", relative, &error)
-                                    })?;
-                                }
-                                if source_eas.is_empty() {
-                                    Ok(())
-                                } else {
-                                    write_extended_attributes_checked(
-                                        destination,
-                                        expected_destination.identity,
-                                        &source_eas,
-                                    )
-                                    .map_err(|error| {
-                                        destination_access_error("write_dir_ea", relative, &error)
-                                    })
-                                }
+                                write_extended_attributes_checked(
+                                    destination,
+                                    expected_destination.identity,
+                                    &source_eas,
+                                )
+                                .map_err(|error| {
+                                    destination_access_error("write_dir_ea", relative, &error)
+                                })
                             }
-                        })
+                        }
+                    })
                 } else {
                     Ok(())
                 }
@@ -1078,7 +1108,8 @@ impl Runner<'_> {
         if let Err(error) = set_basic_at_checked(
             destination,
             expected_destination.identity,
-            current_source_metadata.basic,
+            self.destination_policy
+                .project_basic(current_source_metadata.basic),
         ) {
             self.counters.dirs_meta_failed = self.counters.dirs_meta_failed.saturating_add(1);
             self.record_error(destination_access_error("set_dir_meta", relative, &error))?;
@@ -1100,13 +1131,16 @@ impl Runner<'_> {
         expected_source: bigcp_win::FileIdentity,
         expected_destination: bigcp_win::FileIdentity,
     ) -> Result<u64, OperationError> {
+        if !self.source_supports_streams {
+            return Ok(0);
+        }
         let streams = list_streams(source)
             .map_err(|error| source_access_error("list_dir_streams", relative, &error))?;
         let named: Vec<_> = streams
             .iter()
             .filter(|stream| !stream.is_unnamed())
             .collect();
-        if !self.destination_supports_streams {
+        if !self.destination_policy.supports_streams() {
             let dropped = named.len() as u64;
             for _ in 0..dropped {
                 self.increment_warning("streams_dropped");
@@ -1188,8 +1222,44 @@ impl Runner<'_> {
         destination: Option<DirectoryEntry>,
         relative: PathBuf,
     ) -> Result<(), BigcpError> {
+        if self
+            .destination_policy
+            .maximum_file_size()
+            .is_some_and(|limit| source.metadata.size > limit)
+        {
+            return self.record_file(
+                &relative,
+                FileOutcome::Failed {
+                    bytes: source.metadata.size,
+                    error: OperationError::semantic(
+                        ErrorCategory::FsLimit,
+                        "fat_file_size",
+                        relative.clone(),
+                        format!(
+                            "{} cannot store a {}-byte file; its maximum is {} bytes",
+                            self.destination_policy.filesystem().name(),
+                            source.metadata.size,
+                            u32::MAX
+                        ),
+                    ),
+                },
+                None,
+            );
+        }
         if is_compressed(source.metadata.basic.attributes) {
             self.increment_warning("compressed_sources");
+        }
+        if is_sparse(source.metadata.basic.attributes) && !self.destination_policy.supports_sparse()
+        {
+            self.increment_warning("sparse_expanded");
+            self.audit.emit(&AuditEvent::Warning {
+                kind: "sparse_expanded".to_owned(),
+                rel: Some(AuditPath::from_path(&relative)),
+                message: format!(
+                    "{} does not support sparse allocation; logical content will be written densely",
+                    self.destination_policy.filesystem().name()
+                ),
+            })?;
         }
         if is_cloud_placeholder(source.metadata.basic.attributes) {
             // `--skip-cloud` placeholders never reach this function:
@@ -1215,6 +1285,7 @@ impl Runner<'_> {
             &source_snapshot,
             destination_snapshot.as_ref(),
             self.options.replace,
+            self.destination_policy,
         ) {
             Classification::New => {
                 self.copy_classified(&source, &relative, &source_snapshot, None, None, true)?;
@@ -1236,7 +1307,14 @@ impl Runner<'_> {
                         reason: "dry_run_would_fix_metadata".to_owned(),
                     }
                 } else if let Some(destination) = destination {
-                    match repair_metadata(&source, &destination, &fields, &relative) {
+                    match repair_metadata(
+                        &source,
+                        &destination,
+                        &fields,
+                        &relative,
+                        self.destination_policy,
+                        self.source_supports_eas,
+                    ) {
                         Ok(()) => FileOutcome::MetadataFixed {
                             bytes: source.metadata.size,
                         },
@@ -1339,7 +1417,7 @@ impl Runner<'_> {
             let unnamed = source.metadata.size;
             let checkpoint_possible =
                 self.journal.is_some() && unnamed >= self.options.checkpoint_threshold();
-            let preserve_sparse = self.destination_supports_sparse
+            let preserve_sparse = self.destination_policy.supports_sparse()
                 && !self.options.no_sparse
                 && is_sparse(source.metadata.basic.attributes);
             if unnamed < self.options.large_threshold() && !checkpoint_possible && !preserve_sparse
@@ -1364,9 +1442,23 @@ impl Runner<'_> {
                     large_threshold: self.options.large_threshold(),
                     verify: self.options.verify,
                     flush: self.options.flush,
-                    destination_supports_streams: self.destination_supports_streams,
-                    destination_supports_eas: self.destination_supports_eas,
-                    destination_supports_encryption: self.destination_supports_encryption,
+                    source_supports_streams: self.source_supports_streams,
+                    source_supports_eas: self.source_supports_eas,
+                    destination_supports_streams: self.destination_policy.supports_streams(),
+                    destination_supports_eas: self.destination_policy.supports_eas(),
+                    destination_supports_encryption: self.destination_policy.supports_encryption(),
+                    destination_supports_persistent_acls: self
+                        .destination_policy
+                        .supports_persistent_acls(),
+                    destination_supports_posix_unlink_rename: self
+                        .destination_policy
+                        .supports_posix_unlink_rename(),
+                    destination_metadata: self
+                        .destination_policy
+                        .project_basic(source.metadata.basic),
+                    destination_requires_post_write_stamp: self
+                        .destination_policy
+                        .requires_post_write_stamp(),
                     chunk_bytes: self.chunk_bytes,
                     checkpoint_threshold: self.options.checkpoint_threshold(),
                     streams: None,
@@ -1387,28 +1479,32 @@ impl Runner<'_> {
                 replacement.map(|(fields, _)| fields),
             );
         }
-        let streams = match list_streams(&source.path) {
-            Ok(streams) => streams,
-            Err(error) => {
-                let error = if error.kind() == std::io::ErrorKind::NotFound {
-                    OperationError::from_io_as(
-                        ErrorCategory::SourceChanged,
-                        "list_streams",
-                        relative.to_path_buf(),
-                        &error,
-                    )
-                } else {
-                    OperationError::from_io("list_streams", relative.to_path_buf(), &error)
-                };
-                return self.record_file(
-                    relative,
-                    FileOutcome::Failed {
-                        bytes: source.metadata.size,
-                        error,
-                    },
-                    replacement.map(|(fields, _)| fields),
-                );
+        let streams = if self.source_supports_streams {
+            match list_streams(&source.path) {
+                Ok(streams) => streams,
+                Err(error) => {
+                    let error = if error.kind() == std::io::ErrorKind::NotFound {
+                        OperationError::from_io_as(
+                            ErrorCategory::SourceChanged,
+                            "list_streams",
+                            relative.to_path_buf(),
+                            &error,
+                        )
+                    } else {
+                        OperationError::from_io("list_streams", relative.to_path_buf(), &error)
+                    };
+                    return self.record_file(
+                        relative,
+                        FileOutcome::Failed {
+                            bytes: source.metadata.size,
+                            error,
+                        },
+                        replacement.map(|(fields, _)| fields),
+                    );
+                }
             }
+        } else {
+            vec![bigcp_win::StreamInfo::unnamed(source.metadata.size)]
         };
         let logical_bytes = streams
             .iter()
@@ -1466,12 +1562,24 @@ impl Runner<'_> {
             large_threshold: self.options.large_threshold(),
             verify: self.options.verify,
             flush: self.options.flush,
-            destination_supports_streams: self.destination_supports_streams,
-            destination_supports_eas: self.destination_supports_eas,
+            source_supports_streams: self.source_supports_streams,
+            source_supports_eas: self.source_supports_eas,
+            destination_supports_streams: self.destination_policy.supports_streams(),
+            destination_supports_eas: self.destination_policy.supports_eas(),
             chunk_bytes: self.chunk_bytes,
-            preserve_sparse: self.destination_supports_sparse && !self.options.no_sparse,
+            preserve_sparse: self.destination_policy.supports_sparse() && !self.options.no_sparse,
             checkpoint_threshold: self.options.checkpoint_threshold(),
-            destination_supports_encryption: self.destination_supports_encryption,
+            destination_supports_encryption: self.destination_policy.supports_encryption(),
+            destination_supports_persistent_acls: self
+                .destination_policy
+                .supports_persistent_acls(),
+            destination_supports_posix_unlink_rename: self
+                .destination_policy
+                .supports_posix_unlink_rename(),
+            destination_metadata: self.destination_policy.project_basic(source.metadata.basic),
+            destination_requires_post_write_stamp: self
+                .destination_policy
+                .requires_post_write_stamp(),
             known_streams: Some(&streams),
             cancel: &cancel_probe,
             promote_threshold: None,
@@ -1677,7 +1785,9 @@ impl Runner<'_> {
                             destination_path: completed.destination_path,
                             expected_digest: digest.clone(),
                             expected_size: completed.source_snapshot.metadata.size,
-                            expected_metadata: completed.source_snapshot.metadata.basic,
+                            expected_metadata: self
+                                .destination_policy
+                                .project_basic(completed.source_snapshot.metadata.basic),
                             expected_streams: result.stream_digests.clone(),
                             expected_ea_digest: result.ea_digest.clone(),
                         });
@@ -1738,6 +1848,24 @@ impl Runner<'_> {
         relative: PathBuf,
     ) -> Result<(), BigcpError> {
         self.counters.links_discovered = self.counters.links_discovered.saturating_add(1);
+        if !self.destination_policy.supports_reparse_points() {
+            self.counters.links_failed = self.counters.links_failed.saturating_add(1);
+            return self.record_link_event(
+                &relative,
+                "failed_link",
+                None,
+                None,
+                Some(OperationError::semantic(
+                    ErrorCategory::FsLimit,
+                    "create_reparse",
+                    relative.clone(),
+                    format!(
+                        "{} cannot represent reparse points; the link was not followed or copied as target data",
+                        self.destination_policy.filesystem().name()
+                    ),
+                )),
+            );
+        }
         let source_snapshot = EntrySnapshot {
             relative_path: relative.clone(),
             metadata: source.metadata.clone(),
@@ -1750,6 +1878,7 @@ impl Runner<'_> {
             &source_snapshot,
             destination_snapshot.as_ref(),
             self.options.replace,
+            self.destination_policy,
         );
         let replacement_event = match (&classification, destination_snapshot.as_ref()) {
             (
@@ -1798,7 +1927,16 @@ impl Runner<'_> {
                                 "classifier requested link metadata repair without a destination",
                             ))
                         },
-                        |entry| repair_metadata(&source, entry, &fields, &relative),
+                        |entry| {
+                            repair_metadata(
+                                &source,
+                                entry,
+                                &fields,
+                                &relative,
+                                self.destination_policy,
+                                self.source_supports_eas,
+                            )
+                        },
                     );
                     match result {
                         Ok(()) => {
@@ -1888,32 +2026,36 @@ impl Runner<'_> {
                         return Ok(());
                     }
                     let destination_path = self.destination_root.join(&relative);
-                    match bigcp_win::read_protected_dacl_checked(
-                        &destination_path,
-                        expected.metadata.identity,
-                    ) {
-                        Ok(value) => protected_dacl = value,
-                        Err(error) => {
-                            self.counters.links_failed =
-                                self.counters.links_failed.saturating_add(1);
-                            let error = if error.kind() == std::io::ErrorKind::InvalidData {
-                                OperationError::from_io_as(
-                                    ErrorCategory::DestinationChanged,
-                                    "read_dacl",
-                                    relative.clone(),
-                                    &error,
-                                )
-                            } else {
-                                OperationError::from_io("read_dacl", relative.clone(), &error)
-                            };
-                            self.record_link_event(
-                                &relative,
-                                "failed_link",
-                                None,
-                                replacement_event,
-                                Some(error),
-                            )?;
-                            return Ok(());
+                    if !self.destination_policy.supports_persistent_acls() {
+                        protected_dacl = None;
+                    } else {
+                        match bigcp_win::read_protected_dacl_checked(
+                            &destination_path,
+                            expected.metadata.identity,
+                        ) {
+                            Ok(value) => protected_dacl = value,
+                            Err(error) => {
+                                self.counters.links_failed =
+                                    self.counters.links_failed.saturating_add(1);
+                                let error = if error.kind() == std::io::ErrorKind::InvalidData {
+                                    OperationError::from_io_as(
+                                        ErrorCategory::DestinationChanged,
+                                        "read_dacl",
+                                        relative.clone(),
+                                        &error,
+                                    )
+                                } else {
+                                    OperationError::from_io("read_dacl", relative.clone(), &error)
+                                };
+                                self.record_link_event(
+                                    &relative,
+                                    "failed_link",
+                                    None,
+                                    replacement_event,
+                                    Some(error),
+                                )?;
+                                return Ok(());
+                            }
                         }
                     }
                 }
@@ -1929,6 +2071,8 @@ impl Runner<'_> {
                     self.options.raw_reparse,
                     self.options.flush,
                     protected_dacl.as_ref(),
+                    self.destination_policy.project_basic(source.metadata.basic),
+                    self.destination_policy.supports_posix_unlink_rename(),
                 ) {
                     Ok(result) => {
                         self.counters.bytes_read_source = self
@@ -2586,6 +2730,15 @@ fn preflight(options: &CopyOptions) -> Result<Preflight, BigcpError> {
         probe_volume(&source).map_err(|error| BigcpError::io("probe source volume", error))?;
     let destination_volume = probe_volume(&final_ancestor)
         .map_err(|error| BigcpError::io("probe destination volume", error))?;
+    if destination_volume.filesystem.is_fat_family()
+        && !options.accept_degraded_filesystem
+        && !options.dry_run
+    {
+        return Err(BigcpError::Invalid(format!(
+            "{} destination requires explicit fidelity-degradation acceptance; rerun interactively or pass --accept-degraded-filesystem",
+            destination_volume.filesystem.name()
+        )));
+    }
     let source_device = bigcp_win::profile_device(&source_volume);
     let destination_device = bigcp_win::profile_device(&destination_volume);
     let profile = select_copy_profile(
@@ -2794,6 +2947,16 @@ fn format_time(value: OffsetDateTime) -> String {
 
 fn derive_hints(runner: &Runner<'_>, preflight: &Preflight) -> Vec<Hint> {
     let mut hints = Vec::new();
+    if preflight.destination_volume.filesystem.is_fat_family() {
+        hints.push(Hint {
+            id: "degraded_filesystem".to_owned(),
+            text: format!(
+                "{} cannot preserve NTFS/ReFS-only metadata. Review streams_dropped, ea_dropped, fs_limit, and link failures; use NTFS when full fidelity is required",
+                preflight.destination_volume.filesystem.name()
+            ),
+            confidence: "high".to_owned(),
+        });
+    }
     if preflight.destination_write_cache_disabled {
         hints.push(Hint {
             id: "quick_removal_destination".to_owned(),
@@ -2874,13 +3037,17 @@ fn repair_metadata(
     destination: &DirectoryEntry,
     differences: &[&str],
     relative: &Path,
+    destination_policy: FilesystemPolicy,
+    source_supports_eas: bool,
 ) -> Result<(), OperationError> {
     revalidate_source(source, relative)?;
     let source_eas = if differences.contains(&"ea_size") {
-        Some(
+        Some(if source_supports_eas {
             read_extended_attributes_checked(&source.path, source.metadata.identity)
-                .map_err(|error| source_access_error("read_ea", relative, &error))?,
-        )
+                .map_err(|error| source_access_error("read_ea", relative, &error))?
+        } else {
+            bigcp_win::ExtendedAttributes::empty()
+        })
     } else {
         None
     };
@@ -2901,7 +3068,7 @@ fn repair_metadata(
     set_basic_at_checked(
         &destination.path,
         destination.metadata.identity,
-        source.metadata.basic,
+        destination_policy.project_basic(source.metadata.basic),
     )
     .map_err(|error| destination_access_error("set_meta", relative, &error))
 }

@@ -25,7 +25,8 @@ Their created or enumerated identities are retained through the post-order
 pass; stream, EA, and metadata handles must match those identities before any
 destination update.
 
-Plain files are classified from the joined snapshots. Stream discovery can
+Plain files are classified from the joined snapshots under one immutable
+destination `FilesystemPolicy`. Stream discovery can
 promote a nominally small file with a large ADS. Plain small work enters a
 bounded fixed worker pool; auxiliary-data and sparse work uses the
 transactional engine, while large/checkpoint-capable work stays on the
@@ -35,8 +36,11 @@ and journal state.
 
 Plain small files use `DestinationFinal`: workers read and revalidate the
 source, then create or identity-check-and-truncate the final destination before
-one whole-buffer unnamed-stream write. Files with ADS/EAs, sparse files, and
-large/resumable files use `DestinationTemp` and atomic publication. Large
+one whole-buffer unnamed-stream write. FAT-family files are restamped on that
+same handle after data I/O; the NTFS/ReFS path incurs no extra restamp. Files
+with destination-representable ADS/EAs, sparse files, and large/resumable files
+use `DestinationTemp` and atomic publication. Unsupported source ADS/EAs are
+counted and warned but do not force that slower route. Large
 transfers are bounded synchronous streams;
 checkpoint boundaries retain exact offset-ordered xxh3 snapshots. Both paths
 return the same `EngineResult` and only the coordinator records terminal
@@ -54,7 +58,9 @@ so VISION's single-content-hash rule is unaffected.)
 Loading retains only the valid prefix and discards a torn tail. Job signatures
 bind checkpoints to semantic source, destination, and option identity. A temp
 prefix is reread and hashed before resume. Each resumable record also binds the
-source and temp to their volume serial plus 128-bit file ID. A stale, legacy,
+source and temp to their volume serial plus filesystem file ID. NTFS/ReFS use
+the 128-bit `FileIdInfo` path; FAT-family drivers can fall back to the legacy
+64-bit ID. A stale, legacy,
 type-swapped, or identity-mismatched candidate is ignored without modifying
 the path it names.
 
@@ -66,26 +72,29 @@ report-fallback status consistent with `run_end`.
 
 ## Extension seams
 
-The narrow Win32 crate and capability-based core requests deliberately isolate
-future ports:
+The narrow Win32 crate, capability-based core requests, and immutable
+`FilesystemPolicy` deliberately isolate filesystem differences and future
+ports:
 
 - **UNC/network:** add a path/volume backend that returns network capabilities
   and a network profile; do not add SMB behavior to current local wrappers.
 - **Same-volume acceleration:** add a separately capability-gated transport
   behind the existing result/accounting contract. Classification, audit, and
   verification do not change.
-- **FAT/exFAT:** add a filesystem policy implementing timestamp projection,
-  feature degradation, and size limits. The current exact NTFS/ReFS policy
-  remains untouched.
+- **FAT/exFAT (implemented):** the policy owns timestamp projection, attribute
+  projection, final restamping, and FAT size limits; volume capability flags
+  govern optional streams, EAs, sparse storage, EFS, ACLs, and POSIX rename.
+  `bigcp-win` contains the only 128-to-64-bit identity/enumeration and
+  extended-to-legacy rename fallbacks. The exact NTFS/ReFS policy stays a
+  branch-free equality path and does not pay FAT-only syscalls.
 - **Linux/macOS/WSL:** replace `bigcp-win` with a platform facade providing
   path identity, enumeration snapshots, completion/publication, streams/xattrs,
   sparse extents, and reparse/link equivalents. Core owns no UTF-8 assumption;
   Windows paths remain lossless UTF-16 in audit keys.
 
-Before one of these is enabled, extract the current concrete calls behind
-small capability traits at the `core`/platform boundary. Avoid a premature
-lowest-common-denominator abstraction: each backend must state its atomicity
-and metadata guarantees.
+Before another backend is enabled, extend these existing narrow policy and
+capability seams. Avoid a lowest-common-denominator abstraction: each backend
+must state its atomicity, representation, and metadata guarantees.
 
 ## Performance model
 

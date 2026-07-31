@@ -39,6 +39,12 @@ pub struct RunInfo {
     pub source: String,
     /// Destination display path.
     pub destination: String,
+    /// Probed source filesystem family.
+    #[serde(default)]
+    pub source_filesystem: String,
+    /// Probed destination filesystem family.
+    #[serde(default)]
+    pub destination_filesystem: String,
     /// JSONL log location.
     pub log_path: PathBuf,
     /// Actual JSON report location.
@@ -168,6 +174,12 @@ pub struct Hint {
 pub struct VerificationSummary {
     /// copied for post-copy or full for standalone.
     pub mode: String,
+    /// Destination filesystem used to interpret representable fidelity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_filesystem: Option<String>,
+    /// Whether comparison used FAT-family projection semantics.
+    #[serde(default)]
+    pub projected: bool,
     /// Objects passing every strict field.
     pub passed: u64,
     /// Objects with a serious mismatch.
@@ -277,6 +289,8 @@ pub fn top_level(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::VerificationSummary;
+
     #[test]
     fn public_schemas_are_valid_json_with_v1_identity() {
         for schema in [
@@ -289,5 +303,20 @@ mod tests {
                 value.get("$schema").is_some() && value.get("$id").is_some()
             }));
         }
+    }
+
+    #[test]
+    fn projected_verification_context_is_serialized_explicitly() {
+        let summary = VerificationSummary {
+            mode: "full".to_owned(),
+            destination_filesystem: Some("exFAT".to_owned()),
+            projected: true,
+            passed: 3,
+            ..VerificationSummary::default()
+        };
+        let value = serde_json::to_value(summary);
+        assert!(value.is_ok_and(|value| {
+            value["destination_filesystem"] == "exFAT" && value["projected"] == true
+        }));
     }
 }

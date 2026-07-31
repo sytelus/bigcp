@@ -1,16 +1,13 @@
-# Verifies that the implementation task's three frozen inputs remain byte-identical.
-# Re-pinned 2026-07-30 after the owner-authorized full-repository review
-# reconciled PLAN.md and LIMITATIONS.md with the shipped plain-direct and
-# transactional completion protocols plus the remaining pre-1.0 scaling gap,
-# and again after the owner-approved review fixes (same-handle-only direct
-# revalidation wording and the section 6.2 pseudocode variable fix).
-# VISION.md is unchanged.
+# Verifies that the implementation task's three governing inputs remain
+# byte-identical to their last owner-approved revision. Re-pinned 2026-07-30
+# after the owner-authorized FAT/FAT32/exFAT scope and policy change updated
+# VISION.md, PLAN.md, and LIMITATIONS.md together with ADR 0035.
 # Re-pin only as the final step of an owner-approved documentation change.
 $ErrorActionPreference = 'Stop'
 $Expected = @{
-    'PLAN.md' = 'BAA627C4626D6C7B793E327E9E085495D20209B6183800B1C014D0DA75899C86'
-    'VISION.md' = 'C6446CDF4485E4D0D17118B34BBA1D0E44140FA45F674F6889ACD8374C417FDC'
-    'LIMITATIONS.md' = 'DA26CD222BECEF0B6ED4F175FB6298ECD96C0D5FE60062DAF4926BAFBC426863'
+    'PLAN.md' = '19C964E77CF5363F36F8F664CE79341E6F94CBEDB86117AFF6203BB37DE0A427'
+    'VISION.md' = 'FCB948161642B8519AED534C05183713180C4405B0A8DB20A1AB122A4F898C5B'
+    'LIMITATIONS.md' = 'EAD3C7E22F2F760CA4AC213E82CBFDB34EDDC249092CD18669A0D507DBC1B72D'
 }
 
 foreach ($entry in $Expected.GetEnumerator()) {
@@ -20,4 +17,4 @@ foreach ($entry in $Expected.GetEnumerator()) {
     }
 }
 
-Write-Output 'Frozen input hashes are unchanged.'
+Write-Output 'Governing input hashes are unchanged.'
