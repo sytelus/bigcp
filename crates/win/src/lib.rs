@@ -34,9 +34,9 @@ pub use ea::{
 pub use endpoint::{EndpointKind, classify_endpoint};
 pub use extents::extent_count;
 pub use file::{
-    COPYABLE_ATTRIBUTES, DestinationFinal, DestinationTemp, FAT_COPYABLE_ATTRIBUTES, SourceFile,
-    create_directory, is_cloud_placeholder, is_compressed, is_encrypted, is_readonly, is_sparse,
-    set_basic_at, set_basic_at_checked, without_readonly,
+    COPYABLE_ATTRIBUTES, DestinationFinal, DestinationTemp, FAT_COPYABLE_ATTRIBUTES,
+    RelativeDirectory, SourceFile, create_directory, is_cloud_placeholder, is_compressed,
+    is_encrypted, is_readonly, is_sparse, set_basic_at, set_basic_at_checked, without_readonly,
 };
 pub use lock::DestinationLock;
 pub use metadata::{

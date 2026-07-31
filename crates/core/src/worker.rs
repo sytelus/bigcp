@@ -11,7 +11,7 @@ use std::sync::atomic::AtomicBool;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use bigcp_win::StreamInfo;
+use bigcp_win::{FileIdentity, RelativeDirectory, StreamInfo};
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::engine::{
@@ -35,6 +35,9 @@ pub(crate) struct ReplacementWork {
 pub(crate) struct FileCopyJob {
     pub source_path: std::path::PathBuf,
     pub destination_path: std::path::PathBuf,
+    /// Captured destination-parent identity when local NTFS relative creates
+    /// are eligible. Workers use it to verify and cache one parent handle.
+    pub relative_destination_parent: Option<FileIdentity>,
     pub source_snapshot: EntrySnapshot,
     pub destination_snapshot: Option<EntrySnapshot>,
     pub replacement: Option<ReplacementWork>,
@@ -75,10 +78,14 @@ pub(crate) struct FileCopyJob {
 }
 
 impl FileCopyJob {
-    fn request(&self) -> EngineRequest<'_> {
+    fn request<'a>(
+        &'a self,
+        relative_destination_parent: Option<&'a RelativeDirectory>,
+    ) -> EngineRequest<'a> {
         EngineRequest {
             source_path: &self.source_path,
             destination_path: &self.destination_path,
+            relative_destination_parent,
             relative_path: &self.source_snapshot.relative_path,
             source_snapshot: &self.source_snapshot,
             replacement_snapshot: self.destination_snapshot.as_ref(),
@@ -108,10 +115,13 @@ impl FileCopyJob {
         }
     }
 
-    fn execute(self) -> CompletedCopy {
-        let started = std::time::Instant::now();
+    fn execute(
+        self,
+        relative_destination_parent: Option<&RelativeDirectory>,
+        started: std::time::Instant,
+    ) -> CompletedCopy {
         let mut counters = Counters::default();
-        let request = self.request();
+        let request = self.request(relative_destination_parent);
         // A panicking engine call must still produce a completion: the
         // coordinator's blocking `receive` would otherwise deadlock forever
         // behind the other workers' live sender clones. Engine code is
@@ -296,10 +306,54 @@ impl Drop for FileWorkers {
 }
 
 fn worker_loop(jobs: &Receiver<FileCopyJob>, results: &Sender<CompletedCopy>) {
+    let mut relative_parent = RelativeParentCache::default();
     while let Ok(job) = jobs.recv() {
-        if results.send(job.execute()).is_err() {
+        // Include a cache miss's one-per-directory verified parent open in
+        // worker execution time; --analyze must not hide setup work merely
+        // because it happens immediately before the semantic engine call.
+        let started = std::time::Instant::now();
+        let parent = relative_parent.for_job(&job);
+        if results.send(job.execute(parent, started)).is_err() {
             break;
         }
+    }
+}
+
+#[derive(Default)]
+struct RelativeParentCache {
+    key: Option<(std::path::PathBuf, FileIdentity)>,
+    directory: Option<RelativeDirectory>,
+}
+
+impl RelativeParentCache {
+    fn for_job(&mut self, job: &FileCopyJob) -> Option<&RelativeDirectory> {
+        self.for_destination(&job.destination_path, job.relative_destination_parent)
+    }
+
+    fn for_destination(
+        &mut self,
+        destination: &std::path::Path,
+        expected: Option<FileIdentity>,
+    ) -> Option<&RelativeDirectory> {
+        let Some(expected) = expected else {
+            self.key = None;
+            self.directory = None;
+            return None;
+        };
+        let Some(parent) = destination.parent() else {
+            self.key = None;
+            self.directory = None;
+            return None;
+        };
+        let is_current = self
+            .key
+            .as_ref()
+            .is_some_and(|(path, identity)| path == parent && *identity == expected);
+        if !is_current {
+            self.directory = RelativeDirectory::open_destination(parent, expected).ok();
+            self.key = Some((parent.to_path_buf(), expected));
+        }
+        self.directory.as_ref()
     }
 }
 
@@ -360,7 +414,7 @@ fn run_same_spindle_batch(batch: Vec<FileCopyJob>, results: &Sender<CompletedCop
         let started = std::time::Instant::now();
         let mut counters = Counters::default();
         let result = {
-            let request = job.request();
+            let request = job.request(None);
             prepare_plain_small(&request, &mut counters)
         };
         let seconds = started.elapsed().as_secs_f64();
@@ -387,7 +441,7 @@ fn run_same_spindle_batch(batch: Vec<FileCopyJob>, results: &Sender<CompletedCop
     for mut entry in prepared {
         let started = std::time::Instant::now();
         let result = {
-            let request = entry.job.request();
+            let request = entry.job.request(None);
             write_plain_small(&request, &mut entry.counters, entry.prepared, true)
         };
         entry.seconds += started.elapsed().as_secs_f64();
@@ -417,7 +471,7 @@ fn run_same_spindle_batch(batch: Vec<FileCopyJob>, results: &Sender<CompletedCop
     for entry in written {
         let started = std::time::Instant::now();
         let result = {
-            let request = entry.job.request();
+            let request = entry.job.request(None);
             finish_plain_small(&request, entry.written)
         };
         let seconds = entry.seconds + started.elapsed().as_secs_f64();
@@ -433,7 +487,10 @@ fn run_same_spindle_batch(batch: Vec<FileCopyJob>, results: &Sender<CompletedCop
     // They are rare and are deliberately processed after the ordinary batch
     // so they cannot break its source-only/destination-only phases.
     for job in regular {
-        if results.send(job.execute()).is_err() {
+        if results
+            .send(job.execute(None, std::time::Instant::now()))
+            .is_err()
+        {
             return false;
         }
     }
@@ -442,7 +499,46 @@ fn run_same_spindle_batch(batch: Vec<FileCopyJob>, results: &Sender<CompletedCop
 
 #[cfg(test)]
 mod tests {
-    use super::FileWorkers;
+    use super::{FileWorkers, RelativeParentCache};
+
+    #[test]
+    fn relative_parent_cache_reuses_valid_parent_and_caches_unavailability() {
+        let sandbox = tempfile::tempdir();
+        assert!(sandbox.is_ok());
+        let Some(sandbox) = sandbox.ok() else {
+            return;
+        };
+        let metadata = bigcp_win::metadata_at(sandbox.path());
+        assert!(metadata.is_ok());
+        let Some(metadata) = metadata.ok() else {
+            return;
+        };
+        let child = sandbox.path().join("child.bin");
+        let mut cache = RelativeParentCache::default();
+        assert!(
+            cache
+                .for_destination(&child, Some(metadata.identity))
+                .is_some()
+        );
+        assert!(
+            cache
+                .for_destination(&child, Some(metadata.identity))
+                .is_some()
+        );
+        assert!(cache.for_destination(&child, None).is_none());
+        assert!(cache.key.is_none());
+
+        let mut stale = metadata.identity;
+        stale.file_id[0] ^= 0xFF;
+        assert!(cache.for_destination(&child, Some(stale)).is_none());
+        assert!(cache.directory.is_none());
+        assert_eq!(
+            cache.key.as_ref().map(|(_, identity)| *identity),
+            Some(stale)
+        );
+        // The same unavailable parent does not repeatedly attempt an open.
+        assert!(cache.for_destination(&child, Some(stale)).is_none());
+    }
 
     /// Pins the directory-affinity contract: a shard value must map to a
     /// stable worker index (same directory → same queue). If this fails, the

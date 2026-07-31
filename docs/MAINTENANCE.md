@@ -137,6 +137,12 @@ replacements, warnings, grouped failures, extras, hints, and verification.
 - **Same-spindle transport:** the static policy selected only when physical
   extents intersect and media is rotational; source reads and destination
   writes run in bounded phases to reduce mechanical head switching.
+- **Relative NTFS create:** distinct-drive local NTFS plain-small workers may
+  cache one identity-verified destination-parent capability and open children
+  by final component. Selection belongs in `copy.rs`, the bounded one-entry
+  cache in `worker.rs`, and all native handle mechanics in `file.rs`; never
+  spread this path into another filesystem, endpoint, or transport without a
+  separate decision and evidence.
 - **Generic redirector transport:** generic UNC/mapped paths use two bounded
   buffers; one synchronous source read overlaps one destination write, and
   only non-checkpointed independent streams may use parallel workers.

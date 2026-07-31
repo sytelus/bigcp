@@ -2,6 +2,45 @@
 
 Latest review: 2026-07-31
 
+## 2026-07-31 distinct-drive NTFS small-file relative creates
+
+The local standard plain-small path now removes one repeated namespace cost:
+when source and destination are local NTFS on nonintersecting physical disks,
+each directory-affine worker caches one destination-parent handle after
+verifying the enumerated directory identity. Final child names then open
+relative to that handle through `NtCreateFile`. New-file collision refusal,
+same-handle replacement validation before truncation, EFS-at-create,
+create-time metadata, optional flush, and close-before-success still share the
+existing `DestinationFinal` completion code. If the parent capability cannot
+be opened, the worker caches that outcome for the directory and uses the prior
+absolute-path constructor.
+
+Five new bounded regressions cover relative create/replace and collision
+behavior, exact bytes and create-time metadata, stale parent identity, hostile
+traversal/ADS/NUL components, parent-cache reuse/unavailability, and selection isolation. The selection matrix
+proves the path cannot activate for same-physical-disk, ReFS, FAT/exFAT, UNC,
+WSL, or redirector cases. All 168 confined workspace tests passed serially
+with zero failures in
+`C:\Users\shitals\AppData\Local\Temp\bigcp-tests-8e6d35a814af4ba0bbd4290f81ee49f9`:
+10 CLI, 67 core unit, 18 core end-to-end, 11 testkit safety, 6 TUI, and 56
+Win32-boundary tests.
+
+Formatting, frozen-input verification, automated test-storage safety,
+warning-denied workspace/all-target Clippy, warning-denied rustdoc, and the
+locked optimized workspace build passed. Cargo-deny passed with only the
+allowed `hashbrown` and `syn` duplicate-version warnings; cargo-audit found no
+known vulnerability among 146 locked dependencies after loading 1,177
+advisories. PLAN and ADR 0048 record the mechanism and evidence boundary;
+LIMITATIONS remains current and unchanged. `VISION.md` was not modified and
+remains at SHA-256
+`B970F59B791A53584FB57698B26CB70A7E7E9D80982B9118F4EF5A4199BE6C28`.
+
+No multi-drive or other physical-drive performance run, VHDX, live UNC/WSL
+write, stress, large-scale, endurance, chaos, forced-disconnect, reboot,
+shutdown, or machine-stability test ran. ADR 0048's speedup is deliberately
+unclaimed until an operator approves the exact bounded H8 hardware fixture and
+the quiesced, rotated comparison protocol in `BENCHMARKS.md`.
+
 ## 2026-07-31 terminal UX and output-mode review
 
 This pass improved the user-facing command experience without changing copy,

@@ -12,13 +12,20 @@ use std::io::{self, Read, Seek, Write};
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::OpenOptionsExt;
-use std::os::windows::io::{AsRawHandle, IntoRawHandle};
-use std::path::{Path, PathBuf};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle};
+use std::path::{Component, Path, PathBuf};
+use std::ptr::{null, null_mut};
 
 use uuid::Uuid;
+use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+use windows_sys::Wdk::Storage::FileSystem::{
+    FILE_CREATE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_SEQUENTIAL_ONLY,
+    FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+};
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED,
-    GENERIC_READ, GENERIC_WRITE,
+    GENERIC_READ, GENERIC_WRITE, HANDLE, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError,
+    UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_ALLOCATION_INFO, FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_COMPRESSED,
@@ -28,9 +35,10 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_SPARSE_FILE, FILE_ATTRIBUTE_SYSTEM, FILE_BASIC_INFO, FILE_DISPOSITION_INFO,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_SEQUENTIAL_SCAN,
     FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FILE_WRITE_ATTRIBUTES, FileAllocationInfo, FileBasicInfo, FileDispositionInfo, FileRenameInfo,
-    FileRenameInfoEx, FlushFileBuffers, SetFileInformationByHandle,
+    FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FileAllocationInfo, FileBasicInfo, FileDispositionInfo,
+    FileRenameInfo, FileRenameInfoEx, FlushFileBuffers, SYNCHRONIZE, SetFileInformationByHandle,
 };
+use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 use windows_sys::Win32::System::WindowsProgramming::{
     FILE_RENAME_FLAG_POSIX_SEMANTICS, FILE_RENAME_FLAG_REPLACE_IF_EXISTS,
 };
@@ -156,6 +164,41 @@ impl Read for SourceFile {
 impl Seek for SourceFile {
     fn seek(&mut self, position: io::SeekFrom) -> io::Result<u64> {
         self.file.seek(position)
+    }
+}
+
+/// A verified directory handle used as the root of local NTFS child opens.
+///
+/// The copy workers cache one of these per active destination directory. A
+/// child opened through this capability needs only its final UTF-16 component,
+/// avoiding repeated parsing and traversal of the absolute destination path.
+/// Construction validates the directory identity captured by enumeration;
+/// callers cannot manufacture a capability from an unchecked raw handle.
+pub struct RelativeDirectory {
+    file: File,
+}
+
+impl RelativeDirectory {
+    /// Opens a real directory and verifies that it still has `expected` identity.
+    pub fn open_destination(path: &Path, expected: FileIdentity) -> io::Result<Self> {
+        let mut options = OpenOptions::new();
+        options
+            .access_mode(FILE_READ_ATTRIBUTES | FILE_TRAVERSE)
+            // Pin the verified parent namespace while this worker is creating
+            // children. If another delete-access handle prevents the pin,
+            // core treats the capability as unavailable and keeps the prior
+            // absolute-path behavior for that directory.
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+        let file = options.open(path)?;
+        let metadata = metadata_from_file(&file)?;
+        if metadata.kind != ObjectKind::Directory || metadata.identity != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "destination parent identity or type changed before child creation",
+            ));
+        }
+        Ok(Self { file })
     }
 }
 
@@ -551,6 +594,32 @@ impl DestinationFinal {
             options.attributes(FILE_ATTRIBUTE_ENCRYPTED);
         }
         let file = options.open(path)?;
+        Self::from_opened(file, expected, initial_stamp)
+    }
+
+    /// Opens one final child name relative to a verified local NTFS directory.
+    ///
+    /// `name` must be exactly one ordinary component and may never contain an
+    /// alternate-stream separator. Creation and replacement otherwise retain
+    /// the same no-follow, same-handle validation, metadata, and truncation
+    /// contract as [`Self::create`].
+    pub fn create_relative(
+        parent: &RelativeDirectory,
+        name: &std::ffi::OsStr,
+        expected: Option<&ObjectMetadata>,
+        encrypted: bool,
+        initial_stamp: Option<BasicMetadata>,
+        sequential: bool,
+    ) -> io::Result<Self> {
+        let file = open_relative_final(parent, name, expected.is_none(), encrypted, sequential)?;
+        Self::from_opened(file, expected, initial_stamp)
+    }
+
+    fn from_opened(
+        file: File,
+        expected: Option<&ObjectMetadata>,
+        initial_stamp: Option<BasicMetadata>,
+    ) -> io::Result<Self> {
         if let Some(expected) = expected {
             let metadata = metadata_from_file(&file)?;
             if metadata.kind != ObjectKind::File {
@@ -606,6 +675,98 @@ impl DestinationFinal {
         // transactional path already uses this explicit close boundary.
         close_file(self.file)
     }
+}
+
+fn open_relative_final(
+    parent: &RelativeDirectory,
+    name: &std::ffi::OsStr,
+    create_new: bool,
+    encrypted: bool,
+    sequential: bool,
+) -> io::Result<File> {
+    let mut name_units = relative_name_units(name)?;
+    let name_bytes = name_units
+        .len()
+        .checked_mul(size_of::<u16>())
+        .and_then(|length| u16::try_from(length).ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "file name is too long"))?;
+    let unicode_name = UNICODE_STRING {
+        Length: name_bytes,
+        MaximumLength: name_bytes,
+        Buffer: name_units.as_mut_ptr(),
+    };
+    let object_attributes = OBJECT_ATTRIBUTES {
+        Length: size_u32::<OBJECT_ATTRIBUTES>()?,
+        RootDirectory: parent.file.as_raw_handle().cast(),
+        ObjectName: &raw const unicode_name,
+        Attributes: OBJ_CASE_INSENSITIVE,
+        SecurityDescriptor: null(),
+        SecurityQualityOfService: null(),
+    };
+    let mut status_block = IO_STATUS_BLOCK::default();
+    let mut handle: HANDLE = null_mut();
+    let create_options = FILE_NON_DIRECTORY_FILE
+        | FILE_OPEN_REPARSE_POINT
+        | FILE_SYNCHRONOUS_IO_NONALERT
+        | if sequential { FILE_SEQUENTIAL_ONLY } else { 0 };
+    let attributes = if encrypted {
+        FILE_ATTRIBUTE_ENCRYPTED
+    } else {
+        FILE_ATTRIBUTE_NORMAL
+    };
+    // SAFETY: every pointer references a live, correctly laid-out structure
+    // for the duration of the synchronous call. `parent` owns RootDirectory,
+    // and successful handle ownership transfers immediately into `File`.
+    let status = unsafe {
+        NtCreateFile(
+            &raw mut handle,
+            GENERIC_WRITE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            &raw const object_attributes,
+            &raw mut status_block,
+            null(),
+            attributes,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            if create_new { FILE_CREATE } else { FILE_OPEN },
+            create_options,
+            null(),
+            0,
+        )
+    };
+    if status < 0 {
+        // SAFETY: conversion accepts any NTSTATUS and performs no mutation.
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        return Err(io::Error::from_raw_os_error(code.cast_signed()));
+    }
+    if handle.is_null() {
+        return Err(io::Error::other(
+            "NtCreateFile succeeded without returning a handle",
+        ));
+    }
+    // SAFETY: NtCreateFile returned sole ownership of a valid synchronous
+    // kernel file handle, which `File` closes exactly once.
+    Ok(unsafe { File::from_raw_handle(handle.cast()) })
+}
+
+fn relative_name_units(name: &std::ffi::OsStr) -> io::Result<Vec<u16>> {
+    let mut components = Path::new(name).components();
+    let valid_component = matches!(components.next(), Some(Component::Normal(value)) if value == name)
+        && components.next().is_none();
+    let units: Vec<u16> = name.encode_wide().collect();
+    if !valid_component
+        || units.is_empty()
+        || units.iter().any(|unit| {
+            *unit == 0
+                || *unit == u16::from(b':')
+                || *unit == u16::from(b'\\')
+                || *unit == u16::from(b'/')
+        })
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "relative file name must be one ordinary component without a stream separator",
+        ));
+    }
+    Ok(units)
 }
 
 impl Write for DestinationFinal {
@@ -751,7 +912,7 @@ pub(crate) fn rename_by_handle(
     // code unit. info is naturally aligned because the allocator aligns Vec.
     unsafe {
         (*info).Anonymous.Flags = flags;
-        (*info).RootDirectory = std::ptr::null_mut();
+        (*info).RootDirectory = null_mut();
         (*info).FileNameLength = u32::try_from(name_bytes)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "rename path is too long"))?;
         std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
@@ -1075,9 +1236,11 @@ mod tests {
 
 #[cfg(test)]
 mod destination_final_tests {
-    use super::{BasicMetadata, DestinationFinal};
+    use super::{BasicMetadata, DestinationFinal, RelativeDirectory, relative_name_units};
     use crate::metadata::metadata_at;
+    use std::ffi::{OsStr, OsString};
     use std::io::Write;
+    use std::os::windows::ffi::OsStringExt;
 
     /// Pins the create-time stamp coalescing contract (BENCHMARKS.md
     /// 2026-07-29): an explicit timestamp set right after create must
@@ -1172,5 +1335,143 @@ mod destination_final_tests {
             std::fs::read(&replacement_path).ok(),
             Some(b"must survive".to_vec())
         );
+    }
+
+    #[test]
+    fn verified_parent_creates_relative_child_without_weakening_collision_safety() {
+        let sandbox = tempfile::tempdir();
+        assert!(sandbox.is_ok());
+        let Some(sandbox) = sandbox.ok() else {
+            return;
+        };
+        let parent_metadata = metadata_at(sandbox.path());
+        assert!(parent_metadata.is_ok());
+        let Some(parent_metadata) = parent_metadata.ok() else {
+            return;
+        };
+        let parent = RelativeDirectory::open_destination(sandbox.path(), parent_metadata.identity);
+        assert!(parent.is_ok());
+        let Some(parent) = parent.ok() else {
+            return;
+        };
+        let stamp = BasicMetadata {
+            creation_time: 131_000_000_000_000_010,
+            last_access_time: 131_000_000_000_000_011,
+            last_write_time: 131_000_000_000_000_012,
+            attributes: 0x20,
+        };
+        let child = DestinationFinal::create_relative(
+            &parent,
+            OsStr::new("child.bin"),
+            None,
+            false,
+            Some(stamp),
+            false,
+        );
+        assert!(child.is_ok());
+        let Some(mut child) = child.ok() else {
+            return;
+        };
+        assert!(child.write_all(b"relative child").is_ok());
+        assert!(child.finish(false, None).is_ok());
+        let child_path = sandbox.path().join("child.bin");
+        assert_eq!(
+            std::fs::read(&child_path).ok(),
+            Some(b"relative child".to_vec())
+        );
+        assert!(
+            metadata_at(&child_path)
+                .is_ok_and(|metadata| { metadata.basic.last_write_time == stamp.last_write_time })
+        );
+
+        let collision = DestinationFinal::create_relative(
+            &parent,
+            OsStr::new("child.bin"),
+            None,
+            false,
+            None,
+            false,
+        );
+        assert!(
+            collision
+                .as_ref()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists)
+        );
+        assert_eq!(
+            std::fs::read(&child_path).ok(),
+            Some(b"relative child".to_vec())
+        );
+
+        let expected = metadata_at(&child_path);
+        assert!(expected.is_ok());
+        let Some(expected) = expected.ok() else {
+            return;
+        };
+        let replacement = DestinationFinal::create_relative(
+            &parent,
+            OsStr::new("child.bin"),
+            Some(&expected),
+            false,
+            Some(stamp),
+            false,
+        );
+        assert!(replacement.is_ok());
+        let Some(mut replacement) = replacement.ok() else {
+            return;
+        };
+        assert!(replacement.write_all(b"replacement").is_ok());
+        assert!(replacement.finish(false, None).is_ok());
+        assert_eq!(
+            std::fs::read(&child_path).ok(),
+            Some(b"replacement".to_vec())
+        );
+
+        let other_path = sandbox.path().join("other.bin");
+        assert!(std::fs::write(&other_path, b"must survive").is_ok());
+        let mismatch = DestinationFinal::create_relative(
+            &parent,
+            OsStr::new("other.bin"),
+            Some(&expected),
+            false,
+            None,
+            false,
+        );
+        assert!(mismatch.is_err());
+        assert_eq!(
+            std::fs::read(other_path).ok(),
+            Some(b"must survive".to_vec())
+        );
+    }
+
+    #[test]
+    fn relative_child_names_reject_traversal_streams_and_embedded_nul() {
+        for name in ["", ".", "..", "../escape", r"..\escape", "host:stream"] {
+            assert!(relative_name_units(OsStr::new(name)).is_err());
+        }
+        let embedded_nul = OsString::from_wide(&[
+            u16::from(b'n'),
+            u16::from(b'u'),
+            u16::from(b'l'),
+            0,
+            u16::from(b'x'),
+        ]);
+        assert!(relative_name_units(&embedded_nul).is_err());
+        assert!(relative_name_units(OsStr::new("ordinary name.txt")).is_ok());
+    }
+
+    #[test]
+    fn relative_parent_rejects_a_stale_directory_identity() {
+        let sandbox = tempfile::tempdir();
+        assert!(sandbox.is_ok());
+        let Some(sandbox) = sandbox.ok() else {
+            return;
+        };
+        let metadata = metadata_at(sandbox.path());
+        assert!(metadata.is_ok());
+        let Some(mut identity) = metadata.ok().map(|value| value.identity) else {
+            return;
+        };
+        identity.file_id[0] ^= 0xFF;
+        assert!(RelativeDirectory::open_destination(sandbox.path(), identity).is_err());
     }
 }

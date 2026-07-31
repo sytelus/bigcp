@@ -17,8 +17,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use bigcp_win::{
-    DestinationLock, DestinationStream, DirectoryEntry, FileSystem, ObjectKind, ObjectMetadata,
-    SourceStream, VolumeInfo, absolute_extended, classify_endpoint,
+    DestinationLock, DestinationStream, DirectoryEntry, EndpointKind, FileIdentity, FileSystem,
+    ObjectKind, ObjectMetadata, SourceStream, VolumeInfo, absolute_extended, classify_endpoint,
     clear_extended_attributes_checked, comparison_key, copy_reparse, create_directory,
     display_path, enumerate_directory, final_path, is_cloud_placeholder, is_compressed,
     is_same_or_descendant_with, is_sparse, list_streams, metadata_at, open_root, probe_volume,
@@ -44,7 +44,7 @@ use crate::report::{
     ReplacementSample, ReplacementSummary, RunInfo, RunReport, top_level,
 };
 use crate::stats::{AnalysisCollector, StatsTracker};
-use crate::transport::TransportProfile;
+use crate::transport::{TransportKind, TransportProfile};
 use crate::verify::{VerificationTarget, verify_written_targets};
 use crate::worker::{CompletedCopy, FileCopyJob, FileWorkers, ReplacementWork};
 
@@ -134,7 +134,7 @@ pub fn run_copy(
                 preflight.destination_volume.endpoint.name(),
                 preflight.profile.chunk_bytes / (1024 * 1024),
                 preflight.profile.workers,
-                if preflight.destination_volume.endpoint == bigcp_win::EndpointKind::Wsl {
+                if preflight.destination_volume.endpoint == EndpointKind::Wsl {
                     " with striped destination creates"
                 } else {
                     ""
@@ -264,6 +264,14 @@ pub fn run_copy(
     }
 
     let worker_cancel = Arc::new(AtomicBool::new(false));
+    let relative_ntfs_creates = should_use_relative_ntfs_creates(
+        preflight.source_volume.filesystem,
+        preflight.source_volume.endpoint,
+        preflight.destination_volume.filesystem,
+        preflight.destination_volume.endpoint,
+        preflight.profile.same_physical_disk,
+        preflight.profile.transport,
+    );
     let file_workers = FileWorkers::new(
         preflight.profile.workers,
         preflight
@@ -283,6 +291,7 @@ pub fn run_copy(
         destination_policy,
         chunk_bytes: preflight.profile.chunk_bytes,
         transport: preflight.profile.transport,
+        relative_ntfs_creates,
         source_is_volume_root: same_path(&preflight.source, &preflight.source_volume.root)?,
         counters: Counters::default(),
         audit,
@@ -555,6 +564,9 @@ struct Runner<'a> {
     destination_policy: FilesystemPolicy,
     chunk_bytes: usize,
     transport: TransportProfile,
+    /// Distinct-drive local NTFS plain-small jobs may create children through
+    /// one verified parent handle cached by their directory-affine worker.
+    relative_ntfs_creates: bool,
     source_is_volume_root: bool,
     counters: Counters,
     audit: AuditWriter,
@@ -611,6 +623,22 @@ enum DirectoryTask {
 struct WorkerDispatch {
     promote_threshold: Option<u64>,
     directory_affine: bool,
+}
+
+fn should_use_relative_ntfs_creates(
+    source_filesystem: FileSystem,
+    source_endpoint: EndpointKind,
+    destination_filesystem: FileSystem,
+    destination_endpoint: EndpointKind,
+    same_physical_disk: bool,
+    transport: TransportProfile,
+) -> bool {
+    source_filesystem == FileSystem::Ntfs
+        && destination_filesystem == FileSystem::Ntfs
+        && matches!(source_endpoint, EndpointKind::Local)
+        && matches!(destination_endpoint, EndpointKind::Local)
+        && !same_physical_disk
+        && matches!(transport.kind, TransportKind::Standard)
 }
 
 /// Selects only files whose correctness does not require coordinator-owned
@@ -840,6 +868,13 @@ impl Runner<'_> {
         self.phases.record(6, phase_timer.elapsed());
         let mut seen_source = HashSet::new();
         let mut child_directories = Vec::new();
+        let relative_destination_parent = if self.relative_ntfs_creates {
+            destination_metadata
+                .as_ref()
+                .map(|metadata| metadata.identity)
+        } else {
+            None
+        };
 
         for source_entry in source_entries {
             let phase_timer = Instant::now();
@@ -935,7 +970,12 @@ impl Runner<'_> {
             }
             match source_entry.metadata.kind {
                 ObjectKind::File => {
-                    self.handle_file(source_entry, destination_entry, child_relative)?;
+                    self.handle_file(
+                        source_entry,
+                        destination_entry,
+                        child_relative,
+                        relative_destination_parent,
+                    )?;
                 }
                 ObjectKind::Directory => {
                     child_directories.push((source_entry, destination_entry, child_relative));
@@ -1276,8 +1316,8 @@ impl Runner<'_> {
         source: &Path,
         destination: &Path,
         relative: &Path,
-        expected_source: bigcp_win::FileIdentity,
-        expected_destination: bigcp_win::FileIdentity,
+        expected_source: FileIdentity,
+        expected_destination: FileIdentity,
     ) -> Result<u64, OperationError> {
         if !self.source_supports_streams {
             return Ok(0);
@@ -1369,6 +1409,7 @@ impl Runner<'_> {
         source: DirectoryEntry,
         destination: Option<DirectoryEntry>,
         relative: PathBuf,
+        relative_destination_parent: Option<FileIdentity>,
     ) -> Result<(), BigcpError> {
         if self
             .destination_policy
@@ -1436,7 +1477,15 @@ impl Runner<'_> {
             self.destination_policy,
         ) {
             Classification::New => {
-                self.copy_classified(&source, &relative, &source_snapshot, None, None, true)?;
+                self.copy_classified(
+                    &source,
+                    &relative,
+                    &source_snapshot,
+                    None,
+                    None,
+                    true,
+                    relative_destination_parent,
+                )?;
             }
             Classification::Same => {
                 self.record_file(
@@ -1495,6 +1544,7 @@ impl Runner<'_> {
                     destination_snapshot.as_ref(),
                     Some((fields, destination_newer)),
                     true,
+                    relative_destination_parent,
                 )?;
             }
             Classification::SkipDifferent {
@@ -1543,6 +1593,7 @@ impl Runner<'_> {
         destination_snapshot: Option<&EntrySnapshot>,
         replacement: Option<(Vec<&'static str>, bool)>,
         dispatch: bool,
+        relative_destination_parent: Option<FileIdentity>,
     ) -> Result<(), BigcpError> {
         let replacement_old = match (&replacement, destination_snapshot) {
             (Some(_), Some(snapshot)) => Some(&snapshot.metadata),
@@ -1569,7 +1620,7 @@ impl Runner<'_> {
                 && is_sparse(source.metadata.basic.attributes);
             if let Some(dispatch) = worker_dispatch(
                 self.transport,
-                self.destination_policy.endpoint() == bigcp_win::EndpointKind::Wsl,
+                self.destination_policy.endpoint() == EndpointKind::Wsl,
                 self.journal.is_some(),
                 unnamed,
                 self.options.large_threshold(),
@@ -1579,6 +1630,7 @@ impl Runner<'_> {
                 let job = FileCopyJob {
                     source_path: source.path.clone(),
                     destination_path: self.destination_root.join(relative),
+                    relative_destination_parent,
                     source_snapshot: source_snapshot.clone(),
                     destination_snapshot: destination_snapshot.cloned(),
                     replacement: replacement.map(|(fields, destination_newer)| ReplacementWork {
@@ -1609,8 +1661,7 @@ impl Runner<'_> {
                     destination_requires_post_write_stamp: self
                         .destination_policy
                         .requires_post_write_stamp(),
-                    destination_is_wsl: self.destination_policy.endpoint()
-                        == bigcp_win::EndpointKind::Wsl,
+                    destination_is_wsl: self.destination_policy.endpoint() == EndpointKind::Wsl,
                     chunk_bytes: self.chunk_bytes,
                     transport: self.transport,
                     checkpoint_threshold: self.options.checkpoint_threshold(),
@@ -1715,6 +1766,7 @@ impl Runner<'_> {
         let request = EngineRequest {
             source_path: &source.path,
             destination_path: &destination_path,
+            relative_destination_parent: None,
             relative_path: relative,
             source_snapshot,
             replacement_snapshot: destination_snapshot,
@@ -1742,7 +1794,7 @@ impl Runner<'_> {
             destination_requires_post_write_stamp: self
                 .destination_policy
                 .requires_post_write_stamp(),
-            destination_is_wsl: self.destination_policy.endpoint() == bigcp_win::EndpointKind::Wsl,
+            destination_is_wsl: self.destination_policy.endpoint() == EndpointKind::Wsl,
             known_streams: Some(&streams),
             cancel: &cancel_probe,
             promote_threshold: None,
@@ -1872,6 +1924,7 @@ impl Runner<'_> {
                 destination_snapshot.as_ref(),
                 replacement,
                 false,
+                None,
             );
         }
         self.counters.bytes_read_source = self
@@ -3238,8 +3291,8 @@ fn derive_hints(runner: &Runner<'_>, preflight: &Preflight) -> Vec<Hint> {
             confidence: "high".to_owned(),
         });
     }
-    if preflight.source_volume.endpoint == bigcp_win::EndpointKind::Wsl
-        || preflight.destination_volume.endpoint == bigcp_win::EndpointKind::Wsl
+    if preflight.source_volume.endpoint == EndpointKind::Wsl
+        || preflight.destination_volume.endpoint == EndpointKind::Wsl
     {
         hints.push(Hint {
             id: "wsl_interop".to_owned(),
@@ -3515,13 +3568,93 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        WorkerDispatch, completed_exit, is_default_system_exclusion, path_hash, summarize_phases,
-        validate_audit_layout, worker_dispatch,
+        WorkerDispatch, completed_exit, is_default_system_exclusion, path_hash,
+        should_use_relative_ntfs_creates, summarize_phases, validate_audit_layout, worker_dispatch,
     };
     use crate::model::Counters;
     use crate::report::VerificationSummary;
     use crate::stats::TimelinePoint;
     use crate::transport::TransportProfile;
+    use bigcp_win::{EndpointKind, FileSystem};
+
+    #[test]
+    fn relative_ntfs_creates_are_isolated_to_distinct_local_ntfs_drives() {
+        let standard = TransportProfile::standard(8 * 1024 * 1024);
+        assert!(should_use_relative_ntfs_creates(
+            FileSystem::Ntfs,
+            EndpointKind::Local,
+            FileSystem::Ntfs,
+            EndpointKind::Local,
+            false,
+            standard,
+        ));
+        for (
+            source_fs,
+            source_endpoint,
+            destination_fs,
+            destination_endpoint,
+            same_disk,
+            transport,
+        ) in [
+            (
+                FileSystem::Refs,
+                EndpointKind::Local,
+                FileSystem::Ntfs,
+                EndpointKind::Local,
+                false,
+                standard,
+            ),
+            (
+                FileSystem::Ntfs,
+                EndpointKind::Local,
+                FileSystem::ExFat,
+                EndpointKind::Local,
+                false,
+                standard,
+            ),
+            (
+                FileSystem::Ntfs,
+                EndpointKind::Unc,
+                FileSystem::Ntfs,
+                EndpointKind::Local,
+                false,
+                standard,
+            ),
+            (
+                FileSystem::Ntfs,
+                EndpointKind::Local,
+                FileSystem::Ntfs,
+                EndpointKind::Wsl,
+                false,
+                TransportProfile::wsl(8 * 1024 * 1024),
+            ),
+            (
+                FileSystem::Ntfs,
+                EndpointKind::Local,
+                FileSystem::Ntfs,
+                EndpointKind::Local,
+                true,
+                standard,
+            ),
+            (
+                FileSystem::Ntfs,
+                EndpointKind::Local,
+                FileSystem::Ntfs,
+                EndpointKind::Local,
+                false,
+                TransportProfile::redirector(8 * 1024 * 1024),
+            ),
+        ] {
+            assert!(!should_use_relative_ntfs_creates(
+                source_fs,
+                source_endpoint,
+                destination_fs,
+                destination_endpoint,
+                same_disk,
+                transport,
+            ));
+        }
+    }
 
     #[test]
     fn redirector_dispatches_streamed_files_but_keeps_checkpoint_owners_inline() {

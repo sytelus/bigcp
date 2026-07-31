@@ -335,8 +335,9 @@ With the cached-policy result in hand (5.18 s, 3,861 files/s, ~14× from
 sequential), the phase table re-ranks the field: create is again the top
 item (37.2 worker-seconds — now NTFS log/MFT-allocation contention, since
 the device round-trips are gone), write 9.0, everything else small; workers
-are still idle ~70 % of wall, pointing at dispatch cadence. Candidates, in
-recommended experiment order, none implemented without its measurement:
+are still idle ~70 % of wall, pointing at dispatch cadence. Candidates were
+registered in recommended experiment order; later dispositions are recorded
+inline rather than rewriting the original evidence:
 
 1. **Worker-count sweep under the cached policy** — 32 was tuned for the
    write-through regime; the contention profile changed (trivial to run).
@@ -345,7 +346,10 @@ recommended experiment order, none implemented without its measurement:
    serialization may now be the limiter. A/B affinity vs round-robin.
 3. **Relative-handle creates** (`NtCreateFile` with `RootDirectory`) —
    skips per-create path resolution; matters most on the NVMe cells where
-   effective create cost is already ~58 µs.
+   effective create cost is already ~58 µs. **Implemented 2026-07-31 under
+   ADR 0048; performance remains unmeasured.** The implementation is confined
+   to distinct-drive local-NTFS plain-small workers and falls back to the
+   former absolute open when a verified parent capability is unavailable.
 4. **The unmeasured cell that matters next: HDD *source*** — source open +
    read is trivial from NVMe (125 µs/file) but will dominate reading many
    small files off a spinning source; the prefetch-pipeline idea belongs to
@@ -409,6 +413,20 @@ chunk/thread sweeps in each approved direction and must record WSL version/type,
 distribution, filesystem, warm/cold state, verification policy, and exact
 native-Linux/robocopy comparison commands.
 
+**H8 — local NTFS relative final-name creates (registered 2026-07-31,
+unmeasured):** ADR 0048 caches one verified destination-parent handle per
+directory-affine worker/directory and opens plain-small final names with
+`NtCreateFile(RootDirectory=parent)`. This should reduce repeated absolute
+parent parsing on distinct-drive local NTFS copies without changing source
+opens, stream discovery, data I/O, completion, or any other transport. Bounded
+tests prove create-new collision safety, replacement validation reuse,
+metadata correctness, stale-parent refusal, hostile-component rejection, and
+selection isolation; they do not prove a speedup. The first approved run must
+compare the current implementation with an otherwise-identical absolute-open
+baseline and robocopy, use the certified quiesce/rotation protocol, and report
+results by directory shape because the one-parent-open amortization depends on
+files per directory.
+
 The elevated filesystem matrix, repeated-run certified benchmark protocol,
 ADR 0036 same-spindle HDD comparison, and ADR 0037 generic-UNC/WSL profile
 comparisons remain unexecuted. The same-spindle
@@ -420,8 +438,9 @@ target scratch root, write volume, duration, and drive impact. The remote
 generic-UNC and WSL 8 MiB/16-worker Auto rows are independently bounded static
 defaults, not measured speedup claims; any network/WSL benchmark additionally
 requires an approved scratch share/distribution path. ADR 0045's two-buffer and
-parallel-stream mechanics and ADR 0046's WSL-specific scheduling/round-trip
-reductions are likewise benchmark-pending rather than measured speedup claims. Endurance,
+parallel-stream mechanics, ADR 0046's WSL-specific scheduling/round-trip
+reductions, and ADR 0048's local relative-create path are likewise
+benchmark-pending rather than measured speedup claims. Endurance,
 million-entry, and competitor sweeps stay prohibited (VISION).
 
 Future entries must record OS build, CPU/RAM, source/destination volume and

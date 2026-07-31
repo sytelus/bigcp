@@ -63,6 +63,14 @@ then source-revalidated before success. Checkpoint boundaries retain exact
 offset-ordered xxh3 snapshots. All paths
 return the same `EngineResult` and only the coordinator records terminal
 outcomes. Channels and buffers have explicit caps.
+Distinct-drive local NTFS plain-small workers additionally cache one verified
+destination-parent capability. `bigcp-win` opens the final child relative to
+that handle with `NtCreateFile`, so repeated files in one directory do not
+reparse the same absolute parent path. New/replacement dispositions feed the
+same `DestinationFinal` validation and completion code; a parent-capability
+open failure falls back to the absolute constructor. Selection is deliberately
+absent from same-physical-disk, ReFS, FAT/exFAT, UNC, WSL, sparse, large, and
+transactional paths (ADR 0048).
 Known symbolic links are created through `CreateSymbolicLinkW` so Developer
 Mode can authorize unelevated creation; junction and opted-in unknown tags use
 the raw reparse control path. All are built under owned opaque sibling names.
@@ -200,7 +208,7 @@ knowable; this endpoint branch does not alter local allocation behavior.
   suffixes and NUL-terminated Win32 strings cannot redirect a validated path.
 
 Known intentional differences from the governing plan are recorded inline at
-their PLAN.md sections and in the ADRs (0027–0047); there is no separate
+their PLAN.md sections and in the ADRs (0027–0048); there is no separate
 deviations file.
 
 The terminal layer is a read-only projection of coordinator snapshots and

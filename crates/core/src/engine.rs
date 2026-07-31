@@ -11,10 +11,10 @@ use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use bigcp_win::{
-    DestinationFinal, DestinationStream, DestinationTemp, ObjectMetadata, SourceFile, SourceStream,
-    StreamInfo, is_encrypted, is_readonly, is_sparse, list_streams, metadata_at,
-    read_extended_attributes_checked, read_protected_dacl_checked, set_basic_at_checked,
-    without_readonly,
+    DestinationFinal, DestinationStream, DestinationTemp, ObjectMetadata, RelativeDirectory,
+    SourceFile, SourceStream, StreamInfo, is_encrypted, is_readonly, is_sparse, list_streams,
+    metadata_at, read_extended_attributes_checked, read_protected_dacl_checked,
+    set_basic_at_checked, without_readonly,
 };
 use xxhash_rust::xxh3::Xxh3;
 
@@ -55,6 +55,11 @@ pub struct EngineRequest<'a> {
     pub source_path: &'a Path,
     /// Absolute final destination path.
     pub destination_path: &'a Path,
+    /// Verified parent capability for the local NTFS plain-small hot path.
+    ///
+    /// Transactional, remote, degraded-filesystem, and inline callers pass
+    /// `None` and retain ordinary absolute-path opens.
+    pub relative_destination_parent: Option<&'a RelativeDirectory>,
     /// Relative source identity for errors.
     pub relative_path: &'a Path,
     /// Enumeration snapshot.
@@ -802,13 +807,7 @@ fn create_final(request: &EngineRequest<'_>) -> Result<DestinationFinal, Operati
         .replacement_snapshot
         .map(|snapshot| &snapshot.metadata);
     let initial_stamp = (!request.destination_is_wsl).then_some(request.destination_metadata);
-    match DestinationFinal::create(
-        request.destination_path,
-        expected,
-        encrypted,
-        initial_stamp,
-        request.destination_is_wsl,
-    ) {
+    match open_final(request, expected, encrypted, initial_stamp) {
         Ok(value) => Ok(value),
         Err(error)
             if error.kind() == std::io::ErrorKind::PermissionDenied
@@ -830,13 +829,7 @@ fn create_final(request: &EngineRequest<'_>) -> Result<DestinationFinal, Operati
             .map_err(|error| operation_error("clear_readonly", request.relative_path, &error))?;
             let mut cleared_snapshot = snapshot.metadata.clone();
             cleared_snapshot.basic = cleared;
-            match DestinationFinal::create(
-                request.destination_path,
-                Some(&cleared_snapshot),
-                encrypted,
-                initial_stamp,
-                request.destination_is_wsl,
-            ) {
+            match open_final(request, Some(&cleared_snapshot), encrypted, initial_stamp) {
                 Ok(value) => Ok(value),
                 Err(create_error) => {
                     // The retry did not take ownership of the file. Restore
@@ -891,6 +884,38 @@ fn create_final(request: &EngineRequest<'_>) -> Result<DestinationFinal, Operati
             ))
         }
         Err(error) => Err(operation_error("create_dst", request.relative_path, &error)),
+    }
+}
+
+fn open_final(
+    request: &EngineRequest<'_>,
+    expected: Option<&ObjectMetadata>,
+    encrypted: bool,
+    initial_stamp: Option<bigcp_win::BasicMetadata>,
+) -> std::io::Result<DestinationFinal> {
+    if let Some(parent) = request.relative_destination_parent {
+        let name = request.destination_path.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "destination file path has no final component",
+            )
+        })?;
+        DestinationFinal::create_relative(
+            parent,
+            name,
+            expected,
+            encrypted,
+            initial_stamp,
+            request.destination_is_wsl,
+        )
+    } else {
+        DestinationFinal::create(
+            request.destination_path,
+            expected,
+            encrypted,
+            initial_stamp,
+            request.destination_is_wsl,
+        )
     }
 }
 

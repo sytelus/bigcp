@@ -1,11 +1,11 @@
 # Verifies that the implementation task's three governing inputs remain
 # byte-identical to their last owner-approved revision. Re-pinned 2026-07-31
-# after the owner-directed Recycle Bin default-inclusion and terminal UX
-# changes updated PLAN and LIMITATIONS without changing VISION.
+# after the owner-directed distinct-drive NTFS small-file optimization updated
+# PLAN without changing VISION or LIMITATIONS.
 # Re-pin only as the final step of an owner-approved documentation change.
 $ErrorActionPreference = 'Stop'
 $Expected = @{
-    'PLAN.md' = '21A67604B8E4DB99665FC7466C0D9C384F08510805553AF2831B6A4CEBD04D16'
+    'PLAN.md' = '244CD70834D3577666D5565252F9812A6C70062A0D117EC0023F4847E029FC40'
     'VISION.md' = 'B970F59B791A53584FB57698B26CB70A7E7E9D80982B9118F4EF5A4199BE6C28'
     'LIMITATIONS.md' = 'E31391A9982F22DC74C0754587DBBE9B5066EBDB85294391486539AEDDEAABEE'
 }

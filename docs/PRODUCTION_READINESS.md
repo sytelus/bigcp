@@ -101,4 +101,4 @@ create a certification claim (ADR 0042).
 
 No release process may reinterpret an unrun gate as a pass.
 `TESTING_SUMMARY.md` records dated evidence; intentional differences from
-the governing plan are recorded inline in PLAN.md and in ADRs 0027–0047.
+the governing plan are recorded inline in PLAN.md and in ADRs 0027–0048.

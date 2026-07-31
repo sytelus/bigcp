@@ -238,5 +238,13 @@ silently promoted into the v1 gate and cannot certify those best-effort paths.
 Differential OS-copy comparisons likewise remain optional. See PLAN §12.10,
 §13.2, and `BENCHMARKS.md`.
 
+ADR 0048's distinct-drive NTFS relative-create speed hypothesis remains a
+hardware gate, not a routine test. An approved run must name both disposable
+NTFS roots and their physical disks, cap files/bytes/duration, use the
+quiesced and rotated repetition protocol, compare an otherwise-identical
+absolute-open baseline plus robocopy, and report directory shapes as well as
+logical/physical writes. Correctness-only temporary-directory tests do not
+authorize or substitute for that measurement.
+
 Hours-long soaks, million-entry real trees, and forced-disconnect tests are not
 deferred: they are prohibited by VISION and will never run.

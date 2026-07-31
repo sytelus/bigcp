@@ -36,6 +36,15 @@ versioning once its 1.0 release gates are complete.
 
 ### Changed
 
+- 2026-07-31 distinct-drive NTFS small-file optimization: directory-affine
+  workers now cache one identity-verified destination-parent handle and open
+  plain-small final names relative to it, avoiding repeated absolute-parent
+  resolution while retaining create-new collision refusal, same-handle
+  replacement validation, metadata, flush, and close semantics. Selection is
+  isolated from same-physical-disk, ReFS, FAT/exFAT, UNC, WSL, sparse, large,
+  and transactional paths (ADR 0048). Bounded correctness/isolation tests
+  passed; speed remains pending an approved multi-drive benchmark, and
+  `VISION.md` is unchanged.
 - Improved terminal UX without changing copy semantics: help now shows the
   three command forms and practical examples; `--quiet` truly emits only the
   final summary; `--no-color` and `NO_COLOR` retain the dashboard without color;
