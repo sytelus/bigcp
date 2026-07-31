@@ -13,8 +13,8 @@ Before proposing a change, answer in the description:
   and write budget justify it?
 - Does it change the normative object contract? If yes, include an ADR,
   `docs/SEMANTICS.md`, limitation, and schema review.
-- Does it touch either engine completion protocol or journal ordering? If yes, it cannot ship
-  as 1.0 until the chaos gate passes.
+- Does it touch either completion strategy in the one product engine or
+  journal ordering? If yes, it cannot ship as 1.0 until the chaos gate passes.
 - Are all tests inside validated new sandboxes, and are fresh writes bounded?
 - Have log/report format changes stayed additive within schema v1?
 

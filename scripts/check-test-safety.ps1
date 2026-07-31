@@ -58,6 +58,9 @@ Assert-CodeLine 'crates/testkit/src/generator.rs' `
 Assert-CodeLine 'crates/testkit/src/generator.rs' `
     'ROUTINE_ENTRY_LIMIT' `
     'Generator no longer separates routine caps from opt-in heavy scenarios.'
+Assert-CodeLine 'crates/testkit/src/generator.rs' `
+    'fn planned_entry_counts' `
+    'Generator no longer counts implicit parent directories before enforcing entry caps.'
 
 # The heavy-test opt-in must come from the operator's environment, never from
 # code. No Rust source in this repository may set environment variables.

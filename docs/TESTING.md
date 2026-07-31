@@ -29,6 +29,12 @@ Write budgets:
 | Routine CI total | 2 GiB ceiling |
 | Performance (bounded workloads only) | Low-GB budgets on scratch-designated targets; endurance/TB-class writes are prohibited outright — no approval path exists (VISION) |
 
+Generator entry caps count every distinct implicit parent directory that
+`create_dir_all` can materialize, not only paths explicitly listed in a
+scenario. Exact duplicate files, file/directory path conflicts, invalid
+relative paths, and over-depth plans are rejected before the scenario root is
+created.
+
 ## Test tiers: routine by default, heavy only by explicit opt-in
 
 The default suite is the **routine tier**: correctness tests only. They must

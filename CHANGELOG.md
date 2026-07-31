@@ -36,6 +36,15 @@ versioning once its 1.0 release gates are complete.
 
 ### Changed
 
+- 2026-07-31 safety and consistency review: made live progress and audit
+  failover diagnostics best-effort so a closed output pipe cannot abort an
+  active release copy; made final summary, report, and standalone-verify
+  output failures explicit; closed direct destination handles before success;
+  and made testkit entry caps include every implicit parent directory before
+  any fixture write. CI now denies rustdoc warnings, active audit-failure
+  documentation matches the intentionally immediate-abort implementation,
+  and stale two-engine maintainer wording is removed. `VISION.md` remains
+  unchanged.
 - 2026-07-31 comprehensive review: classify the complete official Win32 Cloud
   Files error family as `cloud`; report a failed READONLY metadata rollback
   with both failure contexts instead of discarding it; document the existing

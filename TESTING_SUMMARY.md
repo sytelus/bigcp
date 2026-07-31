@@ -2,6 +2,47 @@
 
 Latest review: 2026-07-31
 
+## 2026-07-31 output, handle-completion, and test-cap review
+
+This whole-repository pass fixed three concrete safety/correctness gaps.
+Line-oriented progress, messages, final summaries, standalone verification,
+preflight warnings, and prompts now use fallible writes: a closed redirected
+output stream can no longer panic-abort an active release copy, and command
+output failures map to the documented invariant/output exit. Direct
+destination files now close explicitly before their engine result can report
+success, so a `CloseHandle` failure is observable just as it is for the
+transactional path. Finally, testkit planning counts all distinct implicit
+parent directories before creating a scenario root; deep file-only manifests
+can no longer bypass the VISION entry caps. Duplicate declarations and exact
+file/directory path conflicts also fail during that no-write preflight.
+
+Two new testkit regressions cover implicit-directory cap enforcement and
+file/directory conflicts. All 134 bounded workspace tests passed with zero
+failures: 8 CLI, 48 core unit, 16 core end-to-end, 11 testkit safety, 3 TUI,
+and 48 Windows-boundary tests. The serial run used this newly created
+system-temporary root:
+
+`C:\Users\shitals\AppData\Local\Temp\bigcp-review-final-70ba984e59404491bad8ee15d38a7925`
+
+Formatting, warning-denied workspace/all-target Clippy, warning-denied
+rustdoc, doc tests, the locked optimized workspace build, frozen-input and
+test-storage safety checks, Markdown local-link validation, cargo-deny, and
+cargo-audit passed. Cargo-deny reported only the allowed duplicate-version
+warnings for `hashbrown` and `syn`; RustSec found no vulnerability among 146
+locked dependencies. CI now actually sets `RUSTDOCFLAGS=-D warnings`, matching
+the repository's documented gate. PLAN and LIMITATIONS now describe immediate
+audit-failure termination consistently, and stale two-engine wording was
+removed. `VISION.md` was not modified.
+
+The release binary copied and same-run-verified two files (13 bytes), passed a
+full standalone comparison (4 objects, 0 mismatches), and reopened its plain
+report under:
+
+`C:\Users\shitals\AppData\Local\Temp\bigcp-review-smoke-2eef4c1fbe9d47d9b17039aba9de66e6`
+
+No heavy, physical-drive, remote-write, VHDX, performance, stress,
+large-scale, endurance, or forced-disconnect test ran.
+
 ## 2026-07-31 certification-boundary and failure-reporting review
 
 The latest whole-repository review fixed two concrete error-path defects. Raw

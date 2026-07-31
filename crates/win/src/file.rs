@@ -569,7 +569,10 @@ impl DestinationFinal {
         if flush {
             self.file.sync_all()?;
         }
-        Ok(())
+        // Report success only after the direct destination handle is closed.
+        // `File`'s Drop cannot surface a CloseHandle failure, while the
+        // transactional path already uses this explicit close boundary.
+        close_file(self.file)
     }
 }
 

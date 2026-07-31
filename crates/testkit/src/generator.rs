@@ -1,8 +1,10 @@
 //! Deterministic bounded scenario generator.
 
+use std::collections::HashSet;
+use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -91,21 +93,24 @@ pub fn generate(
     if scenario.write_budget_bytes > HARD_WRITE_LIMIT {
         bail!("ordinary generator hard limit is 1 GiB");
     }
-    let entries = scenario
-        .directories
-        .len()
-        .saturating_add(scenario.files.len());
+    // Count the filesystem objects that create_dir_all can actually create,
+    // not just the paths explicitly listed in YAML. Without this expansion,
+    // 10,000 depth-32 file paths could silently create hundreds of thousands
+    // of directories and bypass VISION's absolute scale prohibition.
+    let (planned_directories, planned_files) = planned_entry_counts(scenario)?;
+    let entries = planned_directories.saturating_add(planned_files);
     if entries > HARD_ENTRY_LIMIT {
         bail!(
-            "scenario declares {entries} entries; the generator caps at {HARD_ENTRY_LIMIT} \
-             (VISION.md prohibits large-scale test trees)"
+            "scenario can create {entries} entries including implicit parent directories; the \
+             generator caps at {HARD_ENTRY_LIMIT} (VISION.md prohibits large-scale test trees)"
         );
     }
     if !heavy_tests_enabled() {
         if entries > ROUTINE_ENTRY_LIMIT {
             bail!(
-                "scenario declares {entries} entries; routine runs cap at {ROUTINE_ENTRY_LIMIT}. \
-                 Heavy scenarios require {HEAVY_TESTS_ENV}=1 set explicitly by the operator"
+                "scenario can create {entries} entries including implicit parent directories; \
+                 routine runs cap at {ROUTINE_ENTRY_LIMIT}. Heavy scenarios require \
+                 {HEAVY_TESTS_ENV}=1 set explicitly by the operator"
             );
         }
         if scenario.write_budget_bytes > ROUTINE_WRITE_LIMIT {
@@ -116,26 +121,16 @@ pub fn generate(
             );
         }
     }
-    for relative in scenario
-        .directories
-        .iter()
-        .chain(scenario.files.iter().map(|file| &file.path))
-    {
-        let depth = relative.components().count();
-        if depth > HARD_DEPTH_LIMIT {
-            bail!(
-                "scenario path {} has {depth} components; the generator caps depth at {HARD_DEPTH_LIMIT}",
-                relative.display()
-            );
-        }
-    }
     let root = sandbox.child(relative_root)?;
     fs::create_dir(&root).context("create new scenario root")?;
-    let mut directories = 1_u64;
+    // The generated root is also a newly created directory. Every planned
+    // descendant is distinct and new because that root was create-new.
+    let directories = u64::try_from(planned_directories)
+        .context("planned directory count exceeds u64")?
+        .saturating_add(1);
     for relative in &scenario.directories {
         let path = sandbox.child(&relative_root.join(relative))?;
         fs::create_dir_all(&path).with_context(|| format!("create {}", path.display()))?;
-        directories = directories.saturating_add(1);
     }
     let mut files = 0_u64;
     let mut bytes_written = 0_u64;
@@ -163,6 +158,83 @@ pub fn generate(
     })
 }
 
+/// Validates scenario paths and counts the distinct entries their directory
+/// creation calls can materialize. Counting stops once the hard cap is
+/// conclusively exceeded. This runs before the scenario root is created, so
+/// malformed, conflicting, or oversized plans fail without partial fixture
+/// writes.
+fn planned_entry_counts(scenario: &Scenario) -> Result<(usize, usize)> {
+    let mut directories = HashSet::new();
+    let mut files = HashSet::new();
+
+    for path in &scenario.directories {
+        let components = normal_components(path, false)?;
+        let mut current = PathBuf::new();
+        for component in components {
+            current.push(component);
+            directories.insert(current.clone());
+            if directories.len().saturating_add(files.len()) > HARD_ENTRY_LIMIT {
+                return Ok((HARD_ENTRY_LIMIT.saturating_add(1), 0));
+            }
+        }
+    }
+    for file in &scenario.files {
+        let components = normal_components(&file.path, true)?;
+        let mut current = PathBuf::new();
+        for component in &components[..components.len() - 1] {
+            current.push(component);
+            directories.insert(current.clone());
+            if directories.len().saturating_add(files.len()) > HARD_ENTRY_LIMIT {
+                return Ok((HARD_ENTRY_LIMIT.saturating_add(1), 0));
+            }
+        }
+        current.push(&components[components.len() - 1]);
+        if !files.insert(current) {
+            bail!("scenario declares the same file path more than once");
+        }
+        if directories.len().saturating_add(files.len()) > HARD_ENTRY_LIMIT {
+            return Ok((HARD_ENTRY_LIMIT.saturating_add(1), 0));
+        }
+    }
+    if let Some(conflict) = files.iter().find(|path| directories.contains(*path)) {
+        bail!(
+            "scenario path is declared as both a file and a directory: {}",
+            conflict.display()
+        );
+    }
+    Ok((directories.len(), files.len()))
+}
+
+fn normal_components(path: &Path, file: bool) -> Result<Vec<OsString>> {
+    if path.is_absolute() {
+        bail!("scenario paths must be relative: {}", path.display());
+    }
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(value) => components.push(value.to_os_string()),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!(
+                    "scenario path contains a root, prefix, or parent traversal: {}",
+                    path.display()
+                );
+            }
+        }
+    }
+    if file && components.is_empty() {
+        bail!("scenario file path must name a file");
+    }
+    if components.len() > HARD_DEPTH_LIMIT {
+        bail!(
+            "scenario path {} has {} components; the generator caps depth at {HARD_DEPTH_LIMIT}",
+            path.display(),
+            components.len()
+        );
+    }
+    Ok(components)
+}
+
 fn write_pattern(writer: &mut impl Write, size: u64, seed: u64) -> Result<()> {
     let mut remaining = size;
     let mut state = seed | 1;
@@ -184,7 +256,7 @@ fn write_pattern(writer: &mut impl Write, size: u64, seed: u64) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FileSpec, Scenario, generate, heavy_tests_enabled};
+    use super::{FileSpec, Scenario, generate, heavy_tests_enabled, planned_entry_counts};
     use crate::sandbox::SandboxRoot;
     use std::path::{Path, PathBuf};
 
@@ -259,5 +331,54 @@ mod tests {
                 .is_some_and(|text| text.contains("VISION.md")),
             "hard cap refusal must cite the prohibition: {message:?}"
         );
+    }
+
+    #[test]
+    fn implicit_parent_directories_count_toward_routine_limit() {
+        if heavy_tests_enabled() {
+            return;
+        }
+        let files = (0..34)
+            .map(|index| {
+                let mut path = PathBuf::new();
+                path.push(format!("branch-{index}"));
+                for depth in 0..29 {
+                    path.push(format!("level-{depth}"));
+                }
+                path.push("file.bin");
+                FileSpec {
+                    path,
+                    size: 0,
+                    pattern: 0,
+                }
+            })
+            .collect();
+        let scenario = Scenario {
+            directories: Vec::new(),
+            files,
+            write_budget_bytes: 0,
+        };
+        assert!(
+            planned_entry_counts(&scenario)
+                .is_ok_and(|(directories, files)| directories.saturating_add(files) > 1_000)
+        );
+        let message = refusal_message(&scenario);
+        assert!(message.as_deref().is_some_and(|text| {
+            text.contains("implicit parent directories") && text.contains("BIGCP_ALLOW_HEAVY_TESTS")
+        }));
+    }
+
+    #[test]
+    fn conflicting_file_and_directory_paths_fail_preflight() {
+        let scenario = Scenario {
+            directories: vec![PathBuf::from("collision")],
+            files: vec![FileSpec {
+                path: PathBuf::from("collision"),
+                size: 0,
+                pattern: 0,
+            }],
+            write_budget_bytes: 0,
+        };
+        assert!(planned_entry_counts(&scenario).is_err());
     }
 }

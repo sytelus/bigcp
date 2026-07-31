@@ -306,7 +306,10 @@ impl AuditWriter {
             self.file = open_log(&self.fallback_path)?;
             write_atomic_line(&mut self.file, &notice).map_err(|failure| failure.error)?;
         }
-        eprintln!(
+        // A closed stderr pipe must not panic and abort an otherwise viable
+        // failover. The same notice is already durable in the fallback log.
+        let _ = writeln!(
+            io::stderr().lock(),
             "bigcp: JSONL log failed over from {} to {}",
             self.primary_path.display(),
             self.fallback_path.display()

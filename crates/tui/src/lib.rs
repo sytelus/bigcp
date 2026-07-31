@@ -5,7 +5,7 @@
 
 #![deny(missing_docs, unsafe_code)]
 
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::Duration;
@@ -57,7 +57,12 @@ impl RunObserver for PlainObserver {
         if self.quiet {
             return;
         }
-        println!(
+        // Progress is advisory. In particular, a consumer closing a pipe
+        // must not panic (and abort a release build) while the copy engine is
+        // still mutating the destination. The durable log/report remain the
+        // authoritative output channels.
+        let _ = writeln!(
+            io::stdout().lock(),
             "state={:?} discovered={} copied={} replaced={} {} failed={} read={} written={} {}",
             snapshot.state,
             snapshot.counters.files_discovered,
@@ -73,7 +78,7 @@ impl RunObserver for PlainObserver {
 
     fn on_message(&self, message: &str) {
         if !self.quiet {
-            println!("{message}");
+            let _ = writeln!(io::stdout().lock(), "{message}");
         }
     }
 }
@@ -137,8 +142,7 @@ pub fn run_dashboard(options: CopyOptions) -> Result<RunReport, BigcpError> {
 /// Opens the saved-report browser or prints a plain summary when redirected.
 pub fn show_report(report: &RunReport) -> io::Result<()> {
     if !stdout_is_terminal() {
-        print_report_summary(report);
-        return Ok(());
+        return print_report_summary(report);
     }
     let mut session = TerminalSession::enter()?;
     let mut tab = 0_usize;
@@ -164,17 +168,30 @@ pub fn show_report(report: &RunReport) -> io::Result<()> {
 }
 
 /// Prints the durable final summary used by both UI modes.
-pub fn print_report_summary(report: &RunReport) {
-    println!("bigcp {} -> {}", report.run.source, report.run.destination);
+///
+/// Output failures are returned instead of panicking so a closed pipe cannot
+/// abort the process after a copy has completed.
+pub fn print_report_summary(report: &RunReport) -> io::Result<()> {
+    write_report_summary(&mut io::stdout().lock(), report)
+}
+
+fn write_report_summary(output: &mut impl Write, report: &RunReport) -> io::Result<()> {
+    writeln!(
+        output,
+        "bigcp {} -> {}",
+        report.run.source, report.run.destination
+    )?;
     if report.run.dry_run {
-        println!(
+        writeln!(
+            output,
             "dry-run forecast: new={} replacements={} metadata-fixes={} (destination tree unchanged)",
             report.counters.would_copy_new,
             report.counters.would_copy_replaced,
             report.counters.would_meta_fix
-        );
+        )?;
     }
-    println!(
+    writeln!(
+        output,
         "copied={} replaced={} {} meta-fixed={} failed={} extras={}",
         report.counters.copied_new,
         report.counters.copied_replaced,
@@ -182,21 +199,23 @@ pub fn print_report_summary(report: &RunReport) {
         report.counters.meta_fixed,
         report.counters.failed,
         report.counters.extra
-    );
-    println!(
+    )?;
+    writeln!(
+        output,
         "logical-bytes={} duration={:.2}s average={:.1} MB/s observed-peak={:.1} MB/s",
         report.counters.bytes_logical_copied,
         report.run.duration_seconds,
         report.bottleneck.average_mbps,
         report.bottleneck.observed_peak_mbps
-    );
-    println!(
+    )?;
+    writeln!(
+        output,
         "durability={} audit={} integrity={} log={}",
         report.run.durability,
         report.run.audit,
         report.integrity,
         report.run.log_path.display()
-    );
+    )
 }
 
 fn skipped_counts(counters: &bigcp_core::Counters) -> String {

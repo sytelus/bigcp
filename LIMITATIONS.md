@@ -109,6 +109,6 @@ and what to do about it when it matters. Section references point into
 
 ## Reporting and audit
 
-- **A run that can no longer write its log stops.** After reopen and failover attempts fail, bigcp refuses to continue un-audited (drains in-flight work, exits with the audit-failure code) — claims without a log would be unverifiable (§5.15, I7).
+- **A run that can no longer write either log aborts without a normal final report.** After one reopen and state-directory failover both fail, bigcp returns the audit-failure exit code immediately. An operation already executing may finish while worker resources unwind, but no unaudited completion is claimed; a missing `run_end` is the signal, and rerunning safely reclassifies the destination. The older modeled drain-and-report state was deliberately removed as disproportionate complexity (ADR 0027, §5.15, I7).
 - **Audit artifacts may never live inside either tree.** `--state-dir`, `--log`, and `--report` paths under the source or destination root are rejected pre-flight (same volume is fine) — a log inside SRC would mutate the "stable" source and be copied by its own run (§5.12, E46).
 - **Error samples in the report are capped** (first N per category, plus counts); the JSONL log always holds every event (§10.3).

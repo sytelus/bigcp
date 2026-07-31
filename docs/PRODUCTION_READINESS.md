@@ -30,9 +30,9 @@ required by the governing plan.
   on a whitelisted drive; only the system drive and the code-checkout drive
   are permitted, and prefixes, rooted children, traversal, and every other
   drive are rejected before filesystem access.
-- Formatting, warning-free Clippy, unit/integration/doc tests, locked release
-  builds, schema parse/version checks (full emitted-instance validation is
-  release work), dependency policy, and vulnerability audit.
+- Formatting, warning-free Clippy and rustdoc, unit/integration/doc tests,
+  locked release builds, schema parse/version checks (full emitted-instance
+  validation is release work), dependency policy, and vulnerability audit.
 - Run-owned phase instrumentation, so multiple library runs in one process do
   not contaminate one another's analysis.
 - Topology-gated same-spindle scheduling: bounded plain-small read/write phases,

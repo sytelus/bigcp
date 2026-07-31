@@ -2,7 +2,7 @@
 
 #![deny(unsafe_code)]
 
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
@@ -172,7 +172,7 @@ fn main() -> ExitCode {
     match execute(cli) {
         Ok(code) => ExitCode::from(code),
         Err((code, message)) => {
-            eprintln!("bigcp: {message}");
+            let _ = writeln!(std::io::stderr().lock(), "bigcp: {message}");
             ExitCode::from(code)
         }
     }
@@ -190,16 +190,18 @@ fn execute(cli: Cli) -> Result<u8, (u8, String)> {
                 destination,
             })
             .map_err(|error| (5, error.to_string()))?;
-            serde_json::to_writer_pretty(std::io::stdout(), &summary)
+            let mut stdout = std::io::stdout().lock();
+            serde_json::to_writer_pretty(&mut stdout, &summary)
                 .map_err(|error| (6, format!("write verify result: {error}")))?;
-            println!();
+            writeln!(stdout).map_err(|error| (6, format!("write verify result: {error}")))?;
             Ok(if summary.failed == 0 { 0 } else { 2 })
         }
         Some(Command::Report { file, plain }) => {
             reject_copy_only_flags(&cli.flags)?;
             let report = load_report(&file).map_err(|error| (5, error.to_string()))?;
             if plain || !stdout_is_terminal() {
-                print_report_summary(&report);
+                print_report_summary(&report)
+                    .map_err(|error| (6, format!("write report summary: {error}")))?;
             } else {
                 show_report(&report).map_err(|error| (6, format!("report browser: {error}")))?;
             }
@@ -260,7 +262,8 @@ fn execute(cli: Cli) -> Result<u8, (u8, String)> {
                 run_dashboard(options)
             }
             .map_err(|error| (exit_for_error(&error), error.to_string()))?;
-            print_report_summary(&report);
+            print_report_summary(&report)
+                .map_err(|error| (6, format!("write copy summary: {error}")))?;
             Ok(u8::try_from(report.run.exit).unwrap_or(6))
         }
     }
@@ -437,7 +440,8 @@ fn confirm_preflight_warnings(
         let source_name = source_volume
             .as_ref()
             .map_or("source", |volume| volume.filesystem.name());
-        eprintln!(
+        writeln!(
+            std::io::stderr().lock(),
             "warning: copying from {source_name} to {} requires reduced-fidelity semantics.\n  Creation and last-write times use the destination's coarser, range-limited representation;\n  only READONLY, HIDDEN, SYSTEM, and ARCHIVE attributes are representable. Named streams,\n  EAs, sparse layout, EFS state, ACLs, and reparse points cannot be preserved. Reparse\n  objects fail without being followed.{}",
             destination_volume.filesystem.name(),
             if destination_volume.filesystem.maximum_file_size().is_some() {
@@ -445,7 +449,8 @@ fn confirm_preflight_warnings(
             } else {
                 ""
             }
-        );
+        )
+        .map_err(|error| (6, format!("write preflight warning: {error}")))?;
     }
     let source_endpoint = source_volume
         .as_ref()
@@ -454,7 +459,8 @@ fn confirm_preflight_warnings(
     let wsl = source_endpoint == bigcp_win::EndpointKind::Wsl
         || destination_volume.endpoint == bigcp_win::EndpointKind::Wsl;
     if remote {
-        eprintln!(
+        writeln!(
+            std::io::stderr().lock(),
             "warning: this copy uses a remote endpoint (source: {}; destination: {}).\n  Network or WSL disconnects can interrupt open handles, and server-side cache durability and\n  optional metadata support cannot be inferred from local disk IOCTLs. bigcp keeps bounded I/O,\n  atomic-or-rerunnable publication, verification, and no retries, but cannot make the remote\n  server durable.{}",
             source_endpoint.name(),
             destination_volume.endpoint.name(),
@@ -463,12 +469,14 @@ fn confirm_preflight_warnings(
             } else {
                 ""
             }
-        );
+        )
+        .map_err(|error| (6, format!("write preflight warning: {error}")))?;
     }
     let device = bigcp_win::profile_device(&destination_volume);
     let quick_removal = device.write_cache_enabled == Some(false);
     if quick_removal {
-        eprintln!(
+        writeln!(
+            std::io::stderr().lock(),
             "warning: the destination drive has write caching disabled (Windows 'Quick removal' \
          policy).\n  Copies with many small files run several times slower this way (~3.4x \
          measured).\n  To speed it up: Device Manager > the drive > Policies > 'Better \
@@ -476,7 +484,8 @@ fn confirm_preflight_warnings(
          Windows write-cache buffer flushing'\n  UNCHECKED — that setting risks filesystem \
          corruption on power loss, which a re-run cannot\n  repair. With caching on, always \
          use Safely Remove Hardware before unplugging."
-        );
+        )
+        .map_err(|error| (6, format!("write preflight warning: {error}")))?;
     }
 
     let needs_degradation_confirmation =
@@ -499,11 +508,21 @@ fn confirm_preflight_warnings(
         ));
     }
     if options.interactive && (needs_required_confirmation || quick_removal) {
+        let mut stderr = std::io::stderr().lock();
         if needs_required_confirmation {
-            eprint!("Continue with the acknowledged copy limitations? [y/N] ");
+            write!(
+                stderr,
+                "Continue with the acknowledged copy limitations? [y/N] "
+            )
+            .map_err(|error| (6, format!("write preflight prompt: {error}")))?;
         } else {
-            eprint!("Continue with the current drive policy? [Y/n] ");
+            write!(stderr, "Continue with the current drive policy? [Y/n] ")
+                .map_err(|error| (6, format!("write preflight prompt: {error}")))?;
         }
+        stderr
+            .flush()
+            .map_err(|error| (6, format!("flush preflight prompt: {error}")))?;
+        drop(stderr);
         let mut answer = String::new();
         let read = std::io::stdin().read_line(&mut answer);
         let accepted = read.is_ok() && prompt_answer_accepted(&answer, needs_required_confirmation);

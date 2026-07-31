@@ -51,6 +51,8 @@ jobs:
         run: scripts\cargo-msvc.cmd test --workspace --all-targets --locked -- --test-threads=1
       - name: Documentation
         shell: cmd
+        env:
+          RUSTDOCFLAGS: -D warnings
         run: scripts\cargo-msvc.cmd doc --workspace --no-deps --locked
       - name: Release build
         shell: cmd

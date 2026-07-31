@@ -161,7 +161,7 @@ topology policy.
 | 3 | Graceful user cancellation; rerun to continue. Cancel takes effect between chunks, so even a huge in-flight file stops promptly and safely. |
 | 4 | Stopped early by the circuit breaker: repeated device/share disconnect or disk-full failures. Reconnect the endpoint or free space, then rerun to resume. |
 | 5 | Preflight, configuration, root-lock, or fatal I/O failure. |
-| 6 | Audit, format, or internal invariant failure. |
+| 6 | Audit, output/format, or internal invariant failure. |
 
 ## Fidelity and limits
 
