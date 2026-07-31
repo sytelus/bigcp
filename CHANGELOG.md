@@ -29,7 +29,9 @@ versioning once its 1.0 release gates are complete.
   destination probe — the same-handle check subsumes it, and a vanished
   replacement target is still classified as a destination change; the MSVC
   launcher discovers Visual Studio via `vswhere.exe` with SKU-path fallbacks,
-  fixing CI images that carry Enterprise instead of Build Tools.
+  fixing CI images that carry Enterprise instead of Build Tools; the CI test
+  root is nested three levels deep so it satisfies the testkit's minimum
+  sandbox-depth rule.
 - Hardened checkpoint resume with source/temp filesystem identities,
   non-following temp opens, fail-closed journal version handling, and
   handle-bound cleanup that cannot delete a path replacement.
