@@ -48,6 +48,13 @@ cell including the competitor's; the write path is what these numbers bound.
    whether that cell justifies unbuffered I/O's return is an owner decision —
    the primary USB-C external scenario is device-bound at a fraction of
    either figure, and the comparison tool does no hashing or temp+rename.
+   **(Dispositioned 2026-08-02:** the shortfall was half-duplex
+   request-at-a-time alternation plus a VMD-hidden NVMe misclassification and
+   an adapter-MTL chunk clamp — not buffering. All three were fixed within
+   buffered I/O (ADR 0055), after which bigcp measured ahead of robocopy `/J`
+   on clean interleaved distinct-NVMe pairs; see the "2026-08-02
+   distinct-drive NTFS large-stream overlap" entry. Unbuffered I/O stays
+   closed.)
 3. The anti-fragmentation stance is proven on this run: preallocated 8 GiB
    copies landed as exactly one extent each.
 
@@ -539,6 +546,94 @@ extending segmentation to UNC on loopback evidence would be exactly the
 unfounded claim the H6 gate exists to prevent. H6 remains open pending an
 approved network-class scratch share.
 
+## 2026-08-02 distinct-drive NTFS large-stream overlap (indicative)
+
+**Environment:** same machine and day as the WSL and generic-UNC entries
+(Windows 11 Pro 26200, 64 GB RAM, release build). The pair is the project's
+own drives: C: KIOXIA EG6 1 TB NVMe (system, NTFS) and D: 4 TB NVMe
+(SSDM2E12V4TB, NTFS), **both attached behind Intel VMD** — the topology
+behind the classification finding below. Large-stream cells ran D→C on
+fresh GUID-named scratch directories; the small-file cell ran C→D. Defender
+and commit state were not separately recorded this session, which is one
+more reason every number below is indicative, not certified.
+
+**Methodology caveat — destination SLC-cache state dominates sustained-write
+benchmarks on consumer NVMe.** During this session the 4 TB QLC destination
+collapsed to 170–260 MB/s after ~90 GB of accumulated copies, and both tools
+degrade identically once a cache is exhausted. First-touch/cold runs and
+cache state swing results 2–4×, and one tool's writes degrade the *next*
+run's cache state: robocopy's earlier "502 MB/s large" reading in this
+session was unfairly degraded by bigcp's own prior writes filling the cache.
+Interleaved A/B pairs with per-run deletion + retrim are therefore mandatory
+methodology (the cached-HDD ordering lesson from 2026-07-29, §12.10, applies
+doubly here). Every honest number below comes from clean interleaved pairs
+under that protocol, as medians/ranges of small clean sets; the certified
+≥5-run protocol with recorded Defender/commit state remains pending.
+
+### Baseline (pre-change, D→C 8 GiB clean interleaved pairs)
+
+| Cell | bigcp (defaults) | robocopy `/J` | Standing |
+|---|---|---|---|
+| D→C 8 GiB large stream | 1,788–2,038 MB/s | 2,264–2,802 MB/s | ~25% behind |
+
+### The three mechanism findings
+
+1. **Half-duplex alternation has a structural ceiling.** The standard
+   transport read a chunk, then wrote it, on one thread; with read bandwidth
+   R and write bandwidth W that alternation caps at `1/(1/R + 1/W)` — about
+   half of either device when R ≈ W — while overlapping one read with one
+   write targets `min(R, W)`. The baseline row above is that ceiling made
+   visible; robocopy overlaps and pulled ahead by roughly the predicted
+   margin.
+2. **The adapter MaximumTransferLength was silently clamping the chunk.**
+   The VMD adapter reports a 2 MiB MTL, which composition clamped requests
+   to. The MTL bounds one storport request — the I/O manager splits buffered
+   application transfers into adapter-sized requests itself — so the clamp
+   only added syscalls and handoffs: 2 MiB requests ran ~1.9–2.0 GB/s where
+   16 MiB requests ran ~2.7–2.8 GB/s through the pipeline.
+3. **VMD hides NVMe from adapter-level classification.** Behind Intel
+   VMD/RST the adapter descriptor answers an unspecific bus (RAID), so this
+   Gen4 pair composed the SATA-SSD row. The per-device
+   `STORAGE_DEVICE_DESCRIPTOR.BusType` on the same hardware still answers
+   NVMe; consulting it when the adapter is unspecific yields nvme/nvme,
+   verified in run reports.
+
+### What shipped (ADR 0055)
+
+1. Standard-transport unnamed large streams (at or above the large
+   threshold) move through the same bounded two-buffer read/write-overlap
+   pipeline the redirectors and WSL use; sparse ranges and named streams
+   deliberately keep request-at-a-time, and the checkpoint ordering
+   invariant is unchanged. `REDIRECTOR_PIPELINE_BUFFERS` became
+   `PIPELINE_BUFFERS`, and a `mem` budget now reserves two coordinator
+   chunks on every non-same-spindle transport.
+2. Device-bus classification consults the per-device descriptor when the
+   adapter answer is unspecific (`classify_bus`/`query_device_bus`).
+3. The adapter MTL no longer clamps the composed chunk; it stays a reported
+   fact in the device record.
+4. The NVMe profile row moved 8 → 16 MiB — measured through the pipeline,
+   16 MiB beat 8 MiB by ~12–40% across clean interleaved pairs.
+
+### Post-change (D→C 2 GiB clean interleaved pairs, defaults now composing nvme/nvme, 16 MiB, pipelined)
+
+| Cell | bigcp (defaults) | robocopy | Standing |
+|---|---|---|---|
+| D→C 2 GiB large stream | **2,656–2,808 MB/s** | `/J` 1,773–2,758 MB/s (same pairs) | ahead in both final pairings |
+| C→D 10,000 × 4 KiB | 5,771–8,494 files/s across the session (**8,494** final post-change run) | `/MT:32` 3,852 files/s | ≥1.5–2.2× ahead throughout |
+
+Copies were content hash-verified and standalone `bigcp verify` was green.
+The small-file path itself was **not** changed by this work: that row's
+improvement comes from the corrected nvme classification raising the worker
+row, so ADR 0048's relative-create speedup (H8) remains unmeasured and its
+register entry stands. No new extent capture was taken this session; the
+pipeline writes the same preallocated temp strictly in order, so the
+single-extent evidence recorded for preallocated large temps on 2026-07-29
+carries.
+
+The certified protocol remains pending for this cell as for every other:
+median-of-≥5 quiesced, rotated runs with recorded Defender and commit state,
+per the closing protocol note below.
+
 ## Outstanding
 
 **H6 — redirector overlap (registered 2026-07-31; network-class unmeasured,
@@ -570,6 +665,29 @@ WSL files. Post-change medians: small files ahead of robocopy's best swept
 The numbers are medians of 3 warm runs, below the certified ≥5-repetition
 protocol — indicative, not certified.
 
+**H9 — single authoritative stamp for restamp destinations (registered
+2026-08-02, unmeasured on FAT media):** ADR 0054 drops the create-time stamp
+on every destination whose drivers rewrite time/archive fields during data
+writes (FAT-family, generic UNC, mapped remote; WSL already deferred). The
+plain-small destination sequence shrinks from five syscalls to four — on
+write-through "Quick removal" flash that is one of the ~3 physical metadata
+writes per file (ADR 0031 measured that operation class at ~2 ms), on a
+redirector one network round trip per file. Correctness is pinned by
+`post_write_stamp_destinations_defer_the_create_time_stamp` plus the existing
+deferred-stamp and NTFS create-time-stamp tests, and a live loopback SMB run
+(2026-08-02) verified 2,021/2,021 objects with tick-exact final timestamps.
+No FAT/exFAT medium was attached when this landed, so the wall-clock effect
+is a hypothesis. The first measurement must use the elevated FAT32 + exFAT
+VHDX matrix cells (docs/TESTING.md) or a physical stick under both
+write-cache policies: the 2,000×4 KiB tree, medians of ≥3 warm runs, bigcp
+pre/post-ADR-0054 builds and robocopy `/MT` swept, with the drive's
+write-cache policy, filesystem, and cluster size recorded. The same run
+should settle the open Unknown-profile question (a stick whose USB bridge
+rejects both classification IOCTLs falls to the conservative 4-worker row;
+ADR 0031's data suggests 16–32 workers would roughly halve metadata-bound
+flood time — decide with data, not by loosening the conservative fallback
+blindly).
+
 **H8 — local NTFS relative final-name creates (registered 2026-07-31,
 unmeasured):** ADR 0048 caches one verified destination-parent handle per
 directory-affine worker/directory and opens plain-small final names with
@@ -599,9 +717,12 @@ default, not a measured speedup claim (its loopback-indicative 2026-08-02
 baseline does not change that); the WSL 8 MiB/32-worker row is
 measured (2026-08-02, warm medians of 3 — indicative, not certified); any
 SMB/network benchmark additionally requires an approved scratch share path.
-ADR 0045's two-buffer and parallel-stream mechanics and ADR 0048's local
+ADR 0045's parallel-stream mechanics and ADR 0048's local
 relative-create path are likewise benchmark-pending rather than measured
-speedup claims; ADR 0046/0052's WSL scheduling, round-trip, and segmented
+speedup claims — the two-buffer pipeline itself now has a measured local
+distinct-NVMe win (the "2026-08-02 distinct-drive NTFS large-stream overlap"
+entry; ADR 0055), though that says nothing about network-class SMB, which
+stays under H6; ADR 0046/0052's WSL scheduling, round-trip, and segmented
 mechanisms are covered by the 2026-08-02 entry. Endurance,
 million-entry, and competitor sweeps stay prohibited (VISION).
 

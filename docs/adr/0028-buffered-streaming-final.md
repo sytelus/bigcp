@@ -1,6 +1,12 @@
 # ADR 0028: Buffered streaming is the final engine
 
-**Status:** Accepted
+**Status:** Amended by ADR 0055 (standard-transport unnamed large streams now
+overlap one buffered read with one buffered write through the shared
+two-buffer pipeline — measurement showed the cache manager alone does not
+supply that overlap at distinct-NVMe rates; this ADR's core decision stands:
+I/O remains buffered, no unbuffered path or sector-alignment machinery
+returns, and the 2026-07-29 reopening finding is dispositioned within
+buffered I/O)
 
 ## Context
 

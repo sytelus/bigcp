@@ -36,6 +36,41 @@ versioning once its 1.0 release gates are complete.
 
 ### Changed
 
+- 2026-08-02 distinct-drive NTFS large-stream overlap (ADR 0055): local
+  standard-transport unnamed large streams now move through the same bounded
+  two-buffer read/write-overlap pipeline the redirectors and WSL use, ending
+  half-duplex request-at-a-time alternation whose throughput ceiling is
+  `1/(1/read + 1/write)`; sparse ranges and named streams keep the
+  request-at-a-time loop and checkpoint ordering is unchanged
+  (`REDIRECTOR_PIPELINE_BUFFERS` is renamed `PIPELINE_BUFFERS`, and a `mem`
+  budget now reserves two coordinator chunks on every non-same-spindle
+  transport). Device-bus classification consults the per-device descriptor
+  when the adapter answer is unspecific, so NVMe pairs hidden behind Intel
+  VMD/RST no longer demote to the SATA-SSD row; the adapter
+  MaximumTransferLength no longer clamps the composed chunk (it bounds one
+  storport request that the I/O manager already honors — the VMD adapter's
+  2 MiB MTL had been silently forcing 2 MiB requests); and the NVMe profile
+  row moves 8 → 16 MiB (measured ~12–40% faster through the pipeline).
+  Measured on clean interleaved distinct-NVMe pairs with per-run
+  deletion + retrim (BENCHMARKS.md 2026-08-02, indicative — destination
+  SLC-cache state otherwise dominates): 8 GiB baseline 1,788–2,038 MB/s vs
+  robocopy `/J` 2,264–2,802 became 2 GiB post-change 2,656–2,808 vs
+  1,773–2,758 in the same pairs — ahead in both final pairings,
+  hash-verified with standalone verification green — and 10,000 × 4 KiB
+  small files ran 5,771–8,494 files/s vs `/MT:32` 3,852 (the small-file path
+  is unchanged; that gain is the corrected nvme classification).
+- 2026-08-02 single authoritative stamp for restamp destinations (ADR 0054):
+  FAT/exFAT, generic-UNC, and mapped-remote destinations no longer receive
+  the create-time timestamp stamp that their mandatory finish-time restamp
+  superseded byte-for-byte (WSL already deferred). Plain-small destination
+  syscalls drop from five to four — one fewer physical dirent write per file
+  on write-through "Quick removal" flash, one fewer network round trip per
+  file on redirectors — and an interrupted unstamped file now carries a
+  second Replace signal (driver-current mtime) besides short size. Strict
+  local NTFS/ReFS behavior is byte-identical (ADR 0031 unchanged). Live
+  loopback SMB validation: 2,021/2,021 standalone-verified with tick-exact
+  final timestamps; the FAT flash wall-clock effect is registered as
+  hypothesis H9 pending the elevated VHDX matrix cells or a physical stick.
 - 2026-08-02 latency-gated remote-source striping (ADR 0053): the remote
   volume probe now times the three handle-bound queries it already issues
   and publishes the minimum as a round-trip floor (zero extra I/O). A

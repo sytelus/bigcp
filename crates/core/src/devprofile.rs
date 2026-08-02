@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::BigcpError;
 use crate::options::{DeviceClass, TuneOptions};
-use crate::transport::{REDIRECTOR_PIPELINE_BUFFERS, TransportProfile};
+use crate::transport::{PIPELINE_BUFFERS, TransportProfile};
 
 const DEFAULT_SAME_SPINDLE_BURST_BYTES: usize = 256 * 1024 * 1024;
 const MIN_SAME_SPINDLE_BURST_BYTES: usize = 1024 * 1024;
@@ -95,36 +95,32 @@ pub fn select_copy_profile(
     let wsl =
         source_info.endpoint == EndpointKind::Wsl || destination_info.endpoint == EndpointKind::Wsl;
     let redirector = source_info.endpoint.is_remote() || destination_info.endpoint.is_remote();
+    // The adapter's MaximumTransferLength deliberately does NOT clamp the
+    // chunk: it bounds a single storport request, and the I/O manager splits
+    // buffered application transfers into adapter-sized requests
+    // transparently. Clamping to it halved distinct-NVMe throughput on this
+    // project's own benchmark host (2026-08-02, BENCHMARKS.md): the VMD
+    // adapter reports a 2 MiB MTL, and 2 MiB pipeline requests ran
+    // ~1.9-2.0 GB/s where 16 MiB requests ran ~2.7-2.8 GB/s. The value stays
+    // in DeviceInfo as a reported fact only.
     let mut chunk_bytes = tune
         .chunk_bytes
         .unwrap_or_else(|| source.chunk_bytes.min(destination.chunk_bytes));
-    for maximum in [
-        source_info.maximum_transfer_length,
-        destination_info.maximum_transfer_length,
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if maximum > 0 {
-            chunk_bytes = chunk_bytes.min(maximum as usize);
-        }
-    }
     if let Some(memory_bytes) = tune.memory_bytes {
         let chunk_budget = if same_spindle {
             memory_bytes
         } else {
-            let coordinator_chunks = if redirector {
-                REDIRECTOR_PIPELINE_BUFFERS
-            } else {
-                1
-            };
+            // Every transport's coordinator-owned large stream moves through
+            // the bounded two-buffer overlap pipeline (ADR 0055 extended it
+            // from redirectors to the standard transport), so the coordinator
+            // always reserves PIPELINE_BUFFERS chunks.
             memory_bytes
                 .checked_sub(large_threshold)
-                .map(|available| available / coordinator_chunks)
+                .map(|available| available / PIPELINE_BUFFERS)
                 .filter(|available| *available >= MIN_CHUNK_BYTES)
                 .ok_or_else(|| {
                     BigcpError::Invalid(format!(
-                        "memory budget {memory_bytes} must hold one worker buffer ({large_threshold}) and {coordinator_chunks} minimum coordinator chunk(s) ({MIN_CHUNK_BYTES} bytes each)"
+                        "memory budget {memory_bytes} must hold one worker buffer ({large_threshold}) and {PIPELINE_BUFFERS} minimum coordinator chunks ({MIN_CHUNK_BYTES} bytes each)"
                     ))
                 })?
         };
@@ -148,25 +144,22 @@ pub fn select_copy_profile(
         destination.workers
     };
     if !same_spindle && let Some(memory_bytes) = tune.memory_bytes {
-        // Standard transport can run one coordinator-owned chunk transfer
-        // while small workers each hold one threshold-bounded file. Reserve
-        // that chunk before deriving the worker cap so `mem=` is an actual
-        // aggregate copy-buffer bound, not merely a per-allocation bound.
-        let coordinator_chunks = if redirector {
-            REDIRECTOR_PIPELINE_BUFFERS
-        } else {
-            1
-        };
-        let coordinator_bytes = chunk_bytes.saturating_mul(coordinator_chunks);
+        // The coordinator runs one pipelined large transfer (two chunks in
+        // flight — ADR 0055) while small workers each hold one
+        // threshold-bounded file; redirector workers may additionally stream
+        // pipelined files themselves. Reserve the coordinator's chunks before
+        // deriving the worker cap so `mem=` is an actual aggregate
+        // copy-buffer bound, not merely a per-allocation bound.
+        let coordinator_bytes = chunk_bytes.saturating_mul(PIPELINE_BUFFERS);
         let per_worker_bytes = if redirector {
-            large_threshold.max(chunk_bytes.saturating_mul(coordinator_chunks))
+            large_threshold.max(chunk_bytes.saturating_mul(PIPELINE_BUFFERS))
         } else {
             large_threshold
         };
         let worker_bytes = memory_bytes.saturating_sub(coordinator_bytes);
         if worker_bytes < per_worker_bytes {
             return Err(BigcpError::Invalid(format!(
-                "memory budget {memory_bytes} must hold {coordinator_chunks} coordinator chunk(s) ({chunk_bytes} bytes each) and one worker buffer ({per_worker_bytes})"
+                "memory budget {memory_bytes} must hold {PIPELINE_BUFFERS} coordinator chunks ({chunk_bytes} bytes each) and one worker buffer ({per_worker_bytes})"
             )));
         }
         let budgeted_workers = (worker_bytes / per_worker_bytes).clamp(1, 256);
@@ -285,7 +278,11 @@ fn side_profile(
         (true, EndpointKind::Wsl) => (WSL_CHUNK_BYTES, WSL_WORKERS),
         (true, EndpointKind::Unc) => (UNC_CHUNK_BYTES, UNC_WORKERS),
         (_, _) => match class {
-            DeviceClass::Nvme => (8 * 1024 * 1024, (4 * cores).min(64)),
+            // 16 MiB measured 2026-08-02 (BENCHMARKS.md) on a distinct-NVMe
+            // pair through the overlap pipeline: 16 MiB requests beat 8 MiB
+            // by ~12-40% across clean interleaved pairs (fewer pipeline
+            // handoffs and syscalls per stream).
+            DeviceClass::Nvme => (16 * 1024 * 1024, (4 * cores).min(64)),
             DeviceClass::SataSsd => (8 * 1024 * 1024, 32),
             DeviceClass::UsbSsd => (4 * 1024 * 1024, 16),
             // Seek-penalty media get large sequential chunks. Small-file workers
@@ -375,7 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn composition_is_deterministic_and_mtl_clamped() {
+    fn composition_is_deterministic_and_ignores_the_adapter_mtl() {
         let first = select_copy_profile(
             &nvme(),
             &nvme(),
@@ -392,8 +389,17 @@ mod tests {
         );
         assert!(first.is_ok());
         assert_eq!(
-            first.ok().map(|profile| profile.chunk_bytes),
+            first.as_ref().ok().map(|profile| profile.chunk_bytes),
             second.ok().map(|profile| profile.chunk_bytes)
+        );
+        // The nvme() fixture advertises a 4 MiB MaximumTransferLength; the
+        // composed chunk must stay at the measured 16 MiB row value because
+        // the I/O manager splits buffered transfers into adapter-sized
+        // requests itself — clamping to a VMD's small MTL halved measured
+        // distinct-NVMe throughput (BENCHMARKS.md 2026-08-02).
+        assert_eq!(
+            first.ok().map(|profile| profile.chunk_bytes),
+            Some(16 * 1024 * 1024)
         );
     }
 
@@ -457,7 +463,11 @@ mod tests {
     }
 
     #[test]
-    fn standard_memory_budget_reserves_the_concurrent_coordinator_chunk() {
+    fn standard_memory_budget_reserves_the_pipelined_coordinator_chunks() {
+        // ADR 0055: the standard transport's coordinator-owned large streams
+        // move through the two-buffer overlap pipeline, so a `mem` budget
+        // reserves PIPELINE_BUFFERS coordinator chunks: an 8 MiB budget with
+        // a 4 MiB worker buffer leaves (8-4)/2 = 2 MiB per chunk.
         let mut unlimited = nvme();
         unlimited.maximum_transfer_length = None;
         let bounded = TuneOptions {
@@ -475,7 +485,7 @@ mod tests {
         );
         assert!(
             profile
-                .is_ok_and(|value| { value.chunk_bytes == 4 * 1024 * 1024 && value.workers == 1 })
+                .is_ok_and(|value| { value.chunk_bytes == 2 * 1024 * 1024 && value.workers == 1 })
         );
 
         let too_small = TuneOptions {

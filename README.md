@@ -22,12 +22,14 @@ When source and destination volumes share one rotational physical disk, bigcp
 automatically selects a separate same-spindle transport: small files are read
 in bounded batches before their write phase, while large/sparse/ADS streams
 stage large sequential bursts before switching direction. Same-device SSDs and
-independent drives keep the normal parallel/request-at-a-time path. The choice
+independent drives keep the standard parallel transport. The choice
 is recorded in the log/report and changes scheduling only—not copy semantics.
 
 The repository is currently **pre-1.0**. The ordinary-tree engine, safety
-contract, and measured performance work are implemented (bigcp leads robocopy
-on every measured small-file cell with default settings; see `BENCHMARKS.md`).
+contract, and measured performance work are implemented (with default settings
+bigcp leads robocopy on every measured small-file cell, and — since the
+2026-08-02 overlap work — on the measured distinct-NVMe large-stream pair as
+well; `BENCHMARKS.md` records those numbers as indicative, not certified).
 The remaining 1.0 gates — among them a bounded fallback for exceptionally
 large single directories and the final production-validation pass in PLAN
 §12.10 — are tracked authoritatively in
@@ -150,8 +152,9 @@ Accepted profile classes are `auto`, `nvme`, `sata-ssd`, `usb-ssd`, `hdd`, and
 no stream-count or queue-depth keys: large files stream through one strictly
 ordered path, so those settings would not describe real work. Redirector
 transfers use a fixed two-buffer pipeline and may run independent files below
-the checkpoint threshold on the bounded worker pool; local standard transfers
-retain the original request-at-a-time loop. WSL has a distinct transport/profile
+the checkpoint threshold on the bounded worker pool; local standard large
+streams move through that same two-buffer pipeline, while their sparse ranges
+and named streams keep the request-at-a-time loop. WSL has a distinct transport/profile
 identity even though it reuses the ordered pipeline: Auto uses 8 MiB requests
 and up to 32 workers, and small-file work is striped across those workers
 whenever either side is WSL instead of inheriting NTFS directory affinity.
@@ -161,10 +164,10 @@ Plan 9 handle caps well below what the boundary can carry in aggregate
 (measured in BENCHMARKS.md; ADR 0052).
 Manual bounds are enforced in the core library — workers `1..=256`, chunks
 `64 KiB..=64 MiB`, thresholds positive — while the CLI itself validates only
-syntax and positivity. On the standard path, a `mem` budget reserves one coordinator
-chunk and must also hold at least one large-threshold worker buffer. The
-redirector path reserves two coordinator chunks and
-`max(large-threshold, 2 × chunk)` for each worker. Remaining bytes cap the
+syntax and positivity. On the standard path, a `mem` budget reserves the two
+pipelined coordinator chunks and must also hold at least one large-threshold
+worker buffer. The redirector path reserves the same two coordinator chunks
+plus `max(large-threshold, 2 × chunk)` for each worker. Remaining bytes cap the
 worker count. The same-spindle path serializes coordinator and worker I/O, so
 its 256 MiB burst is instead capped directly by `mem`; a
 1 MiB–1 GiB override must be at least the larger of the effective chunk and

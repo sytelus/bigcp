@@ -737,9 +737,10 @@ impl DestinationFinal {
         }
         // CREATE_NEW itself proves a new handle is a regular file, so a
         // metadata query is necessary only when revalidating a replacement.
-        // WSL callers also defer their projected last-write stamp until after
-        // data: the Plan 9 provider may update it during writes, and the final
-        // stamp is both authoritative and one round trip cheaper.
+        // Destinations that mandate a post-write restamp (FAT-family drivers
+        // and remote providers update time/archive fields while data is
+        // written) pass no initial stamp: their final stamp is authoritative
+        // and one device-visible metadata write cheaper per file.
         if let Some(stamp) = initial_stamp {
             set_basic_by_handle(&file, stamp)?;
         }

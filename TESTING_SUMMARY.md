@@ -2,6 +2,65 @@
 
 Latest review: 2026-08-02
 
+## 2026-08-02 distinct-drive NTFS large-stream overlap and device-bus classification
+
+ADR 0055's changes — the two-buffer overlap pipeline for standard-transport
+unnamed large streams, the `PIPELINE_BUFFERS` rename with two-coordinator-chunk
+`mem` accounting on every non-same-spindle transport, the device-descriptor
+bus fallback, the removed adapter-MTL chunk clamp, and the 16 MiB NVMe row —
+landed with confined coverage. The updated devprofile pins
+`composition_is_deterministic_and_ignores_the_adapter_mtl` (composition stays
+deterministic and the composed chunk holds the measured 16 MiB row against a
+fixture advertising a 4 MiB MTL) and
+`standard_memory_budget_reserves_the_pipelined_coordinator_chunks` (an 8 MiB
+budget with a 4 MiB worker buffer leaves (8−4)/2 = 2 MiB per coordinator
+chunk and one worker). The new bigcp-win unit test
+`bus_classification_prefers_any_specific_answer_over_unspecific_ones` pins
+the whole fallback table, including the VMD case (unspecific adapter,
+specific device descriptor), the two-unspecific `Other` case, and the
+conservative no-answer path. All 221 confined workspace tests passed with
+zero failures; formatting, warning-denied Clippy, and the frozen-input and
+test-storage safety scripts passed.
+
+Benchmarking ran manually, outside CI, entirely on the whitelisted C: and D:
+drives in fresh GUID-named scratch directories, with every fixture and
+destination deleted after its run. Methodology note recorded with the
+evidence: destination SLC-cache state swings consumer-NVMe results 2–4× (the
+4 TB QLC destination collapsed to 170–260 MB/s after ~90 GB of accumulated
+copies), and one tool's writes degrade the next run's cache state, so every
+published pair was interleaved A/B with per-run deletion + retrim —
+back-to-back single-tool sequences on these drives are not a valid
+instrument. The numbers in `BENCHMARKS.md` ("2026-08-02 distinct-drive NTFS
+large-stream overlap (indicative)") are medians/ranges of small clean
+interleaved sets — indicative, not the certified ≥5-repetition quiesced
+protocol, which remains pending with recorded Defender/commit state. No
+stress, endurance, or large-scale test ran.
+
+## 2026-08-02 single authoritative stamp for restamp destinations (FAT/exFAT/UNC)
+
+ADR 0054 removed the create-time stamp on destinations whose mandatory
+finish-time restamp superseded it byte-for-byte (FAT-family, generic UNC,
+mapped remote; WSL already deferred). The new core unit test
+`post_write_stamp_destinations_defer_the_create_time_stamp` pins the
+predicate for both classes; the existing bigcp-win
+`deferred_stamp_is_applied_after_sequential_writes` and
+`create_time_stamp_survives_writes_in_sandbox` continue to pin the deferred
+mechanics and the untouched strict-NTFS contract respectively. All 220
+confined workspace tests passed with zero failures; formatting,
+warning-denied Clippy, and the frozen-input and test-storage safety scripts
+passed.
+
+Live validation ran manually through the loopback `\\localhost\C$` share
+(writes confined to the session's disposable scratch sandbox): the
+2,000-file tree copied clean, standalone verification passed 2,021/2,021,
+and a spot check confirmed the destination last-write time tick-equal to the
+source with only the finish-time stamp applied. No FAT or exFAT medium was
+attached this session and non-elevated VHD creation is not possible, so the
+flash wall-clock effect is registered as hypothesis H9 in `BENCHMARKS.md`
+with its measurement protocol (elevated FAT32/exFAT VHDX cells or a physical
+stick under both write-cache policies). No FAT media, stress, endurance, or
+large-scale test ran.
+
 ## 2026-08-02 latency-gated remote-source striping (generic UNC)
 
 ADR 0053's latency gate — `VolumeInfo::remote_query_latency` sampled at zero

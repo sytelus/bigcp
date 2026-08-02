@@ -80,7 +80,12 @@ lifespan-reducing writes, no machine-stability impact — see PLAN §12.0):
   (minutes-scale) real-process chaos passes.
 - **Bounded** workloads (W1s/W2s-class) and topology-matched performance runs
   on scratch-designated storage;
-  million-entry behavior via synthetic enumeration simulation, never real trees.
+  million-entry behavior via synthetic enumeration simulation, never real
+  trees. The distinct-drive local NTFS large-stream cell now carries
+  indicative interleaved evidence (BENCHMARKS.md "2026-08-02 distinct-drive
+  NTFS large-stream overlap"; ADR 0055) that informs but does not close this
+  gate — the certified median-of-≥5 quiesced protocol with recorded
+  Defender/commit state remains pending for every cell.
 - The same-spindle HDD `[HW]` cell remains required before claiming a measured
   speedup or universal optimality for the new 256 MiB default.
 - An approved disposable SMB/UNC endpoint remains required before claiming a

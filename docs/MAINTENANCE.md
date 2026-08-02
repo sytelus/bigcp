@@ -27,7 +27,7 @@
 | I6 | Counters reconcile. | `Counters::reconcile` at run end and unit tests. |
 | I7 | Every per-object failure is auditable. | Typed `OperationError`, coordinator-only outcome/audit ownership, and preflight rejection of colliding log/report/state/journal roles. |
 | I8 | Journal never creates a skip. | Journal API exposes checkpoints only; one-record-lookahead replay, every-byte torn-tail/interior-record tests, and exact-handle atomic compaction preserving only the job plus live hints. |
-| I9 | Memory/work queues are bounded. | `crossbeam_channel::bounded`; standard transport reserves one coordinator chunk, redirector transport reserves two chunks per active stream, and same-spindle coordinator/worker activity is serialized under one burst cap. |
+| I9 | Memory/work queues are bounded. | `crossbeam_channel::bounded`; every non-same-spindle transport reserves the two pipelined coordinator chunks (ADR 0055), redirector workers additionally reserve two chunks per active stream, and same-spindle coordinator/worker activity is serialized under one burst cap. |
 | I10 | No source-tree writes. | All write constructors accept destination/audit paths; preflight audit containment. |
 | I11 | Destination mutations revalidate targets. | Identity/kind/size/mtime/attributes/reparse-tag snapshot before repair/replacement; directory stream, EA, and metadata updates recheck identity on their write handle; direct READONLY clear/retry restores through that identity and reports rollback failure (ADR 0044). |
 | I12 | One writer per exact destination. | Global mutex with exact-root hash. |
@@ -125,10 +125,13 @@ replacements, warnings, grouped failures, extras, hints, and verification.
   plain-small and transactional auxiliary/sparse/large strategies share result
   and accounting contracts but have distinct completion protocols.
 - **Watermark:** contiguous temp prefix eligible for a checkpoint.
-- **QD:** queue depth — in-flight I/O count per device side; the shipped
-  large-file loop issues one synchronous request at a time. Small-file
-  parallelism comes from the worker pool.
-- **MTL:** adapter-reported maximum transfer length used to clamp chunks.
+- **QD:** queue depth — in-flight I/O count per device side; each pipeline
+  stage issues one synchronous request at a time, with large streams
+  overlapping one read with one write through two bounded buffers
+  (ADR 0055). Small-file parallelism comes from the worker pool.
+- **MTL:** adapter-reported maximum transfer length; a recorded fact only —
+  it bounds one storport request and no longer clamps the composed chunk
+  (ADR 0055).
 - **VDL:** valid data length; bigcp never uses `SetFileValidData`.
 - **UASP/BOT:** USB storage transports; BOT-like uncertainty selects a
   conservative profile.
@@ -181,8 +184,12 @@ replacements, warnings, grouped failures, extras, hints, and verification.
   0028). No completion ring exists: the standard transport is a sequential
   buffered chunk loop, ADR 0036 adds bounded synchronous same-spindle phases,
   ADR 0045 adds a fixed two-buffer redirector pipeline, ADR 0046 gives WSL
-  its own profile and scheduling seam over that pipeline, and ADR 0052 adds
-  WSL's measured segmented parallel large-file transfers (PLAN §5.8–§5.9).
+  its own profile and scheduling seam over that pipeline, ADR 0052 adds
+  WSL's measured segmented parallel large-file transfers, and ADR 0055
+  routes standard-transport unnamed large streams through the same
+  two-buffer pipeline (`PIPELINE_BUFFERS`, formerly
+  `REDIRECTOR_PIPELINE_BUFFERS`) while sparse ranges and named streams keep
+  the request-at-a-time loop (PLAN §5.8–§5.9).
 
 ## Release checklist
 

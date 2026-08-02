@@ -21,9 +21,10 @@ use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::{
     DEVICE_SEEK_PENALTY_DESCRIPTOR, DISK_EXTENT, IOCTL_STORAGE_QUERY_PROPERTY,
     PropertyStandardQuery, STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR, STORAGE_ADAPTER_DESCRIPTOR,
-    STORAGE_PROPERTY_QUERY, STORAGE_WRITE_CACHE_PROPERTY, StorageAccessAlignmentProperty,
-    StorageAdapterProperty, StorageDeviceSeekPenaltyProperty, StorageDeviceWriteCacheProperty,
-    VOLUME_DISK_EXTENTS, WriteCacheDisabled, WriteCacheEnabled,
+    STORAGE_DEVICE_DESCRIPTOR, STORAGE_PROPERTY_QUERY, STORAGE_WRITE_CACHE_PROPERTY,
+    StorageAccessAlignmentProperty, StorageAdapterProperty, StorageDeviceProperty,
+    StorageDeviceSeekPenaltyProperty, StorageDeviceWriteCacheProperty, VOLUME_DISK_EXTENTS,
+    WriteCacheDisabled, WriteCacheEnabled,
 };
 
 use crate::EndpointKind;
@@ -109,14 +110,10 @@ pub fn profile_device(volume: &VolumeInfo) -> DeviceInfo {
         &handle,
         StorageAccessAlignmentProperty,
     );
-    let bus = adapter
-        .as_ref()
-        .map(|value| match i32::from(value.BusType) {
-            value if value == BusTypeNvme => DeviceBus::Nvme,
-            value if value == BusTypeSata => DeviceBus::Sata,
-            value if value == BusTypeUsb => DeviceBus::Usb,
-            _ => DeviceBus::Other,
-        });
+    let bus = classify_bus(
+        adapter.as_ref().map(|value| i32::from(value.BusType)),
+        query_device_bus(&handle),
+    );
     let maximum_transfer_length = adapter.map(|value| value.MaximumTransferLength);
     let logical_sector = alignment
         .as_ref()
@@ -200,6 +197,70 @@ fn device_path_for_root(root: &Path) -> io::Result<OsString> {
         body[0],
         body[1],
     ]))
+}
+
+/// Combines the adapter-level and device-level bus answers.
+///
+/// NVMe drives behind Intel VMD/RAID controllers report an unspecific bus at
+/// the ADAPTER level while the per-device descriptor still answers
+/// `BusTypeNvme` — on such hardware the adapter-only classification silently
+/// selected the moderate SATA-SSD row for a Gen4 NVMe pair (observed
+/// 2026-08-02 on this project's own benchmark host). A specific answer from
+/// either source wins, preferring the adapter; two unspecific answers stay
+/// `Other`; no answer at all stays `None` so the conservative Unknown
+/// profile applies exactly as before.
+fn classify_bus(adapter: Option<i32>, device: Option<i32>) -> Option<DeviceBus> {
+    let specific = |value: i32| match value {
+        value if value == BusTypeNvme => Some(DeviceBus::Nvme),
+        value if value == BusTypeSata => Some(DeviceBus::Sata),
+        value if value == BusTypeUsb => Some(DeviceBus::Usb),
+        _ => None,
+    };
+    match (adapter.and_then(specific), device.and_then(specific)) {
+        (Some(bus), _) | (None, Some(bus)) => Some(bus),
+        (None, None) if adapter.is_some() || device.is_some() => Some(DeviceBus::Other),
+        (None, None) => None,
+    }
+}
+
+/// Queries the variable-length device descriptor for its bus type.
+///
+/// `STORAGE_DEVICE_DESCRIPTOR` trails identification strings, so the query
+/// uses a bounded raw buffer and reads only the fixed-offset `BusType` field
+/// after validating the returned length covers it.
+fn query_device_bus(handle: &File) -> Option<i32> {
+    #[repr(C, align(8))]
+    struct Aligned([u8; 1024]);
+
+    let query = STORAGE_PROPERTY_QUERY {
+        PropertyId: StorageDeviceProperty,
+        QueryType: PropertyStandardQuery,
+        AdditionalParameters: [0],
+    };
+    let mut output = Aligned([0; 1024]);
+    let mut returned = 0_u32;
+    // SAFETY: query and output are valid for their passed lengths; the
+    // control code is a read-only query and the call is synchronous.
+    let succeeded = unsafe {
+        DeviceIoControl(
+            handle.as_raw_handle().cast(),
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            (&raw const query).cast(),
+            u32::try_from(size_of::<STORAGE_PROPERTY_QUERY>()).ok()?,
+            output.0.as_mut_ptr().cast(),
+            u32::try_from(output.0.len()).ok()?,
+            &raw mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    let bus_offset = offset_of!(STORAGE_DEVICE_DESCRIPTOR, BusType);
+    let needed = bus_offset.checked_add(size_of::<i32>())?;
+    if succeeded == 0 || (returned as usize) < needed {
+        return None;
+    }
+    // SAFETY: the returned length covers the fixed BusType offset within the
+    // zero-initialized bounded buffer; read_unaligned tolerates any packing.
+    Some(unsafe { std::ptr::read_unaligned(output.0.as_ptr().add(bus_offset).cast::<i32>()) })
 }
 
 fn open_volume_device(volume: &VolumeInfo) -> io::Result<File> {
@@ -318,6 +379,31 @@ mod tests {
     fn non_letter_roots_are_rejected() {
         assert!(device_path_for_root(Path::new(r"\\?\Volume{0000}\a")).is_err());
         assert!(device_path_for_root(Path::new(r"relative")).is_err());
+    }
+
+    #[test]
+    fn bus_classification_prefers_any_specific_answer_over_unspecific_ones() {
+        use windows_sys::Win32::Storage::FileSystem::{BusTypeNvme, BusTypeSata, BusTypeUsb};
+
+        use super::{DeviceBus, classify_bus};
+
+        // Specific adapter answers win exactly as before.
+        assert_eq!(classify_bus(Some(BusTypeNvme), None), Some(DeviceBus::Nvme));
+        assert_eq!(
+            classify_bus(Some(BusTypeSata), Some(BusTypeNvme)),
+            Some(DeviceBus::Sata)
+        );
+        // The VMD case: unspecific adapter, specific device descriptor.
+        assert_eq!(
+            classify_bus(Some(99), Some(BusTypeNvme)),
+            Some(DeviceBus::Nvme)
+        );
+        assert_eq!(classify_bus(None, Some(BusTypeUsb)), Some(DeviceBus::Usb));
+        // Two unspecific answers remain Other; silence remains None so the
+        // conservative Unknown profile still applies.
+        assert_eq!(classify_bus(Some(99), Some(77)), Some(DeviceBus::Other));
+        assert_eq!(classify_bus(Some(99), None), Some(DeviceBus::Other));
+        assert_eq!(classify_bus(None, None), None);
     }
 
     #[test]

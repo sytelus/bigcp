@@ -52,4 +52,26 @@ floor stripes plain-small dispatch while loopback-class shares keep
 directory affinity, the once-per-run decision is logged, and SMB single-file
 segmentation is deliberately withheld pending H6.
 
+- **0054 — Single authoritative stamp for restamp destinations.** FAT-family,
+  generic-UNC, mapped-remote, and WSL destinations drop the create-time stamp
+  their mandatory finish-time restamp superseded byte-for-byte: one fewer
+  device-visible metadata write per small file (a physical dirent write on
+  write-through flash, a network round trip on redirectors) with strictly
+  better interrupted-file detectability; strict local NTFS/ReFS keep
+  ADR 0031 unchanged, and the flash wall-clock claim is registered as
+  hypothesis H9.
+- **0055 — Local large-stream overlap and device-bus classification.**
+  Standard-transport unnamed large streams move through the same bounded
+  two-buffer read/write-overlap pipeline the redirectors and WSL use, ending
+  half-duplex alternation (ceiling `1/(1/read + 1/write)`) that measured
+  ~25% behind robocopy `/J` on a distinct-NVMe pair; sparse ranges and named
+  streams keep request-at-a-time, `REDIRECTOR_PIPELINE_BUFFERS` becomes
+  `PIPELINE_BUFFERS`, and `mem` reserves two coordinator chunks on every
+  non-same-spindle transport. Bus classification falls back to the
+  per-device descriptor when the adapter answer is unspecific (NVMe behind
+  Intel VMD no longer demotes to the SATA-SSD row), the adapter
+  MaximumTransferLength no longer clamps the composed chunk, and the NVMe
+  row moves to 16 MiB — amending ADR 0028's overlap rationale while keeping
+  its buffered-I/O decision.
+
 The index is filename ordered. `docs/MAINTENANCE.md` maps decisions to code and release checks.

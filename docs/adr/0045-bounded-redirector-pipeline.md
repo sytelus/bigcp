@@ -6,6 +6,12 @@
 8 MiB/16-worker Auto row, destination-create striping, and provider-specific
 handle/metadata-call reductions. Generic UNC retains this ADR's policy.
 
+**Extended by ADR 0055:** the two-buffer pipeline now also carries
+standard-transport unnamed large streams, its constant is renamed
+`PIPELINE_BUFFERS`, and standard `mem` accounting reserves the same two
+coordinator chunks. This ADR's "standard local accounting remains unchanged"
+statements describe the state before ADR 0055.
+
 ## Context
 
 ADR 0037 isolated UNC, mapped-drive, and WSL policy but deliberately retained

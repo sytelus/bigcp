@@ -964,6 +964,31 @@ pub(crate) fn finish_plain_small(
     Ok(written.result)
 }
 
+/// Create-time stamp for the direct final-name writer, or `None` when the
+/// destination mandates an authoritative post-write restamp.
+///
+/// `finish` restamps exactly the destinations whose drivers update time or
+/// archive fields while data is written (FAT-family and every remote
+/// provider), so a create-time stamp there is superseded byte-for-byte and
+/// wastes one device-visible metadata write per file — on write-through
+/// removable media ("Quick removal") each such write lands on the device.
+/// Deferring also strengthens crash detectability: an interrupted unstamped
+/// file keeps the driver's current mtime, which differs from the source
+/// beyond the comparison quantum, so a rerun sees a second Replace signal
+/// besides the short size. Strict local NTFS/ReFS keep ADR 0031's measured
+/// create-time-only fast path — their `finish` passes `None` and this stamp
+/// is the only one.
+const fn initial_small_file_stamp(
+    requires_post_write_stamp: bool,
+    metadata: bigcp_win::BasicMetadata,
+) -> Option<bigcp_win::BasicMetadata> {
+    if requires_post_write_stamp {
+        None
+    } else {
+        Some(metadata)
+    }
+}
+
 /// Opens the direct final-name writer, clearing a read-only attribute first
 /// when the classification already saw it on the file being replaced.
 fn create_final(request: &EngineRequest<'_>) -> Result<DestinationFinal, OperationError> {
@@ -971,7 +996,10 @@ fn create_final(request: &EngineRequest<'_>) -> Result<DestinationFinal, Operati
     let expected = request
         .replacement_snapshot
         .map(|snapshot| &snapshot.metadata);
-    let initial_stamp = (!request.destination_is_wsl()).then_some(request.destination_metadata);
+    let initial_stamp = initial_small_file_stamp(
+        request.destination_requires_post_write_stamp(),
+        request.destination_metadata,
+    );
     match open_final(request, expected, encrypted, initial_stamp) {
         Ok(value) => Ok(value),
         Err(error)
@@ -1130,7 +1158,7 @@ fn copy_streamed(
         checkpoint_identity(&temp, checkpoint_eligible),
     );
     let mut journal_degraded = false;
-    let mut buffers = StreamBuffers::new(
+    let mut buffers = StreamBuffers::for_unnamed_stream(
         request,
         request.chunk_bytes(),
         logical_size.saturating_sub(total),
@@ -1731,11 +1759,14 @@ fn address_space_error(
 
 /// Per-stream transport state allocated once before a stream's transfer loop.
 enum StreamBuffers {
-    /// Request-at-a-time chunk buffer for the standard transport.
+    /// Request-at-a-time chunk buffer for standard-transport sparse ranges
+    /// and named streams.
     Standard(Vec<u8>),
-    /// Bounded redirector pipeline; the two request buffers live inside
-    /// [`transfer_pipelined`], so only the per-request size is retained.
-    Redirector {
+    /// Bounded read/write-overlap pipeline; the two request buffers live
+    /// inside [`transfer_pipelined`], so only the per-request size is
+    /// retained. Carries every redirector and WSL stream, and — since the
+    /// 2026-08-02 measurement — standard-transport unnamed large streams.
+    Pipelined {
         /// Bytes per pipeline request.
         request_bytes: usize,
     },
@@ -1746,7 +1777,7 @@ enum StreamBuffers {
 impl StreamBuffers {
     /// Builds the run transport's state for one stream with `remaining` bytes
     /// left to move. `request_bytes` sizes the standard chunk buffer (a
-    /// zero-byte composed profile is rejected) and the redirector's requests;
+    /// zero-byte composed profile is rejected) and the pipeline's requests;
     /// the same-spindle staging buffer keeps its own composed request size.
     fn new(
         request: &EngineRequest<'_>,
@@ -1758,11 +1789,40 @@ impl StreamBuffers {
                 request, remaining,
             )?))
         } else if request.transport().is_redirector() {
-            Ok(Self::Redirector { request_bytes })
+            Ok(Self::Pipelined { request_bytes })
         } else if request_bytes == 0 {
             Err(zero_chunk_error(request))
         } else {
             Ok(Self::Standard(vec![0_u8; request_bytes]))
+        }
+    }
+
+    /// Like [`Self::new`], but a standard-transport stream large enough to
+    /// reach the temp+rename path overlaps one source read with one
+    /// destination write through the bounded two-buffer pipeline instead of
+    /// half-duplex request-at-a-time alternation.
+    ///
+    /// Measured 2026-08-02 (BENCHMARKS.md): an 8 GiB distinct-NVMe copy ran
+    /// 1,788–2,038 MB/s under alternation while robocopy's unbuffered mode
+    /// held 2,264–2,802 MB/s on the interleaved pairs — the alternation
+    /// ceiling is `1/(1/read + 1/write)` while overlap targets
+    /// `min(read, write)`. The pipeline is the same one every redirector and
+    /// WSL stream already uses, including its checkpoint ordering invariant
+    /// (boundaries only at segment ends). Sparse ranges and named streams
+    /// deliberately keep [`Self::new`]: their segments are typically small,
+    /// hole-bounded, or ADS-sized, where a reader thread per stream would
+    /// cost more than the overlap returns.
+    fn for_unnamed_stream(
+        request: &EngineRequest<'_>,
+        request_bytes: usize,
+        remaining: u64,
+    ) -> Result<Self, OperationError> {
+        if request.transport().is_same_spindle() {
+            Self::new(request, request_bytes, remaining)
+        } else if request_bytes == 0 {
+            Err(zero_chunk_error(request))
+        } else {
+            Ok(Self::Pipelined { request_bytes })
         }
     }
 }
@@ -1850,7 +1910,7 @@ fn transfer_segment<R: Read + Send, W: Write>(
             )
             .map(|count| count as u64)
         }
-        StreamBuffers::Redirector { request_bytes } => transfer_redirector_segment(
+        StreamBuffers::Pipelined { request_bytes } => transfer_redirector_segment(
             request,
             counters,
             source,
@@ -2835,6 +2895,28 @@ mod tests {
             persistent_acls: value,
             posix_unlink_rename: value,
         }
+    }
+
+    /// Pins the single-stamp rule: destinations whose drivers rewrite
+    /// time/archive fields during data writes (FAT-family and every remote
+    /// provider — exactly those `finish` restamps) receive no create-time
+    /// stamp, saving one device-visible metadata write per small file on
+    /// write-through removable media. Strict local NTFS/ReFS keep ADR 0031's
+    /// measured create-time-only stamp, whose `finish` passes `None`.
+    #[test]
+    fn post_write_stamp_destinations_defer_the_create_time_stamp() {
+        let metadata = bigcp_win::BasicMetadata {
+            creation_time: 1,
+            last_access_time: 2,
+            last_write_time: 3,
+            attributes: 0x20,
+        };
+        // FAT/exFAT/UNC/WSL class: the finish-time restamp is the only one.
+        assert!(super::initial_small_file_stamp(true, metadata).is_none());
+        // Strict NTFS/ReFS class: the create-time stamp is the only one.
+        let stamped = super::initial_small_file_stamp(false, metadata);
+        assert_eq!(stamped.map(|value| value.last_write_time), Some(3));
+        assert_eq!(stamped.map(|value| value.attributes), Some(0x20));
     }
 
     /// Pins `DestinationCaps::from_policy` field-by-field against the

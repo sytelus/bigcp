@@ -51,11 +51,12 @@ NTFS/ReFS policy retains its measured create-time stamp. Files
 with destination-representable ADS/EAs, sparse files, and large/resumable files
 use `DestinationTemp` and atomic publication. Unsupported source ADS/EAs are
 counted and warned but do not force that slower route. Large transfers are
-bounded synchronous streams. The standard transport uses one request-sized
-buffer. Immutable generic `Redirector` and `Wsl` transports use exactly two
-buffers and a scoped reader so one source read overlaps one destination write;
-hashing and writes remain ordered, and pipeline segments stop at checkpoint
-boundaries.
+bounded synchronous streams. Standard-transport unnamed large streams and
+every immutable generic `Redirector` and `Wsl` stream use exactly two
+buffers and a scoped reader so one source read overlaps one destination write
+(ADR 0055); hashing and writes remain ordered, and pipeline segments stop at
+checkpoint boundaries. Standard-transport sparse ranges and named streams
+keep the one request-sized buffer.
 WSL remains a distinct transport/profile identity and stripes plain-small
 dispatch across its worker pool whenever either side is WSL, while generic
 UNC retains directory affinity. A generic-redirector source switches to the
@@ -169,7 +170,13 @@ must state its atomicity, representation, and metadata guarantees.
 ## Performance model
 
 Local device discovery uses official query-only IOCTLs: physical extents, bus
-type, seek penalty, sector sizes, and maximum transfer length. Remote discovery
+type, seek penalty, sector sizes, and maximum transfer length. When the
+adapter's bus answer is unspecific (Intel VMD/RST reports RAID for NVMe), the
+per-device descriptor's bus type is consulted before any conservative
+fallback; the adapter maximum transfer length is recorded as a fact but no
+longer clamps the composed chunk — it bounds one storport request, which the
+I/O manager already honors by splitting buffered transfers (ADR 0055).
+Remote discovery
 uses provider-returned volume data and independently immutable generic-UNC/WSL
 profiles; remote sources cap the composed worker count. Static profiles choose
 per-side chunk size and workers. Both remote transports use two buffers per
@@ -181,10 +188,11 @@ segments to overlap the measured per-handle ceiling (ADR 0052).
 Intersecting local disk extents plus
 rotational classification select one phased worker and a bounded same-spindle
 burst; SSD overlap stays on the standard path. Manual values are range checked.
-On standard transport the memory override reserves the concurrently live
-coordinator chunk before capping threshold-sized workers. Redirector accounting
-reserves two coordinator chunks and the larger of one whole-small-file buffer
-or two chunks per worker. On same-spindle transport the drain-before-inline
+On standard transport the memory override reserves the two concurrently live
+pipelined coordinator chunks before capping threshold-sized workers.
+Redirector accounting
+reserves the same two coordinator chunks and the larger of one
+whole-small-file buffer or two chunks per worker. On same-spindle transport the drain-before-inline
 rule permits one direct burst cap. All effective transport facts are reported.
 
 The directory join avoids a destination `stat` per source file. Stream and EA

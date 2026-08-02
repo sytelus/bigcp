@@ -101,7 +101,7 @@ impl TransportProfile {
 /// Two buffers are sufficient to overlap one synchronous read with one
 /// synchronous write. A deeper userspace queue would increase memory without
 /// increasing either handle's I/O depth.
-pub const REDIRECTOR_PIPELINE_BUFFERS: usize = 2;
+pub const PIPELINE_BUFFERS: usize = 2;
 
 const CHANNEL_POLL: Duration = Duration::from_millis(50);
 
@@ -186,8 +186,8 @@ where
     F: FnMut(&[u8]),
 {
     let request_bytes = request_bytes.max(1);
-    let mut buffers = Vec::with_capacity(REDIRECTOR_PIPELINE_BUFFERS);
-    for _ in 0..REDIRECTOR_PIPELINE_BUFFERS {
+    let mut buffers = Vec::with_capacity(PIPELINE_BUFFERS);
+    for _ in 0..PIPELINE_BUFFERS {
         let mut buffer = Vec::new();
         if let Err(error) = buffer.try_reserve_exact(request_bytes) {
             return Err(PipelinedFailure {
@@ -202,8 +202,8 @@ where
     let stopped = AtomicBool::new(false);
     let bytes_read = AtomicU64::new(0);
     let mut bytes_written = 0_u64;
-    let (free_sender, free_receiver) = crossbeam_channel::bounded(REDIRECTOR_PIPELINE_BUFFERS);
-    let (filled_sender, filled_receiver) = crossbeam_channel::bounded(REDIRECTOR_PIPELINE_BUFFERS);
+    let (free_sender, free_receiver) = crossbeam_channel::bounded(PIPELINE_BUFFERS);
+    let (filled_sender, filled_receiver) = crossbeam_channel::bounded(PIPELINE_BUFFERS);
     for buffer in buffers {
         // The receiver is live and the channel has exactly enough capacity.
         if free_sender.send(buffer).is_err() {
