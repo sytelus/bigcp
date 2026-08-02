@@ -8,7 +8,7 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-bigcp-win = { path = "../win", version = "0.2.1" }
+bigcp-win = { path = "../win", version = "0.3.0" }
 clap.workspace = true
 hex.workspace = true
 serde.workspace = true
