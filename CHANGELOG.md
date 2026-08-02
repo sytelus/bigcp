@@ -36,7 +36,9 @@ versioning once its 1.0 release gates are complete.
 
 ### Changed
 
-- 2026-08-02 distinct-drive NTFS large-stream overlap (ADR 0055): local
+- 2026-08-02 distinct-drive NTFS large-stream overlap (ADR 0055) (v0.3.0 —
+  this release spans the entries from the 2026-08-01 review pass through this
+  one): local
   standard-transport unnamed large streams now move through the same bounded
   two-buffer read/write-overlap pipeline the redirectors and WSL use, ending
   half-duplex request-at-a-time alternation whose throughput ceiling is

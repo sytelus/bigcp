@@ -1076,19 +1076,30 @@ fn unsupported_rename_class(error: &io::Error) -> bool {
     )
 }
 
+/// FILETIME for 1980-01-02 00:00 UTC: inside every supported filesystem's
+/// representable range (FAT's epoch is 1980-01-01; FastFAT *rejects*
+/// out-of-range stamps with `STATUS_INVALID_PARAMETER` rather than clamping,
+/// so a 1601-era sentinel would silently fail exactly where the poison
+/// matters most — write-through removable media).
+const POISON_LAST_WRITE: i64 = 119_600_928_000_000_000;
+
 /// Returns a stamp that makes a destination detectably different from its
 /// source after a failed durable flush.
 ///
 /// The skip heuristic compares size and last-write time; after a flush
 /// failure both already match the source, so a rerun would classify the
-/// possibly-non-durable file as Same and never retry. Timestamp value `1`
-/// (1601-01-01 + 100ns) is a legal FILETIME no real source carries; the zero
-/// fields mean "leave unchanged" to `FILE_BASIC_INFO`.
+/// possibly-non-durable file as Same and never retry. The sentinel
+/// last-write time (1980-01-02) differs from any real source by decades —
+/// far beyond every quantization window. The zero timestamps mean "leave
+/// unchanged" to `FILE_BASIC_INFO`; note that `set_basic_by_handle` maps
+/// the zero attribute mask to `FILE_ATTRIBUTE_NORMAL`, so a successful
+/// poison also clears the failed file's attributes — acceptable (and
+/// detectability-positive) because the rerun fully replaces it.
 pub(crate) const fn poison_stamp() -> BasicMetadata {
     BasicMetadata {
         creation_time: 0,
         last_access_time: 0,
-        last_write_time: 1,
+        last_write_time: POISON_LAST_WRITE,
         attributes: 0,
     }
 }

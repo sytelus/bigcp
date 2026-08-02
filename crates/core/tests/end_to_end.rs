@@ -1020,6 +1020,11 @@ fn verified_checkpoint_resume_completes_an_interrupted_large_file()
     // Make the 2 MiB fixture checkpoint-eligible so it takes the same
     // journaled transactional path a 40 GB production file would.
     options.tune.checkpoint_threshold = Some(64 * 1024);
+    // Pin both sides to a solid-state class: on an HDD-only host the auto
+    // profile would compose the same-spindle transport and silently stop
+    // exercising the pipelined standard path this resume contract rides on.
+    options.source_profile = DeviceClass::SataSsd;
+    options.destination_profile = DeviceClass::SataSsd;
     let report = run_copy(&options, &SilentObserver)?;
 
     assert_eq!(report.run.exit, 0, "resume errors: {:?}", report.errors);
@@ -1045,6 +1050,136 @@ fn verified_checkpoint_resume_completes_an_interrupted_large_file()
     let compacted = fs::read_to_string(&journal_path)?;
     assert_eq!(compacted.lines().count(), 1, "journal: {compacted}");
     assert!(compacted.contains("\"ev\":\"job\""));
+    let oracle = check_trees(&sandbox, Path::new("source"), Path::new("destination"))?;
+    assert_eq!(oracle.mismatches, 0, "oracle samples: {:?}", oracle.samples);
+    Ok(())
+}
+
+/// Cancels at the first poll after this run's own journal contains a
+/// persisted checkpoint record, deterministically landing the stop inside
+/// the transactional window between checkpoint persistence and publication
+/// (the journal line is flushed before the poll that observes it).
+struct CancelAfterOwnCheckpoint {
+    journal_path: PathBuf,
+}
+
+impl RunObserver for CancelAfterOwnCheckpoint {
+    fn on_snapshot(&self, _snapshot: &RunSnapshot) {}
+
+    fn on_message(&self, _message: &str) {}
+
+    fn cancellation_requested(&self) -> bool {
+        fs::read_to_string(&self.journal_path)
+            .is_ok_and(|journal| journal.contains("\"ev\":\"checkpoint\""))
+    }
+}
+
+#[test]
+fn canceled_checkpointed_copy_resumes_from_its_own_journal_records()
+-> Result<(), Box<dyn std::error::Error>> {
+    // The first test consuming checkpoint records the engine's own pipelined
+    // writer produced — every other resume test seeds its journal by hand.
+    //
+    // Determinism note (in place of the poll-count cancel the audit
+    // sketched): with the production 256 MiB checkpoint cadence a small
+    // stream's only boundary sits at its EOF (`next_checkpoint_after` clamps
+    // to the stream size), and an unnamed-only file has no cancel poll
+    // between that final append and publication — a poll-count observer
+    // would either stop before any checkpoint exists (temp self-deletes) or
+    // after the file committed. A checkpoint-eligible named stream keeps the
+    // file inside the cancel-polled engine after the base checkpoint, and
+    // the observer cancels at the first poll that sees the run's own journal
+    // record, so the stop lands in that window every time.
+    //
+    // Fresh-write ceiling: ~2.25 MiB source (2 MiB base + 256 KiB ADS), the
+    // 2 MiB persisted partial, and the rerun's 256 KiB stream copy — about
+    // 5 MiB, inside the 16 MiB end-to-end fixture budget.
+    let allowed_temp = validated_system_temp()?;
+    let lease = tempfile::Builder::new()
+        .prefix("bigcp-cancel-resume-")
+        .tempdir_in(allowed_temp)?;
+    let sandbox = initialize_empty(lease.path())?;
+    let source = sandbox.child(Path::new("source"))?;
+    let destination = sandbox.child(Path::new("destination"))?;
+    let state = sandbox.child(Path::new("state"))?;
+    fs::create_dir(&source)?;
+
+    let base_size = 2 * 1024 * 1024_u64;
+    let mut payload = vec![0_u8; usize::try_from(base_size)?];
+    let mut pattern = 0x2f_u8;
+    for byte in &mut payload {
+        pattern = pattern.wrapping_mul(31).wrapping_add(7);
+        *byte = pattern;
+    }
+    let source_file = source.join("large.bin");
+    fs::write(&source_file, &payload)?;
+    let stream = StreamInfo {
+        name: OsString::from(":resume-tail:$DATA"),
+        size: 256 * 1024,
+    };
+    let mut alternate = DestinationStream::create(&source_file, &stream, true)?;
+    alternate.write_all(&vec![0xc3_u8; usize::try_from(stream.size)?])?;
+    alternate.flush()?;
+    drop(alternate);
+
+    let mut options = sandboxed_options(&sandbox, source, destination.clone(), "state")?;
+    // Make both streams checkpoint-eligible and keep the base transfer in
+    // small pipeline requests so the run behaves like a large production
+    // file scaled down.
+    options.tune.checkpoint_threshold = Some(64 * 1024);
+    options.tune.chunk_bytes = Some(64 * 1024);
+    // Pin both sides to a solid-state class: on an HDD-only host the auto
+    // profile would compose the same-spindle transport and silently stop
+    // exercising the pipelined standard path this resume contract rides on.
+    options.source_profile = DeviceClass::SataSsd;
+    options.destination_profile = DeviceClass::SataSsd;
+
+    let journal_path = state.join("journal.jsonl");
+    let observer = CancelAfterOwnCheckpoint {
+        journal_path: journal_path.clone(),
+    };
+    let canceled = run_copy(&options, &observer)?;
+    // The canceled exit path: exit 3 with a clean error report and the
+    // mid-file warning, exactly like every graceful cancel.
+    assert_eq!(canceled.run.exit, 3, "errors: {:?}", canceled.errors);
+    assert!(canceled.errors.is_empty());
+    assert!(canceled.warnings.contains_key("canceled_mid_file"));
+    assert!(!destination.join("large.bin").exists());
+    // Exactly one persisted opaque partial survives for the resume.
+    let parts: Vec<_> = fs::read_dir(&destination)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .filter(|name| {
+            let name = name.to_string_lossy();
+            name.starts_with(".bigcp-") && name.ends_with(".part")
+        })
+        .collect();
+    assert_eq!(parts.len(), 1, "persisted partials: {parts:?}");
+    // And the journal holds the checkpoint the writer itself appended.
+    let journal = fs::read_to_string(&journal_path)?;
+    assert!(
+        journal
+            .lines()
+            .any(|line| line.contains("\"ev\":\"checkpoint\"")),
+        "journal lost its own checkpoint: {journal}"
+    );
+
+    let resumed = run_copy(&options, &SilentObserver)?;
+    assert_eq!(resumed.run.exit, 0, "resume errors: {:?}", resumed.errors);
+    assert_eq!(resumed.counters.copied_new, 1);
+    // Resumed, not restarted: the rerun re-hashed exactly the checkpointed
+    // 2 MiB base prefix from the persisted partial and read only the named
+    // stream from the source — strictly less than the base stream size.
+    assert_eq!(resumed.counters.bytes_verified, base_size);
+    assert_eq!(resumed.counters.bytes_read_source, stream.size);
+    assert!(resumed.counters.bytes_read_source < base_size);
+    assert_eq!(fs::read(destination.join("large.bin"))?, payload);
+    let leftovers: Vec<_> = fs::read_dir(&destination)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .filter(|name| name.to_string_lossy().starts_with(".bigcp-"))
+        .collect();
+    assert!(leftovers.is_empty(), "unconsumed partials: {leftovers:?}");
     let oracle = check_trees(&sandbox, Path::new("source"), Path::new("destination"))?;
     assert_eq!(oracle.mismatches, 0, "oracle samples: {:?}", oracle.samples);
     Ok(())
@@ -1278,5 +1413,65 @@ fn fresh_run_reclaims_the_previous_partial() -> Result<(), Box<dyn std::error::E
         .filter(|name| name.to_string_lossy().starts_with(".bigcp-"))
         .collect();
     assert!(leftovers.is_empty(), "stray partials: {leftovers:?}");
+    Ok(())
+}
+
+#[test]
+fn lost_retirement_record_does_not_resurrect_or_reclaim_on_rerun()
+-> Result<(), Box<dyn std::error::Error>> {
+    // The GC retirement-crash state: a journal checkpoint survives but the
+    // temp it names is gone (removed between the discard and the record that
+    // would have retired the checkpoint). The rerun must treat the dangling
+    // checkpoint as a dead hint — copy the file fresh, reclaim nothing,
+    // report nothing — and retire the record so nothing replays later.
+    let allowed_temp = validated_system_temp()?;
+    let lease = tempfile::Builder::new()
+        .prefix("bigcp-lostgc-")
+        .tempdir_in(allowed_temp)?;
+    let sandbox = initialize_empty(lease.path())?;
+    let source = sandbox.child(Path::new("source"))?;
+    let destination = sandbox.child(Path::new("destination"))?;
+    let state = sandbox.child(Path::new("state"))?;
+    fs::create_dir(&source)?;
+    fs::create_dir(&destination)?;
+
+    let payload = vec![0x6b_u8; 256 * 1024];
+    let source_file = source.join("large.bin");
+    fs::write(&source_file, &payload)?;
+    let source_metadata = metadata_at(&source_file)?;
+    let (temp_name, _) = seed_checkpointed_partial(
+        &source,
+        &destination,
+        &state,
+        "large.bin",
+        &payload[..64 * 1024],
+        payload.len() as u64,
+        source_metadata.basic.last_write_time,
+        Some(CheckpointFileIdentity::from_file(source_metadata.identity)),
+    )?;
+    // The crash window under test: the checkpoint now points at nothing.
+    fs::remove_file(destination.join(&temp_name))?;
+
+    let mut options = sandboxed_options(&sandbox, source, destination.clone(), "state")?;
+    options.tune.checkpoint_threshold = Some(64 * 1024);
+    let report = run_copy(&options, &SilentObserver)?;
+    assert_eq!(report.run.exit, 0, "errors: {:?}", report.errors);
+    assert_eq!(report.counters.failed, 0);
+    assert_eq!(report.counters.copied_new, 1);
+    // Fresh copy, not a resurrected resume: every source byte was re-read
+    // and no vanished prefix was "verified".
+    assert_eq!(report.counters.bytes_read_source, payload.len() as u64);
+    assert_eq!(report.counters.bytes_verified, 0);
+    assert_eq!(fs::read(destination.join("large.bin"))?, payload);
+    // Nothing on disk matched the record, so nothing was reclaimed and
+    // nothing became an extra.
+    assert!(!report.warnings.contains_key("temp_reclaimed"));
+    assert_eq!(report.counters.extra, 0);
+    // The dangling checkpoint retired with the completed file: the clean
+    // end compacts the journal back to its job header alone.
+    let compacted = fs::read_to_string(state.join("journal.jsonl"))?;
+    assert_eq!(compacted.lines().count(), 1, "journal: {compacted}");
+    assert!(compacted.contains("\"ev\":\"job\""));
+    assert!(!compacted.contains("\"ev\":\"checkpoint\""));
     Ok(())
 }

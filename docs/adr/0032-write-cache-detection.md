@@ -26,7 +26,9 @@ only with fresh evidence.
    (F19) — the CLI shows a pre-copy notice and, in an interactive terminal
    only, one Continue? [Y/n] confirmation. Non-interactive, `--plain`,
    `--quiet`, and `--dry-run` runs warn without prompting, so scripts never
-   block. Mid-run prompts remain forbidden.
+   block. Mid-run prompts remain forbidden. [ADR 0049 later added
+   `--accept-write-cache-policy` as the non-interactive acceptance for this
+   notice.]
 3. Recommended user setting, documented in the README: Better performance
    with "Enable write caching on the device" checked (the measured win;
    rerun-repair covers its loss window when paired with Safely Remove) and

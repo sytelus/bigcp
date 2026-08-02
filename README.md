@@ -27,9 +27,11 @@ is recorded in the log/report and changes scheduling only—not copy semantics.
 
 The repository is currently **pre-1.0**. The ordinary-tree engine, safety
 contract, and measured performance work are implemented (with default settings
-bigcp leads robocopy on every measured small-file cell, and — since the
-2026-08-02 overlap work — on the measured distinct-NVMe large-stream pair as
-well; `BENCHMARKS.md` records those numbers as indicative, not certified).
+bigcp leads robocopy on every measured local small-file cell and every cell
+copying into WSL, sits within ~9% coming out of WSL, and — since the
+2026-08-02 overlap work — leads on the measured distinct-NVMe large-stream
+pair as well; `BENCHMARKS.md` records those numbers as indicative, not
+certified).
 The remaining 1.0 gates — among them a bounded fallback for exceptionally
 large single directories and the final production-validation pass in PLAN
 §12.10 — are tracked authoritatively in
@@ -150,7 +152,9 @@ Accepted profile classes are `auto`, `nvme`, `sata-ssd`, `usb-ssd`, `hdd`, and
 `chunk`, `threads`, `mem`, `large-threshold`, `checkpoint-threshold`, and
 `same-spindle-burst`; byte sizes accept `KiB`, `MiB`, or `GiB`. There are
 no stream-count or queue-depth keys: large files stream through one strictly
-ordered path, so those settings would not describe real work. Redirector
+ordered path everywhere except WSL's automatically planned segmented
+transfers, whose segment count is computed rather than tunable, so those
+settings would not describe real work. Redirector
 transfers use a fixed two-buffer pipeline and may run independent files below
 the checkpoint threshold on the bounded worker pool; local standard large
 streams move through that same two-buffer pipeline, while their sparse ranges

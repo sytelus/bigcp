@@ -79,6 +79,10 @@ pub struct DestinationCaps {
     /// initial metadata round trip that the required post-write stamp would
     /// immediately supersede. Other endpoint mechanics remain unchanged.
     is_wsl: bool,
+    /// Whether the destination is any remote endpoint. The segmented
+    /// strategy requires the non-WSL side to be genuinely local (its digest
+    /// pass re-reads that side).
+    is_remote: bool,
 }
 
 impl DestinationCaps {
@@ -97,6 +101,7 @@ impl DestinationCaps {
             supports_posix_unlink_rename: policy.supports_posix_unlink_rename(),
             requires_post_write_stamp: policy.requires_post_write_stamp(),
             is_wsl: policy.endpoint() == EndpointKind::Wsl,
+            is_remote: policy.endpoint().is_remote(),
         }
     }
 }
@@ -114,6 +119,9 @@ pub struct SourceCaps {
     /// `copy::worker_dispatch` and the segmented large-file strategy's
     /// one-side-is-WSL eligibility); source read semantics are unchanged.
     pub is_wsl: bool,
+    /// Whether the source is any remote endpoint (the segmented strategy
+    /// requires the non-WSL side to be genuinely local).
+    pub is_remote: bool,
 }
 
 /// Run-constant transfer tuning shared by every engine call.
@@ -296,6 +304,13 @@ impl EngineRequest<'_> {
     fn destination_is_wsl(&self) -> bool {
         self.settings.destination.is_wsl
     }
+
+    /// Whether the destination is any remote endpoint (see
+    /// [`DestinationCaps`]).
+    #[inline]
+    fn destination_is_remote(&self) -> bool {
+        self.settings.destination.is_remote
+    }
 }
 
 /// Copies one ordinary file through the fidelity- and size-appropriate
@@ -350,7 +365,9 @@ pub fn copy_file(
         let plan = segment_plan(
             request.transport(),
             request.source_is_wsl(),
+            request.settings.source.is_remote,
             request.destination_is_wsl(),
+            request.destination_is_remote(),
             // Per-file effective sparse preservation: a file that would take
             // the sparse strategy never reaches this branch, so this is the
             // same `preserve_sparse && is_sparse` predicate the first branch
@@ -1277,7 +1294,7 @@ fn finish_streamed(
 /// I/O — the per-handle ceiling, not the medium, is the bottleneck. Below
 /// 64 MiB the extra identity-checked opens and thread startup outweigh that
 /// ceiling, so smaller files keep the ordered pipeline.
-const SEGMENT_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const SEGMENT_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Segment-count bounds: `K = clamp(size / SEGMENT_THRESHOLD_BYTES, 2, 8)`.
 ///
@@ -1306,9 +1323,12 @@ struct SegmentPlan {
 /// - `transport` must be the WSL Plan 9 transport — the strategy exists only
 ///   to overlap that provider's per-handle ceiling (see
 ///   [`SEGMENT_THRESHOLD_BYTES`]).
-/// - exactly one endpoint may be WSL (`source_is_wsl` XOR
-///   `destination_is_wsl`): the local side hosts the coordinator's whole-file
-///   digest pass, and a WSL↔WSL copy has no local side.
+/// - exactly one endpoint may be WSL, and the other side must be genuinely
+///   LOCAL (`!*_is_remote`): the local side hosts the coordinator's
+///   whole-file digest pass. A WSL↔WSL copy has no local side, and a
+///   UNC↔WSL pair would silently re-read the whole source (or re-read the
+///   just-written temp) across a network for the digest — an unmeasured 2×
+///   traffic cost the plan comment's "nearly free" claim does not cover.
 /// - `preserve_sparse` files keep the allocated-range strategy.
 /// - the discovered stream set must be unnamed-only (the WSL side claims no
 ///   named streams; requiring it keeps a surprise ADS on the ordered path).
@@ -1326,7 +1346,9 @@ struct SegmentPlan {
 fn segment_plan(
     transport: TransportProfile,
     source_is_wsl: bool,
+    source_is_remote: bool,
     destination_is_wsl: bool,
+    destination_is_remote: bool,
     preserve_sparse: bool,
     streams: &[StreamInfo],
     size: u64,
@@ -1335,8 +1357,10 @@ fn segment_plan(
     checkpoint_eligible: bool,
     resume_candidate: bool,
 ) -> Option<SegmentPlan> {
+    let one_wsl_side_with_local_peer =
+        (source_is_wsl && !destination_is_remote) || (destination_is_wsl && !source_is_remote);
     if !transport.is_wsl()
-        || source_is_wsl == destination_is_wsl
+        || !one_wsl_side_with_local_peer
         || preserve_sparse
         || streams.iter().any(|stream| !stream.is_unnamed())
         || size < threshold
@@ -3092,6 +3116,8 @@ mod tests {
         segment_plan(
             TransportProfile::wsl(TEST_CHUNK),
             true,
+            true,
+            false,
             false,
             false,
             &[StreamInfo::unnamed(size)],
@@ -3109,9 +3135,12 @@ mod tests {
         let streams = [StreamInfo::unnamed(size)];
         let wsl = TransportProfile::wsl(TEST_CHUNK);
         let eligible = |transport, source_wsl, destination_wsl| {
+            // In these fixtures the WSL side is the only remote side.
             segment_plan(
                 transport,
                 source_wsl,
+                source_wsl,
+                destination_wsl,
                 destination_wsl,
                 false,
                 &streams,
@@ -3131,11 +3160,49 @@ mod tests {
         // Exactly one endpoint may be WSL.
         assert!(eligible(wsl, true, true).is_none());
         assert!(eligible(wsl, false, false).is_none());
+        // The non-WSL side must be genuinely local: a UNC peer would drag
+        // the whole-file digest pass across the network (2x traffic).
+        assert!(
+            segment_plan(
+                wsl,
+                true,
+                true,
+                false,
+                true,
+                false,
+                &streams,
+                size,
+                TEST_THRESHOLD,
+                TEST_CHUNK,
+                false,
+                false,
+            )
+            .is_none()
+        );
+        assert!(
+            segment_plan(
+                wsl,
+                false,
+                true,
+                true,
+                true,
+                false,
+                &streams,
+                size,
+                TEST_THRESHOLD,
+                TEST_CHUNK,
+                false,
+                false,
+            )
+            .is_none()
+        );
         // Sparse preservation keeps the allocated-range strategy.
         assert!(
             segment_plan(
                 wsl,
                 true,
+                true,
+                false,
                 false,
                 true,
                 &streams,
@@ -3159,6 +3226,8 @@ mod tests {
             segment_plan(
                 wsl,
                 true,
+                true,
+                false,
                 false,
                 false,
                 &with_named,
@@ -3177,6 +3246,8 @@ mod tests {
             segment_plan(
                 wsl,
                 true,
+                true,
+                false,
                 false,
                 false,
                 &streams,
@@ -3193,6 +3264,8 @@ mod tests {
             segment_plan(
                 wsl,
                 true,
+                true,
+                false,
                 false,
                 false,
                 &streams,
@@ -3209,6 +3282,8 @@ mod tests {
             segment_plan(
                 wsl,
                 true,
+                true,
+                false,
                 false,
                 false,
                 &streams,
@@ -3319,6 +3394,7 @@ mod tests {
                 supports_streams: true,
                 supports_eas: false,
                 is_wsl: source_is_wsl,
+                is_remote: source_is_wsl,
             },
             destination,
         }
@@ -3327,10 +3403,14 @@ mod tests {
     /// Runs the segmented strategy end to end inside one sandbox and returns
     /// the engine result, counters, and the still-alive sandbox (dropping it
     /// removes everything). `None` only when sandbox setup itself failed.
+    /// `rewrite_after_snapshot` replaces the source bytes after the
+    /// enumeration snapshot is captured, staling it exactly like a source
+    /// mutated mid-run.
     fn run_segmented(
         source_is_wsl: bool,
         data: &[u8],
         cancel: &dyn crate::transport::CancelProbe,
+        rewrite_after_snapshot: Option<&[u8]>,
     ) -> Option<(
         Result<super::EngineResult, crate::error::OperationError>,
         Counters,
@@ -3348,6 +3428,11 @@ mod tests {
             relative_path: PathBuf::from("big.bin"),
             metadata: metadata_at(&source_path).ok()?,
         };
+        if let Some(replacement) = rewrite_after_snapshot {
+            // A different length guarantees the staleness is observable even
+            // when the rewrite lands inside one filesystem timestamp tick.
+            std::fs::write(&source_path, replacement).ok()?;
+        }
         let settings = wsl_policy_settings(source_is_wsl, TEST_CHUNK);
         let phases = PhaseTracker::new();
         let request = EngineRequest {
@@ -3369,6 +3454,8 @@ mod tests {
         let plan = segment_plan(
             TransportProfile::wsl(TEST_CHUNK),
             source_is_wsl,
+            source_is_wsl,
+            !source_is_wsl,
             !source_is_wsl,
             false,
             &streams,
@@ -3396,11 +3483,22 @@ mod tests {
 
     #[test]
     fn segmented_copy_publishes_identical_content_and_digest_both_directions() {
-        let data = patterned(2 * 1024 * 1024 + 7);
+        // Fresh-write ceiling: 1 MiB + 7 B source plus an equal published
+        // destination per direction (~2.1 MiB each, sandbox dropped between
+        // directions), keeping the test at the 4 MiB unit budget in
+        // docs/TESTING.md.
+        let data = patterned(1024 * 1024 + 7);
+        // The halved fixture must still exercise the parallel mechanics: at
+        // the 512 KiB test threshold it plans two segments, and the +7 tail
+        // keeps the final segment covering an unaligned remainder.
+        assert!(
+            plan_for(data.len() as u64).is_some_and(|plan| plan.ranges.len() >= 2),
+            "fixture no longer produces multiple segments"
+        );
         let expected_digest = format!("xxh3:{:032x}", xxhash_rust::xxh3::xxh3_128(&data));
         for source_is_wsl in [true, false] {
             let cancel = || false;
-            let run = run_segmented(source_is_wsl, &data, &cancel);
+            let run = run_segmented(source_is_wsl, &data, &cancel, None);
             assert!(run.is_some(), "sandbox setup or planning failed");
             let Some((result, counters, sandbox)) = run else {
                 return;
@@ -3421,6 +3519,20 @@ mod tests {
                 Some(data.clone()),
                 "published bytes differ (source_is_wsl={source_is_wsl})"
             );
+            // Publication must leave exactly the final file: no `.part`
+            // residue may survive a successful segmented copy.
+            let names: Vec<_> = std::fs::read_dir(sandbox.path().join("dst"))
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name())
+                .collect();
+            assert_eq!(
+                names,
+                [OsString::from("big.bin")],
+                "destination residue (source_is_wsl={source_is_wsl})"
+            );
             assert_eq!(counters.bytes_read_source, data.len() as u64);
             assert_eq!(counters.bytes_written_destination, data.len() as u64);
         }
@@ -3428,10 +3540,13 @@ mod tests {
 
     #[test]
     fn segmented_copy_cancel_leaves_no_destination_object() {
+        // Fresh-write ceiling: one 2 MiB source plus its preallocated 2 MiB
+        // temp (self-deleted on the cancel return), within the 4 MiB unit
+        // budget in docs/TESTING.md.
         let data = patterned(2 * 1024 * 1024);
         let polls = AtomicUsize::new(0);
         let cancel = move || polls.fetch_add(1, Ordering::SeqCst) >= 3;
-        let run = run_segmented(true, &data, &cancel);
+        let run = run_segmented(true, &data, &cancel, None);
         assert!(run.is_some(), "sandbox setup or planning failed");
         let Some((result, _counters, sandbox)) = run else {
             return;
@@ -3453,5 +3568,45 @@ mod tests {
                 .map(Iterator::count),
             Some(0)
         );
+    }
+
+    #[test]
+    fn segmented_copy_source_change_fails_the_file_once_and_discards_the_temp() {
+        // Fresh-write ceiling: one ~1 MiB source (then a tiny rewrite) plus
+        // its preallocated ~1 MiB temp, discarded on the failure return —
+        // within the 4 MiB unit budget in docs/TESTING.md.
+        let data = patterned(1024 * 1024 + 7);
+        let cancel = || false;
+        // The rewrite lands between snapshot capture and the copy, so every
+        // segment thread's fresh identity-checked open sees a source whose
+        // size (and mtime) no longer match the enumeration snapshot.
+        let run = run_segmented(true, &data, &cancel, Some(b"swapped after enumeration"));
+        assert!(run.is_some(), "sandbox setup or planning failed");
+        let Some((result, counters, sandbox)) = run else {
+            return;
+        };
+        // One failure for the whole file (first segment error wins), carrying
+        // the SourceChanged category from `ensure_source_unchanged`.
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|error| error.category == crate::error::ErrorCategory::SourceChanged),
+            "expected a SourceChanged failure, got {:?}",
+            result.as_ref().err().map(|error| &error.category)
+        );
+        // The temp was discarded: no final-name object, no residue at all.
+        let destination_dir = sandbox.path().join("dst");
+        assert!(!destination_dir.join("big.bin").exists());
+        assert_eq!(
+            std::fs::read_dir(&destination_dir)
+                .ok()
+                .map(Iterator::count),
+            Some(0),
+            "failed segmented copy left destination residue"
+        );
+        // Every segment refused its open-time validation before any I/O, so
+        // the accumulated actual-I/O counters stay exactly zero.
+        assert_eq!(counters.bytes_read_source, 0);
+        assert_eq!(counters.bytes_written_destination, 0);
     }
 }

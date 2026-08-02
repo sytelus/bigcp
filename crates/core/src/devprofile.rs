@@ -51,7 +51,9 @@ pub struct CopyProfile {
     pub source: SideProfile,
     /// Destination-side settings.
     pub destination: SideProfile,
-    /// Chunk clamped by both adapters.
+    /// Chunk composed from both sides' class rows (and any memory cap). The
+    /// adapter MaximumTransferLength is a reported fact, not a clamp
+    /// (ADR 0055).
     pub chunk_bytes: usize,
     /// Composed file worker count (destination-led, source-HDD/remote-capped).
     pub workers: usize,
@@ -351,6 +353,12 @@ mod tests {
         );
         assert_eq!(super::detected_class(&probe(Some(true))), DeviceClass::Hdd);
         assert_eq!(super::detected_class(&probe(None)), DeviceClass::Unknown);
+        // An explicitly unrecognized bus with no seek-penalty answer carries
+        // no solid-state evidence either: it must stay on the conservative
+        // Unknown profile, exactly like an absent bus.
+        let mut other_bus = probe(None);
+        other_bus.bus = Some(DeviceBus::Other);
+        assert_eq!(super::detected_class(&other_bus), DeviceClass::Unknown);
     }
 
     use super::select_copy_profile;

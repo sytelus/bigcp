@@ -228,21 +228,24 @@ acceptance.
   or cache-policy IOCTLs to a remote root and cannot know whether two shares
   use the same server disk. It therefore never selects the local same-spindle
   transport for remote paths.
-- **Remote tuning uses bounded static defaults.** Generic UNC and WSL each use
-  an independently owned 8 MiB request/16-worker Auto profile. Streamed files
-  use two bounded buffers so the next source read can overlap the current
-  destination write. Independent files below the 16 GiB default checkpoint
-  threshold can use separate workers; checkpointed and sparse files stay
-  coordinator-owned. Equal current UNC/WSL values do not merge their policies.
-  These settings are correctness-tested, not certified as optimal for every
-  network or provider. `--profile` and `--tune` remain available.
+- **Remote tuning uses bounded static defaults.** Generic UNC uses an
+  independently owned 8 MiB request/16-worker Auto profile; WSL owns a
+  separate 8 MiB/32-worker profile whose worker count was measured on a real
+  distribution (BENCHMARKS.md 2026-08-02). Streamed files use two bounded
+  buffers so the next source read can overlap the current destination write.
+  Independent files below the 16 GiB default checkpoint threshold can use
+  separate workers; checkpointed and sparse files stay coordinator-owned.
+  The two remote profiles never merge their policies. Generic-UNC settings
+  are correctness-tested, not certified as optimal for every network or
+  provider. `--profile` and `--tune` remain available.
 - **A single remote handle still has synchronous I/O depth one.** The pipeline
   overlaps source and destination stages; it does not issue an unbounded set of
   SMB requests or bypass the server. Link latency, server disks, signing,
   encryption, compression policy, antivirus, and provider caching can remain
-  the bottleneck. No generic UNC performance result has been measured yet on
-  an approved scratch share, so compare with robocopy on your own disposable
-  workload before choosing manual overrides.
+  the bottleneck. Generic UNC evidence so far is loopback-indicative only
+  (BENCHMARKS.md 2026-08-02); no network-class share has been measured, so
+  compare with robocopy on your own disposable workload before choosing
+  manual overrides.
 - **Generic UNC fidelity depends on the provider.** Known filesystem names use
   their corresponding policy and reported capabilities. Unknown providers
   require regular content and last-write time but do not claim Windows
@@ -257,16 +260,23 @@ acceptance.
   reparse objects fail. Linux uid/gid/mode/xattrs and special-file semantics,
   Windows creation/access times and attributes, ADS/EAs, ACLs, EFS, and sparse
   layout are not reproduced through this Win32 engine.
-- **WSL has its own performance path.** WSL destination creates are striped
-  across the bounded worker pool instead of using NTFS directory affinity.
-  WSL destination handles receive the sequential cache hint, new files avoid
-  an unnecessary handle-metadata query, and the projected last-write time is
-  set once after data rather than before and after it. These changes reduce
-  Plan 9 round trips but have not been measured on an approved distribution.
-- **A single WSL stream still has synchronous provider depth one.** The
-  two-buffer path overlaps its source and destination stages, while concurrency
-  across independent files supplies the larger request window. One enormous
-  file can therefore remain limited by one WSL provider request at a time.
+- **WSL has its own performance path.** Small files are striped across the
+  bounded worker pool whenever either side is WSL, instead of using NTFS
+  directory affinity. WSL destination handles receive the sequential cache
+  hint, new files avoid an unnecessary handle-metadata query, and the
+  projected last-write time is set once after data. Eligible large files
+  (64 MiB up to the checkpoint threshold, exactly one WSL side, non-sparse,
+  unnamed-stream-only, no resume candidate) transfer as 2–8 parallel
+  identity-verified segments of one temporary. These mechanisms were
+  measured on a real distribution (BENCHMARKS.md 2026-08-02, indicative
+  medians): small files ahead of robocopy's best swept setting into WSL and
+  within ~9% out of it, large files within ~9% of robocopy both ways.
+- **A single WSL provider request stream still has synchronous depth one.**
+  Parallelism comes from segments and workers, not request queue depth.
+  Checkpoint-eligible files (16 GiB and larger by default), WSL-to-WSL
+  copies, sparse sources, and files with named streams keep the ordered
+  single-stream path and can remain limited by one provider request at a
+  time.
 - **WSL UNC is not the fastest Linux-to-Linux path.** Windows access crosses
   WSL's translation boundary and may start the distribution. Prefer native
   Linux tools inside WSL for sustained copies entirely within Linux.

@@ -1,6 +1,7 @@
 # ADR 0035: Isolated FAT and exFAT filesystem policy
 
-**Status:** Accepted
+**Status:** Accepted; amended by ADR 0054 (per-file operation sequence: the
+create-time stamp is gone; the finish-time stamp is the only one)
 
 ## Context
 

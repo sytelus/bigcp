@@ -665,6 +665,20 @@ WSL files. Post-change medians: small files ahead of robocopy's best swept
 The numbers are medians of 3 warm runs, below the certified ≥5-repetition
 protocol — indicative, not certified.
 
+**H8 — local NTFS relative final-name creates (registered 2026-07-31,
+unmeasured):** ADR 0048 caches one verified destination-parent handle per
+directory-affine worker/directory and opens plain-small final names with
+`NtCreateFile(RootDirectory=parent)`. This should reduce repeated absolute
+parent parsing on distinct-drive local NTFS copies without changing source
+opens, stream discovery, data I/O, completion, or any other transport. Bounded
+tests prove create-new collision safety, replacement validation reuse,
+metadata correctness, stale-parent refusal, hostile-component rejection, and
+selection isolation; they do not prove a speedup. The first approved run must
+compare the current implementation with an otherwise-identical absolute-open
+baseline and robocopy, use the certified quiesce/rotation protocol, and report
+results by directory shape because the one-parent-open amortization depends on
+files per directory.
+
 **H9 — single authoritative stamp for restamp destinations (registered
 2026-08-02, unmeasured on FAT media):** ADR 0054 drops the create-time stamp
 on every destination whose drivers rewrite time/archive fields during data
@@ -687,20 +701,6 @@ rejects both classification IOCTLs falls to the conservative 4-worker row;
 ADR 0031's data suggests 16–32 workers would roughly halve metadata-bound
 flood time — decide with data, not by loosening the conservative fallback
 blindly).
-
-**H8 — local NTFS relative final-name creates (registered 2026-07-31,
-unmeasured):** ADR 0048 caches one verified destination-parent handle per
-directory-affine worker/directory and opens plain-small final names with
-`NtCreateFile(RootDirectory=parent)`. This should reduce repeated absolute
-parent parsing on distinct-drive local NTFS copies without changing source
-opens, stream discovery, data I/O, completion, or any other transport. Bounded
-tests prove create-new collision safety, replacement validation reuse,
-metadata correctness, stale-parent refusal, hostile-component rejection, and
-selection isolation; they do not prove a speedup. The first approved run must
-compare the current implementation with an otherwise-identical absolute-open
-baseline and robocopy, use the certified quiesce/rotation protocol, and report
-results by directory shape because the one-parent-open amortization depends on
-files per directory.
 
 The elevated filesystem matrix, repeated-run certified benchmark protocol,
 ADR 0036 same-spindle HDD comparison, and ADR 0037's generic-UNC profile

@@ -22,13 +22,21 @@ direction or the other.
 
 A zero-cost sample distinguishes the classes: the remote volume probe
 already issues three handle-bound native volume queries at preflight, so
-timing them adds no I/O, and their minimum is a floor estimate of the
+timing them adds no I/O. [Amended 2026-08-02: the published sample is now
+the MAXIMUM of the three, not the minimum — the SMB redirector answers
+filesystem-attribute and volume-information queries from its tree-connect
+cache without touching the network, so a min-of-three collapses to local
+syscall cost on a real network share and would permanently dead-gate the
+striping this ADR exists to enable. One uncached answer reveals the network;
+on loopback all three run in tens of microseconds, so the maximum still
+classifies loopback correctly.] The sample is an estimate of the
 provider round trip.
 
 ## Decision
 
-- `VolumeInfo` gains `remote_query_latency: Option<Duration>` — the minimum
+- `VolumeInfo` gains `remote_query_latency: Option<Duration>` — the slowest
   of the three handle-bound native queries the remote probe already issues
+  (see the amendment above for why the maximum)
   (`bigcp-win::volume`); `None` for local volumes.
 - A pure policy `remote_source_striping(endpoint, latency)` in `core::copy`
   decides plain-small source locality once per run: WSL sources always

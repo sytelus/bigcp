@@ -141,24 +141,10 @@ pub fn run_copy(
         } else {
             // The locality clause makes the latency-gated dispatch decision
             // (remote_source_striping) visible in the log for later analysis.
-            let locality = match (
-                preflight.source_volume.endpoint.is_remote(),
+            let locality = locality_clause(
+                preflight.source_volume.endpoint,
                 preflight.source_volume.remote_query_latency,
-            ) {
-                (true, Some(latency))
-                    if remote_source_striping(preflight.source_volume.endpoint, Some(latency)) =>
-                {
-                    format!(
-                        "; source round trip ~{}us, striping small files across workers",
-                        latency.as_micros()
-                    )
-                }
-                (true, Some(latency)) => format!(
-                    "; source round trip ~{}us (loopback-class), keeping directory affinity",
-                    latency.as_micros()
-                ),
-                _ => String::new(),
-            };
+            );
             format!(
                 "remote topology: source={} destination={}; using bounded two-buffer read/write overlap and {} static redirector worker(s){locality}",
                 preflight.source_volume.endpoint.name(),
@@ -309,6 +295,7 @@ pub fn run_copy(
             supports_streams: preflight.source_volume.capabilities.named_streams,
             supports_eas: preflight.source_volume.capabilities.extended_attributes,
             is_wsl: preflight.source_volume.endpoint == EndpointKind::Wsl,
+            is_remote: preflight.source_volume.endpoint.is_remote(),
         },
         destination: DestinationCaps::from_policy(&destination_policy),
     });
@@ -713,8 +700,18 @@ fn worker_dispatch(
     preserve_sparse: bool,
 ) -> Option<WorkerDispatch> {
     let checkpoint_eligible = journal_available && unnamed_size >= checkpoint_threshold;
-    let redirector_stream =
-        transport.is_redirector() && (!journal_available || unnamed_size < checkpoint_threshold);
+    // Files in the WSL segmented band stay coordinator-inline: a worker-run
+    // segmented copy would hold up to SEGMENT_MAX per-thread chunk buffers
+    // per job, so 32 concurrent workers could exceed the documented I9
+    // aggregate (and any `mem=` budget) severalfold, and open far more
+    // concurrent provider handles than the measured two-handle knee ADR 0052
+    // sized SEGMENT_MAX against. Inline, exactly one segmented file runs at
+    // a time and the cost is the ADR's documented K × chunk.
+    let segmented_inline =
+        transport.is_wsl() && unnamed_size >= crate::engine::SEGMENT_THRESHOLD_BYTES;
+    let redirector_stream = transport.is_redirector()
+        && !segmented_inline
+        && (!journal_available || unnamed_size < checkpoint_threshold);
     if preserve_sparse
         || checkpoint_eligible
         || (unnamed_size >= large_threshold && !redirector_stream)
@@ -780,6 +777,27 @@ fn remote_source_striping(endpoint: EndpointKind, query_latency: Option<Duration
             query_latency.is_some_and(|latency| latency >= REMOTE_SOURCE_STRIPE_LATENCY_FLOOR)
         }
         EndpointKind::Local => false,
+    }
+}
+
+/// Renders the run-start locality clause of the non-WSL remote topology
+/// message: the source's measured round trip plus the latency-gated
+/// dispatch decision from [`remote_source_striping`], or an empty clause
+/// for a local (or unmeasured) source. Pure so the message builder and the
+/// tests share exactly one rendering of the decision.
+fn locality_clause(endpoint: EndpointKind, latency: Option<Duration>) -> String {
+    match (endpoint.is_remote(), latency) {
+        (true, Some(latency)) if remote_source_striping(endpoint, Some(latency)) => {
+            format!(
+                "; source round trip ~{}us, striping small files across workers",
+                latency.as_micros()
+            )
+        }
+        (true, Some(latency)) => format!(
+            "; source round trip ~{}us (loopback-class), keeping directory affinity",
+            latency.as_micros()
+        ),
+        _ => String::new(),
     }
 }
 
@@ -983,6 +1001,11 @@ impl Runner<'_> {
         if self.options.dry_run {
             return dispositions;
         }
+        // After a mid-run journal failure (`self.journal = None`) later
+        // directories classify nothing, so their live temps ARE counted as
+        // extras while identical temps in earlier directories were
+        // suppressed. Deliberate: with the journal gone the proof is gone,
+        // and over-reporting is the fail-safe direction.
         let Some(journal) = self.journal.as_mut() else {
             return dispositions;
         };
@@ -1003,34 +1026,65 @@ impl Runner<'_> {
             {
                 continue;
             }
-            let resumable = journal
-                .resume_temp_record(name)
-                .map(|(key, identity)| (key.to_owned(), identity.cloned()));
-            if let Some((key, identity)) = resumable {
-                let Some(final_path) =
-                    key_to_path(&key).filter(|path| path.parent() == Some(relative))
+            let resumable = journal.resume_temp_record(name).cloned();
+            if let Some(checkpoint) = resumable {
+                let Some(final_path) = key_to_path(&checkpoint.relative_path)
+                    .filter(|path| path.parent() == Some(relative))
                 else {
                     continue;
                 };
-                let source_has_final_file = final_path.file_name().is_some_and(|final_name| {
+                let source_child = final_path.file_name().and_then(|final_name| {
                     source_entries
                         .iter()
-                        .any(|child| child.name.as_os_str() == final_name)
+                        .find(|child| child.name.as_os_str() == final_name)
                 });
-                if source_has_final_file {
-                    dispositions.insert(name.to_owned(), ResumeTempDisposition::Live);
-                } else if let Some(identity) = identity {
-                    dispositions.insert(
-                        name.to_owned(),
-                        ResumeTempDisposition::Orphan {
-                            retire_key: Some(key),
-                            temp_identity: identity,
-                        },
-                    );
+                // Live requires resume to be GENUINELY reachable this run:
+                // the source child must still be a real file whose identity,
+                // size, and mtime equal the checkpointed source facts. A
+                // bare name match used to suppress the temp from extras
+                // forever even when nothing would ever consume it (source
+                // shrank below the large threshold and routes plain-small,
+                // source replaced by a directory, ...), understating extras
+                // permanently.
+                let checkpoint_matches_child = |child: &DirectoryEntry| {
+                    child.metadata.kind == ObjectKind::File
+                        && checkpoint.source_size == child.metadata.size
+                        && checkpoint.source_mtime == child.metadata.basic.last_write_time
+                        && checkpoint
+                            .source_identity
+                            .as_ref()
+                            .is_some_and(|identity| identity.matches(child.metadata.identity))
+                };
+                let engine_will_touch_temp = |child: &DirectoryEntry| {
+                    // A mismatched-but-large source file still reaches the
+                    // streamed engine, whose resume attempt discards the
+                    // stale temp itself; reclaiming here would race that
+                    // discard and misreport the leftover. Leave those
+                    // unclassified: they surface as ordinary extras only if
+                    // they survive the run.
+                    child.metadata.kind == ObjectKind::File
+                        && child.metadata.size >= self.options.large_threshold()
+                };
+                match source_child {
+                    Some(child) if checkpoint_matches_child(child) => {
+                        dispositions.insert(name.to_owned(), ResumeTempDisposition::Live);
+                    }
+                    Some(child) if engine_will_touch_temp(child) => {}
+                    _ => {
+                        if let Some(identity) = checkpoint.temp_identity {
+                            dispositions.insert(
+                                name.to_owned(),
+                                ResumeTempDisposition::Orphan {
+                                    retire_key: Some(checkpoint.relative_path),
+                                    temp_identity: identity,
+                                },
+                            );
+                        }
+                        // An identity-less version-one record can never be
+                        // proven: deliberately left unclassified (ordinary
+                        // extra, never deleted).
+                    }
                 }
-                // An identity-less version-one record can never be proven:
-                // deliberately left unclassified (ordinary extra, never
-                // deleted).
             } else if let Some(harvested) = journal.take_reclaimable_temp(name, relative) {
                 dispositions.insert(
                     name.to_owned(),
@@ -4183,6 +4237,30 @@ mod tests {
             EndpointKind::Local,
             Some(Duration::from_millis(5))
         ));
+    }
+
+    /// Pins the rendered run-start locality clause byte-for-byte: the log
+    /// line must name which dispatch decision the measured round trip
+    /// produced, and a local (or unmeasured) source must add no clause.
+    #[test]
+    fn remote_topology_locality_clause_names_the_decision() {
+        use std::time::Duration;
+
+        use super::{REMOTE_SOURCE_STRIPE_LATENCY_FLOOR, locality_clause};
+
+        // Network-class round trip: the clause names the striping decision.
+        assert_eq!(
+            locality_clause(EndpointKind::Unc, Some(REMOTE_SOURCE_STRIPE_LATENCY_FLOOR)),
+            "; source round trip ~250us, striping small files across workers"
+        );
+        // Loopback-class round trip: the clause names the kept affinity.
+        assert_eq!(
+            locality_clause(EndpointKind::Unc, Some(Duration::from_micros(60))),
+            "; source round trip ~60us (loopback-class), keeping directory affinity"
+        );
+        // Local source or an unmeasured remote one: no clause at all.
+        assert_eq!(locality_clause(EndpointKind::Local, None), String::new());
+        assert_eq!(locality_clause(EndpointKind::Unc, None), String::new());
     }
 
     #[test]

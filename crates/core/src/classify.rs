@@ -218,6 +218,49 @@ mod tests {
         ));
     }
 
+    /// Pins ADR 0054's interrupted-file detectability claim for full-length
+    /// unstamped partials: a copy interrupted after its data writes but
+    /// before the single authoritative `finish` stamp leaves a destination
+    /// of equal size whose driver-assigned last-write time sits beyond the
+    /// comparison quantum, so the rerun must classify Replace on the mtime
+    /// field alone (with the genuinely-newer destination reported).
+    #[test]
+    fn unstamped_full_length_partial_classifies_replace_on_restamp_destinations() {
+        // FAT family (2-second quantum): the driver stamp lands >2s after
+        // the source mtime, outside the quantum, so size-equal is not enough
+        // to call the partial complete.
+        let source = entry(4096, 20_000_000, 0, ObjectKind::File);
+        let unstamped = entry(4096, 60_000_000, 0, ObjectKind::File);
+        assert!(matches!(
+            classify(
+                &source,
+                Some(&unstamped),
+                true,
+                policy(FileSystem::Fat, false)
+            ),
+            Classification::Replace {
+                fields,
+                destination_newer: true,
+            } if fields == ["mtime"]
+        ));
+        // NTFS analogue: exact comparison, so even one driver tick beyond
+        // the source mtime keeps the full-length partial detectable.
+        let ntfs_source = entry(4096, 100, 0, ObjectKind::File);
+        let ntfs_unstamped = entry(4096, 101, 0, ObjectKind::File);
+        assert!(matches!(
+            classify(
+                &ntfs_source,
+                Some(&ntfs_unstamped),
+                true,
+                policy(FileSystem::Ntfs, true)
+            ),
+            Classification::Replace {
+                fields,
+                destination_newer: true,
+            } if fields == ["mtime"]
+        ));
+    }
+
     #[test]
     fn fat_policy_accepts_coarse_mtime_and_ignores_unrepresentable_metadata() {
         let mut source = entry(1, 20_000_000, 0x0000_2001, ObjectKind::File);

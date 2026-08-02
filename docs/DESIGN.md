@@ -42,9 +42,10 @@ report aggregates, and journal state.
 
 Plain small files use `DestinationFinal`: workers read and revalidate the
 source, then create or identity-check-and-truncate the final destination before
-one whole-buffer unnamed-stream write. FAT-family and remote files are
-restamped on that same handle after data I/O; WSL defers its projected stamp
-until that point instead of issuing a redundant initial Plan 9 metadata call.
+one whole-buffer unnamed-stream write. Destinations that require a post-write
+restamp (FAT-family, generic UNC, mapped remote, WSL) skip the create-time
+stamp entirely and receive one authoritative finish-time stamp on that same
+handle after data I/O (ADR 0054).
 New final names also skip a handle-metadata query because `CREATE_NEW` already
 proves the returned object was just created as a regular file. The exact local
 NTFS/ReFS policy retains its measured create-time stamp. Files
@@ -234,7 +235,7 @@ knowable; this endpoint branch does not alter local allocation behavior.
   suffixes and NUL-terminated Win32 strings cannot redirect a validated path.
 
 Known intentional differences from the governing plan are recorded inline at
-their PLAN.md sections and in the ADRs (0027–0052); there is no separate
+their PLAN.md sections and in the ADRs from 0027 onward; there is no separate
 deviations file.
 
 The terminal layer is a read-only projection of coordinator snapshots and

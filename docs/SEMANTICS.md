@@ -54,8 +54,9 @@ destination-representable EAs are read and
 source-revalidated before destination mutation. A new final name is created
 exclusively; a replacement is opened non-following, identity-checked on that
 same handle, and then truncated in place, preserving its security descriptor.
-The engine writes the one unnamed payload, revalidates the source, restamps it
-after data I/O on FAT-family and remote destinations, optionally flushes, and only then
+The engine writes the one unnamed payload, revalidates the source, stamps it
+once after data I/O on FAT-family and remote destinations — the only timestamp
+stamp those destinations receive — optionally flushes, and only then
 reports `copied`. A process kill can leave an incomplete
 final-named plain file, but a mid-write file is shorter than the source and a
 completed whole-buffer write has already completed its logical data.

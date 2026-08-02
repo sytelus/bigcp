@@ -1,6 +1,8 @@
 # ADR 0031: Create-time timestamp stamping and destination-led worker counts
 
-**Status:** Accepted; late auxiliary stamp branch superseded by ADR 0034
+**Status:** Accepted; late auxiliary stamp branch superseded by ADR 0034;
+create-time stamp scope narrowed by ADR 0054 (post-write-restamp destinations
+no longer stamp at create)
 
 ## Context
 
@@ -20,7 +22,11 @@ worker composition let one low-confidence Unknown-profiled side drag a
    `create_time_stamp_survives_writes_in_sandbox` regression test), so the
    stamp coalesces into the create's MFT window. ADR 0034 later routed files
    carrying ADS or EAs through transactional temp publication, so the direct
-   path now always uses this create-time stamp. Crash repair rides the size
+   path now always uses this create-time stamp. [Amendment 2026-08-02:
+   ADR 0054 narrowed that scope — destinations requiring a post-write restamp
+   (FAT-family, generic UNC, mapped remote, WSL) skip the create-time stamp
+   and receive only the finish-time stamp; strict local NTFS/ReFS keep this
+   fast path unchanged.] Crash repair rides the size
    check: every
    mid-write interruption is shorter than the source; once the full unnamed
    payload and early metadata have landed, the ordinary file content is

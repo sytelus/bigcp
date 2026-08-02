@@ -271,17 +271,24 @@ fn probe_remote_volume(root: PathBuf, endpoint: EndpointKind) -> io::Result<Volu
     } else {
         endpoint
     };
-    // Time each query the probe must issue anyway; the minimum of the three
-    // is the round-trip floor published as `remote_query_latency`.
+    // Time each query the probe must issue anyway; the SLOWEST of the three
+    // is published as `remote_query_latency`. The maximum, not the minimum:
+    // the SMB redirector answers filesystem-attribute and volume-information
+    // queries from its tree-connect cache without touching the network, so a
+    // min-of-three would collapse to local syscall cost on a real network
+    // share and permanently dead-gate the latency-aware scheduling that
+    // consumes this sample. One uncached answer is enough to reveal the
+    // network; on loopback all three run in tens of microseconds, so the
+    // maximum still classifies it correctly.
     let started = std::time::Instant::now();
     let attributes = query_remote_attributes(&handle)?;
     let mut latency = started.elapsed();
     let started = std::time::Instant::now();
     let serial = query_remote_serial(&handle)?;
-    latency = latency.min(started.elapsed());
+    latency = latency.max(started.elapsed());
     let started = std::time::Instant::now();
     let size = query_remote_struct::<FILE_FS_SIZE_INFORMATION>(&handle, FileFsSizeInformation)?;
-    latency = latency.min(started.elapsed());
+    latency = latency.max(started.elapsed());
     let bytes_per_sector = size.BytesPerSector;
     let cluster_size = u64::from(size.SectorsPerAllocationUnit)
         .checked_mul(u64::from(bytes_per_sector))

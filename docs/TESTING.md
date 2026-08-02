@@ -171,7 +171,11 @@ handle path, and deferred final stamp (ADRs 0045/0046/0052).
 
 Live generic-SMB, mapped-drive, or WSL source/destination tests need an
 operator-approved scratch endpoint whose exact share/distribution path is named
-in advance. They may create only a unique test-owned subtree, must use the same
+in advance. Two endpoints are already operator-approved for manual indicative
+runs: `\\wsl.localhost\u2\tmp\bigcp-bench` and the loopback `\\localhost\C$`
+path into the session scratch area; certified runs on either must also record
+the signing/encryption/compression fields required below.
+They may create only a unique test-owned subtree, must use the same
 small routine write budget unless separately approved as heavy, and must never
 reuse an existing user-data tree. A read-only WSL source dry-run may establish
 provider query/enumeration compatibility but does not establish write-path or

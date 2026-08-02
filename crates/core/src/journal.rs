@@ -186,6 +186,9 @@ struct LoadedState {
     valid_length: u64,
     active_job: Option<JobSignature>,
     skipped_records: u64,
+    /// Complete lines seen so far; the future-version refusal fires only on
+    /// the first one (see `apply_loaded_line`).
+    records_seen: u64,
 }
 
 impl LoadedState {
@@ -478,19 +481,10 @@ impl Journal {
     /// provably orphaned (reclaimable only under the identity proof), and
     /// unproven (reported, never deleted).
     #[must_use]
-    pub(crate) fn resume_temp_record(
-        &self,
-        name: &str,
-    ) -> Option<(&str, Option<&CheckpointFileIdentity>)> {
+    pub(crate) fn resume_temp_record(&self, name: &str) -> Option<&Checkpoint> {
         self.resumable
             .values()
             .find(|checkpoint| checkpoint.temp_name == name)
-            .map(|checkpoint| {
-                (
-                    checkpoint.relative_path.as_str(),
-                    checkpoint.temp_identity.as_ref(),
-                )
-            })
     }
 
     /// Removes and returns the harvested orphan record for one destination
@@ -576,12 +570,22 @@ fn read_bounded_record(reader: &mut impl BufRead) -> std::io::Result<Option<(Vec
 /// otherwise misfile every real `j: 2` record as generic corruption — the
 /// version refusal would be unreachable and a newer build's journal would be
 /// silently skipped or truncated instead of preserved.
+///
+/// The refusal fires only on the journal's FIRST record: a genuine
+/// newer-build journal begins with that build's Job header, while a single
+/// bit-flipped `j` inside an interior record — whose CRC would have failed
+/// anyway — must not abort the whole load and disable checkpointing for the
+/// run when every other single-record corruption is merely skipped or
+/// tail-truncated. Interior future-version markers fall through to the CRC
+/// filter, which never trusts them.
 fn apply_loaded_line(
     raw: &[u8],
     oversized: bool,
     is_last: bool,
     state: &mut LoadedState,
 ) -> Result<bool, BigcpError> {
+    let first_record = state.records_seen == 0;
+    state.records_seen = state.records_seen.saturating_add(1);
     let line = raw.strip_suffix(b"\n").unwrap_or(raw);
     let line = line.strip_suffix(b"\r").unwrap_or(line);
     let parsed = if oversized {
@@ -591,7 +595,10 @@ fn apply_loaded_line(
             Err(_) => None,
             Ok(value) => {
                 let version = value.get("j").and_then(serde_json::Value::as_u64);
-                if version.is_some_and(|found| found != u64::from(crate::JOURNAL_SCHEMA_VERSION)) {
+                if first_record
+                    && version
+                        .is_some_and(|found| found != u64::from(crate::JOURNAL_SCHEMA_VERSION))
+                {
                     return Err(BigcpError::Format(format!(
                         "unsupported journal version {}; this build supports {}",
                         version.unwrap_or_default(),
@@ -807,7 +814,35 @@ mod tests {
         let future = b"{\"j\":2,\"ev\":\"novel_record\",\"payload\":true,\"crc\":\"00000000\"}\n";
         assert!(fs::write(&path, future).is_ok());
         assert!(Journal::open(path.clone(), false).is_err());
-        assert_eq!(fs::read(path).ok(), Some(future.to_vec()));
+        assert_eq!(fs::read(&path).ok(), Some(future.to_vec()));
+
+        // An INTERIOR future-version marker is a different animal: a genuine
+        // newer-build journal declares itself in its first record, so a lone
+        // interior `j` mismatch (a bit-flipped byte whose CRC cannot match)
+        // is ordinary corruption — skipped like any other bad record, never
+        // a whole-file refusal that would disable checkpointing for the run.
+        let first = super::encode_record(&JournalEvent::End {
+            run_id: "one".to_owned(),
+        });
+        let last = super::encode_record(&JournalEvent::End {
+            run_id: "two".to_owned(),
+        });
+        assert!(first.is_ok() && last.is_ok());
+        let (Some(first), Some(last)) = (first.ok(), last.ok()) else {
+            return;
+        };
+        let mut mixed = first;
+        mixed
+            .extend_from_slice(b"{\"j\":9,\"ev\":\"end\",\"run_id\":\"x\",\"crc\":\"00000000\"}\n");
+        mixed.extend_from_slice(&last);
+        let interior = directory.path().join("interior.jsonl");
+        assert!(fs::write(&interior, &mixed).is_ok());
+        let journal = Journal::open(interior.clone(), false);
+        assert!(journal.is_ok());
+        assert_eq!(journal.ok().map(|value| value.skipped_records()), Some(1));
+        // The file itself is untouched: the corrupt interior line is
+        // retained on disk, never truncated away with the valid tail.
+        assert_eq!(fs::read(interior).ok(), Some(mixed));
     }
 
     #[test]

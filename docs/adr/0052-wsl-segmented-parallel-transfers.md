@@ -81,6 +81,14 @@ named-stream-bearing, and resume-candidate files are untouched. UNC, local,
 and same-spindle transports are byte-for-byte unchanged — `copy_streamed`
 remains the fallback for every other modality.
 
+[Noted 2026-08-02: a segment-writer re-arm failure, or a process kill inside
+the brief disarm/re-arm window (opened up to K times per segmented file),
+can leave the opaque temp alive without a journal checkpoint. Segmented
+files are structurally checkpoint-ineligible, so ADR 0051's reclamation
+proof can never cover such an orphan: it is reported as a destination extra
+on every rerun, never deleted — harmless, but permanent until removed by
+hand.]
+
 ## Validation
 
 Pure tests pin the planner and the mechanics:

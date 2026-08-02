@@ -27,7 +27,9 @@ artifact role, or resource budget weaker than its public description.
   report may remain ordinary children of the state directory, but neither may
   be its ancestor or container.
 - On standard transport, reserve one coordinator chunk from `mem` before
-  deriving the threshold-sized worker count. Same-spindle transport retains a
+  deriving the threshold-sized worker count. [Amendment 2026-08-02: ADR 0055's
+  two-buffer large-stream pipeline raised this reservation to the two
+  pipelined coordinator chunks.] Same-spindle transport retains a
   single direct burst cap because coordinator work drains the phased worker
   before starting.
 - Replay journals with one-record lookahead, preserving the existing torn-tail

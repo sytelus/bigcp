@@ -784,7 +784,9 @@ mod tests {
             return;
         };
         assert_eq!(summary.failed, 0, "mismatches: {:?}", summary.mismatches);
-        assert!(summary.passed > 0);
+        // The fixture holds exactly five verified entities: the root pair,
+        // the `sub` directory pair, and the three file pairs.
+        assert_eq!(summary.passed, 5);
     }
 
     #[test]
@@ -801,7 +803,10 @@ mod tests {
         let Some(summary) = verified(source, destination) else {
             return;
         };
-        assert!(summary.failed >= 1);
+        // Exactly the rewritten file fails; the root, `sub`, and the two
+        // untouched files still pass.
+        assert_eq!(summary.failed, 1, "mismatches: {:?}", summary.mismatches);
+        assert_eq!(summary.passed, 4);
         assert!(
             summary
                 .mismatches
@@ -824,7 +829,10 @@ mod tests {
         let Some(summary) = verified(source, destination) else {
             return;
         };
-        assert!(summary.failed >= 1);
+        // Exactly the removed file fails; the root, the restamped `sub`,
+        // and the two remaining files still pass.
+        assert_eq!(summary.failed, 1, "mismatches: {:?}", summary.mismatches);
+        assert_eq!(summary.passed, 4);
         assert!(
             summary
                 .mismatches
@@ -846,7 +854,10 @@ mod tests {
         let Some(summary) = verified(source, destination) else {
             return;
         };
-        assert!(summary.failed >= 1);
+        // Exactly the destination-only file fails; all five matched
+        // entities (root, `sub`, three files) still pass.
+        assert_eq!(summary.failed, 1, "mismatches: {:?}", summary.mismatches);
+        assert_eq!(summary.passed, 5);
         assert!(
             summary
                 .mismatches
