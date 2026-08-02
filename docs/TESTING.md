@@ -163,9 +163,11 @@ classification, mapped-drive effective policy, exact WSL name keys, projected
 metadata, remote profiles, redirector error categories, two-buffer ordering and
 actual stage overlap, short-I/O accounting, cancellation, memory budgets, and
 the checkpoint/sparse worker-dispatch boundary. WSL-specific pure tests also
-pin its distinct transport/audit value, independent 8 MiB/16-worker row,
-destination-create striping without local-affinity regression, sequential
-handle path, and deferred final stamp (ADRs 0045/0046).
+pin its distinct transport/audit value, independent 8 MiB/32-worker row,
+either-side small-file striping without local-affinity regression, the
+segmented-transfer planner and its identity-proven segment writers (local
+files under a WSL transport profile — no real endpoint needed), sequential
+handle path, and deferred final stamp (ADRs 0045/0046/0052).
 
 Live generic-SMB, mapped-drive, or WSL source/destination tests need an
 operator-approved scratch endpoint whose exact share/distribution path is named

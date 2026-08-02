@@ -6,9 +6,11 @@
 |---|---|
 | `crates/win/src/endpoint.rs`, `path.rs`, `metadata.rs`, `volume.rs`, `device.rs`, `extents.rs`, `lock.rs`, `util.rs` | Local/UNC/WSL classification, lossless paths, 128/64-bit handle identity, fast/fallback 256 KiB enumeration, local/handle-bound-remote volume facts, query-only local device/extent facts, run lock, shared fail-closed helpers. |
 | `crates/win/src/file.rs`, `streams.rs`, `ea.rs`, `sparse.rs`, `reparse.rs`, `security.rs` | Read-only source and capability-bearing destination primitives; the only unsafe boundary. Interrupted reads are retried here; native/provider lengths, EA records, sparse ranges, and stream suffixes are validated before core sees them. |
+| `crates/win/src/console.rs` | Process-global latched Ctrl+C/Ctrl+Break cancel flag: the first cancel is absorbed so the run can stop gracefully, the second falls through to default termination; close/logoff/shutdown signals are never absorbed. |
 | `crates/core/src/model.rs`, `options.rs`, `filesystem.rs`, `classify.rs`, `copy.rs`, `transport.rs`, `worker.rs`, `engine.rs` | Work model, validated options, immutable source/destination semantic policy, endpoint-aware join, terminal outcomes, isolated standard/generic-redirector/WSL/same-spindle transports, bounded scheduling, direct-plain-small and transactional auxiliary/sparse/large copy. |
 | `crates/core/src/artifact.rs`, `journal.rs`, `audit.rs`, `report.rs`, `stats.rs`, `devprofile.rs` | Shared exact-handle artifact publication, one-record-lookahead resume replay, disjoint public artifact roles, throughput windows, and exact static-profile buffer budgets. |
 | `crates/core/src/verify.rs` | Post-copy and standalone verification. |
+| `crates/core/src/phase.rs`, `error.rs` | Run-owned phase-timing accumulators behind the named `PHASE_*` indices, and the typed error categories/hints mirrored by `docs/ERRORS.md`. |
 | `crates/tui` | Immutable-snapshot live UI and saved report browser. |
 | `crates/cli` | Grammar, option validation, exit mapping. |
 | `crates/testkit` | Structurally confined generator and independent oracle. |
@@ -58,6 +60,15 @@ of MSVC/SDK. Do not bake an installed minor version into project files.
 4. Update `docs/ERRORS.md` and report/log schemas if their enum is closed.
 5. Test raw-code classification and grouping by top-level folder.
 
+### Add or change a tune key
+
+`--tune` keys parse in `crates/cli/src/main.rs` (syntax and positivity only);
+the real bounds live in `core::devprofile::validate_tuning` and the
+transport-specific memory accounting. The README "Copy flags" section is the
+single normative user-facing list of keys, bounds, and budget rules — update
+it in the same commit, and keep other documents pointing at it rather than
+repeating the numbers.
+
 ### Add a scenario field
 
 Keep every path relative and pass it through `SandboxRoot::child`. Add checked
@@ -86,8 +97,10 @@ Journal records are not user reports. Each line contains version, tagged event,
 and CRC. Replay retains one line of lookahead and at most one MiB of any one
 record; it streams past an oversized record without allocating its full size.
 A torn/invalid last line is truncated; an invalid interior line is skipped
-without trusting it or deleting later valid records; an unsupported version is
-left untouched and disables checkpointing for that run. A new checkpoint
+without trusting it or deleting later valid records; an unsupported version
+(refused on the raw `j` field, before the CRC filter) or a transient read
+error during loading leaves the file untouched and disables checkpointing for
+that run. A new checkpoint
 records a temp sibling, source and temp filesystem identities, stream key,
 source size/mtime, watermark, and prefix digest. Older identity-less records
 load but cannot authorize resume. Never repair a journal manually or infer
@@ -147,9 +160,14 @@ replacements, warnings, grouped failures, extras, hints, and verification.
   buffers; one synchronous source read overlaps one destination write, and
   only non-checkpointed independent streams may use parallel workers.
 - **WSL transport:** the separate Plan 9 profile reuses the ordered two-buffer
-  mechanics, uses its own 8 MiB/16-worker constants, stripes WSL destination
-  creates, marks destination handles sequential, and stamps projected metadata
-  only after data. Keep those choices behind `EndpointKind::Wsl`; never spread
+  mechanics, uses its own measured 8 MiB/32-worker constants, stripes
+  plain-small dispatch when either endpoint is WSL, marks destination handles
+  sequential, and stamps projected metadata only after data. Eligible large
+  one-sided WSL files move as bounded parallel segments: selection and
+  transfer live in `core::engine` (`segment_plan`/`copy_streamed_segmented`),
+  the identity-proven reopen mechanics in `bigcp-win::file`
+  (`SegmentWriter`); ADR 0052 records the eligibility list and measurements.
+  Keep those choices behind `EndpointKind::Wsl`; never spread
   WSL checks into the standard or generic-UNC data loops.
 - **FMEA:** explicit failure-mode/effect analysis behind crash invariants.
 - **Reparse point:** filesystem object carrying a tagged buffer (symlink,
@@ -162,8 +180,9 @@ replacements, warnings, grouped failures, extras, hints, and verification.
   overlapped ring, ADR 0027, and the unbuffered reader/writer pair, ADR
   0028). No completion ring exists: the standard transport is a sequential
   buffered chunk loop, ADR 0036 adds bounded synchronous same-spindle phases,
-  ADR 0045 adds a fixed two-buffer redirector pipeline, and ADR 0046 gives WSL
-  its own profile and scheduling seam over that pipeline (PLAN §5.8–§5.9).
+  ADR 0045 adds a fixed two-buffer redirector pipeline, ADR 0046 gives WSL
+  its own profile and scheduling seam over that pipeline, and ADR 0052 adds
+  WSL's measured segmented parallel large-file transfers (PLAN §5.8–§5.9).
 
 ## Release checklist
 

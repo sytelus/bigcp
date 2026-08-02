@@ -31,6 +31,19 @@ destination creates, sequential hints, and fewer metadata round trips. ADR
 set while preserving the remaining exclusions and `--include-system`. ADR
 0048 gives distinct-drive local NTFS plain-small workers a verified, one-entry
 destination-parent handle cache and native relative child creates; all other
-filesystem, endpoint, topology, and completion paths remain unchanged.
+filesystem, endpoint, topology, and completion paths remain unchanged. ADR
+0049 adds a process-global console cancel handler (first Ctrl+C/Ctrl+Break
+graceful, second escalates) plus `--accept-write-cache-policy`, keeping that
+acceptance CLI-only because the Quick-removal notice is performance advice,
+not a fidelity gate. ADR 0050 makes a failed `--flush` best-effort poison the
+destination's last-write stamp so the rerun's skip heuristic detects and
+replaces the possibly-non-durable file instead of skipping it forever. ADR
+0051 reclaims orphaned resume temporaries only under a four-part journal
+proof (opaque shape, recorded name, recorded identity, handle-verified
+identity match) while everything unproven stays reported and is never
+deleted. ADR 0052 amends ADR 0046 with measured WSL values: 32 workers,
+striping on either WSL side, segmented parallel identity-verified transfers
+for eligible large one-sided WSL files, and three per-file round-trip cuts,
+while keeping 0046's chunk window, sequential hints, and deferred stamp.
 
 The index is filename ordered. `docs/MAINTENANCE.md` maps decisions to code and release checks.

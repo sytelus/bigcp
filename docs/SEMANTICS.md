@@ -13,7 +13,12 @@ on FAT, and within the 10-millisecond interval on exFAT. Differences only in the
 creation time are repaired without rewriting data. Any size or last-write
 difference is replaced unless `--replace=false`. Large-file publication is
 atomic; small-file replacement is direct and recoverable by rerun. Destination-only
-objects are extras and are never changed. A file/directory/reparse type conflict
+objects are extras and are never changed, with one narrow exception: an
+orphaned `.bigcp-….part` resume temporary is deleted by a real (never dry)
+run only when this destination's journal records both its name and its
+filesystem identity and the opened file matches that identity — proof that
+bigcp itself created it; look-alikes that cannot be proven remain reported
+extras. A file/directory/reparse type conflict
 fails and is never auto-resolved.
 
 Named-stream divergence and same-length EA payload divergence are not queried
@@ -65,7 +70,17 @@ prevents a partially written stream/EA set from becoming visible under the
 final name. Checkpointed partials may persist under opaque
 names, but resume never trusts them: current source size/mtime, source and
 temporary filesystem identities, and the exact temp-prefix digest must match.
-Legacy identity-less checkpoint records are parseable but restart from zero.
+Legacy identity-less checkpoint records are parseable but restart from zero;
+they are also never reclaimed, because only an identity-bearing record can
+prove an orphaned partial is bigcp's own.
+
+On either path, a requested per-file flush that fails is a reported failure.
+Because size and last-write time already match the source at that point,
+bigcp additionally re-stamps the destination's last-write time (best effort,
+on the same handle) to a sentinel value so the skip heuristic cannot classify
+the possibly-non-durable file as `Same`; the rerun replaces it and retries
+the flush. If the device is already gone that restamp can fail too; recovery
+remains reconnect, rerun, and standalone verification.
 
 ## Streams, EAs, sparse files, EFS, and reparse points
 

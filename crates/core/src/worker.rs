@@ -15,13 +15,12 @@ use bigcp_win::{FileIdentity, RelativeDirectory, StreamInfo};
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::engine::{
-    EngineRequest, EngineResult, PreparedPlainSmall, SmallPreparation, WrittenPlainSmall,
-    copy_file, finish_plain_small, prepare_plain_small, write_plain_small,
+    EngineRequest, EngineResult, EngineSettings, PreparedPlainSmall, SmallPreparation,
+    WrittenPlainSmall, copy_file, finish_plain_small, prepare_plain_small, write_plain_small,
 };
 use crate::error::{BigcpError, OperationError};
 use crate::model::{Counters, EntrySnapshot};
 use crate::phase::PhaseTracker;
-use crate::transport::TransportProfile;
 
 /// Replacement decision facts retained until coordinator finalization.
 pub(crate) struct ReplacementWork {
@@ -41,24 +40,9 @@ pub(crate) struct FileCopyJob {
     pub source_snapshot: EntrySnapshot,
     pub destination_snapshot: Option<EntrySnapshot>,
     pub replacement: Option<ReplacementWork>,
-    pub run_id: String,
-    pub large_threshold: u64,
-    pub verify: bool,
-    pub flush: bool,
-    pub source_supports_streams: bool,
-    pub source_supports_eas: bool,
-    pub destination_supports_streams: bool,
-    pub destination_supports_eas: bool,
-    pub destination_supports_encryption: bool,
-    pub destination_supports_preallocation: bool,
-    pub destination_supports_persistent_acls: bool,
-    pub destination_supports_posix_unlink_rename: bool,
+    /// Run-constant engine settings shared with the coordinator.
+    pub settings: Arc<EngineSettings>,
     pub destination_metadata: bigcp_win::BasicMetadata,
-    pub destination_requires_post_write_stamp: bool,
-    pub destination_is_wsl: bool,
-    pub chunk_bytes: usize,
-    pub transport: TransportProfile,
-    pub checkpoint_threshold: u64,
     /// Known stream set, or None for the fast-dispatch path: the engine
     /// discovers streams itself at open, keeping the coordinator probe-free.
     pub streams: Option<Vec<StreamInfo>>,
@@ -89,25 +73,9 @@ impl FileCopyJob {
             relative_path: &self.source_snapshot.relative_path,
             source_snapshot: &self.source_snapshot,
             replacement_snapshot: self.destination_snapshot.as_ref(),
-            run_id: &self.run_id,
-            large_threshold: self.large_threshold,
-            verify: self.verify,
-            flush: self.flush,
-            source_supports_streams: self.source_supports_streams,
-            source_supports_eas: self.source_supports_eas,
-            destination_supports_streams: self.destination_supports_streams,
-            destination_supports_eas: self.destination_supports_eas,
-            chunk_bytes: self.chunk_bytes,
-            transport: self.transport,
+            settings: &self.settings,
             preserve_sparse: false,
-            checkpoint_threshold: self.checkpoint_threshold,
-            destination_supports_encryption: self.destination_supports_encryption,
-            destination_supports_preallocation: self.destination_supports_preallocation,
-            destination_supports_persistent_acls: self.destination_supports_persistent_acls,
-            destination_supports_posix_unlink_rename: self.destination_supports_posix_unlink_rename,
             destination_metadata: self.destination_metadata,
-            destination_requires_post_write_stamp: self.destination_requires_post_write_stamp,
-            destination_is_wsl: self.destination_is_wsl,
             known_streams: self.streams.as_deref(),
             cancel: self.cancel.as_ref(),
             promote_threshold: self.promote_threshold,
@@ -202,6 +170,21 @@ pub(crate) struct FileWorkers {
 /// hundred KiB per worker, firmly bounded).
 const PER_WORKER_QUEUE: usize = 1024;
 
+/// Maps a coordinator shard value to a worker queue index.
+///
+/// The stability of this mapping *is* the directory-affinity contract: the
+/// same shard (parent directory) must always land on the same worker queue,
+/// or same-directory NTFS creates interleave across workers and the
+/// directory-index convoy the sharding exists to prevent returns (PLAN
+/// section 5.8, BENCHMARKS.md 2026-07-29).
+const fn route_shard(shard: usize, worker_count: usize) -> usize {
+    shard % worker_count_floor(worker_count)
+}
+
+const fn worker_count_floor(worker_count: usize) -> usize {
+    if worker_count == 0 { 1 } else { worker_count }
+}
+
 impl FileWorkers {
     /// Starts the static profile's bounded file workers.
     pub fn new(
@@ -262,7 +245,7 @@ impl FileWorkers {
         job: FileCopyJob,
         shard: usize,
     ) -> Result<Option<FileCopyJob>, BigcpError> {
-        let index = shard % self.senders.len().max(1);
+        let index = route_shard(shard, self.senders.len());
         let Some(sender) = self.senders.get(index) else {
             return Err(BigcpError::Invariant(
                 "file workers already stopped".to_owned(),
@@ -546,14 +529,31 @@ mod tests {
     /// see PLAN section 5.8 and BENCHMARKS.md (2026-07-29) before changing.
     #[test]
     fn shard_routing_is_stable_per_directory() {
+        // Same shard → same queue, every time.
+        assert_eq!(super::route_shard(41, 8), super::route_shard(41, 8));
+        // Distinct shards spread across the queues by modulo.
+        assert_eq!(super::route_shard(0, 8), 0);
+        assert_eq!(super::route_shard(9, 8), 1);
+        assert_eq!(super::route_shard(15, 8), 7);
+        // One phased same-spindle worker receives everything.
+        assert_eq!(super::route_shard(41, 1), 0);
+        // The zero floor cannot divide by zero even on a stopped pool.
+        assert_eq!(super::route_shard(41, 0), 0);
+    }
+
+    #[test]
+    fn worker_pool_bounds_are_enforced_at_construction() {
+        assert!(FileWorkers::new(0, None).is_err());
+        assert!(FileWorkers::new(257, None).is_err());
+        // Same-spindle phased scheduling requires exactly one worker; any
+        // other count silently defeats the topology policy.
+        assert!(FileWorkers::new(2, Some(1024 * 1024)).is_err());
         let workers = FileWorkers::new(8, None);
         assert!(workers.is_ok());
         let Some(workers) = workers.ok() else {
             return;
         };
         assert_eq!(workers.senders.len(), 8);
-        // Same shard, same queue; distinct shards spread by modulo.
-        assert_eq!(41 % workers.senders.len(), 41 % 8);
         assert_eq!(workers.capacity(), 8 * super::PER_WORKER_QUEUE);
     }
 }

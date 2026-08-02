@@ -4,6 +4,11 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// Default large-file threshold shared by [`CopyOptions::large_threshold`]
+/// and the profile memory-budget math in `devprofile`, so the two can never
+/// drift apart.
+pub(crate) const DEFAULT_LARGE_THRESHOLD: u64 = 16 * 1024 * 1024;
+
 /// Static device classes from PLAN.md section 8.2.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -132,10 +137,16 @@ impl CopyOptions {
     /// machines VISION targets) rather than at the older 4 MiB citation.
     #[must_use]
     pub fn large_threshold(&self) -> u64 {
-        self.tune.large_threshold.unwrap_or(16 * 1024 * 1024)
+        self.tune.large_threshold.unwrap_or(DEFAULT_LARGE_THRESHOLD)
     }
 
     /// Returns the configured checkpoint threshold.
+    ///
+    /// A value below [`Self::large_threshold`] is legal (the e2e suite uses
+    /// one to exercise checkpointing with small fixtures). The engine must
+    /// therefore never assume checkpoint-eligible streams are also
+    /// large-threshold streams — in particular, every checkpoint-eligible
+    /// stream needs its own in-flight hasher regardless of size.
     #[must_use]
     pub fn checkpoint_threshold(&self) -> u64 {
         self.tune

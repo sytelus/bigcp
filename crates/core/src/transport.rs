@@ -165,6 +165,13 @@ enum ReadPacket {
 /// more than that bounded window ahead of the committed destination prefix.
 /// `consume` runs in write order on the caller thread, which lets the semantic
 /// engine retain its ordinary contiguous hashing and checkpoint boundaries.
+///
+/// INVARIANT for checkpoint callers: `consume` (hashing) runs *before* the
+/// corresponding write is confirmed, so the in-flight digest may be ahead of
+/// the durable destination prefix mid-segment. A checkpoint recorded from the
+/// live hasher inside a segment would attest bytes that may never have been
+/// written — checkpoints must only be appended after this function returns
+/// `Ok` for the whole segment ending at the boundary.
 pub(crate) fn transfer_pipelined<R, W, F>(
     source: &mut R,
     destination: &mut W,

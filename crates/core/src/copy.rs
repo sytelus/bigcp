@@ -6,7 +6,7 @@
 //! enumeration begins.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::hash::{Hash, Hasher};
@@ -17,12 +17,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use bigcp_win::{
-    DestinationLock, DestinationStream, DirectoryEntry, EndpointKind, FileIdentity, FileSystem,
-    ObjectKind, ObjectMetadata, SourceStream, VolumeInfo, absolute_extended, classify_endpoint,
-    clear_extended_attributes_checked, comparison_key, copy_reparse, create_directory,
-    display_path, enumerate_directory, final_path, is_cloud_placeholder, is_compressed,
-    is_same_or_descendant_with, is_sparse, list_streams, metadata_at, open_root, probe_volume,
-    read_extended_attributes_checked, set_basic_at_checked, write_extended_attributes_checked,
+    DestinationLock, DestinationStream, DestinationTemp, DirectoryEntry, EndpointKind,
+    FileIdentity, FileSystem, ObjectKind, ObjectMetadata, SourceStream, VolumeInfo,
+    absolute_extended, classify_endpoint, clear_extended_attributes_checked, comparison_key,
+    copy_reparse, create_directory, display_path, enumerate_directory, final_path,
+    is_cloud_placeholder, is_compressed, is_same_or_descendant_with, is_sparse, list_streams,
+    metadata_at, open_root, probe_volume, read_extended_attributes_checked, set_basic_at_checked,
+    write_extended_attributes_checked,
 };
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
@@ -32,10 +33,12 @@ use crate::REPORT_SCHEMA_VERSION;
 use crate::audit::{AuditEvent, AuditPath, AuditWriter, ReplacementEvent, option_summary};
 use crate::classify::classify;
 use crate::devprofile::{CopyProfile, select_copy_profile};
-use crate::engine::{EngineRequest, copy_file};
+use crate::engine::{
+    DestinationCaps, EngineRequest, EngineSettings, EngineTuning, SourceCaps, copy_file,
+};
 use crate::error::{BigcpError, ErrorCategory, OperationError};
 use crate::filesystem::FilesystemPolicy;
-use crate::journal::{Journal, JournalEvent, path_key};
+use crate::journal::{CheckpointFileIdentity, Journal, JournalEvent, key_to_path, path_key};
 use crate::model::{Classification, Counters, EntrySnapshot, FileOutcome, RunSnapshot, RunState};
 use crate::options::CopyOptions;
 use crate::phase::PhaseTracker;
@@ -129,16 +132,11 @@ pub fn run_copy(
     {
         let message = if preflight.profile.transport.is_wsl() {
             format!(
-                "WSL Plan 9 topology: source={} destination={}; using bounded two-buffer overlap, {} MiB requests, and {} static worker(s){}",
+                "WSL Plan 9 topology: source={} destination={}; using bounded two-buffer overlap, {} MiB requests, and {} static worker(s) with striped small-file dispatch",
                 preflight.source_volume.endpoint.name(),
                 preflight.destination_volume.endpoint.name(),
                 preflight.profile.chunk_bytes / (1024 * 1024),
                 preflight.profile.workers,
-                if preflight.destination_volume.endpoint == EndpointKind::Wsl {
-                    " with striped destination creates"
-                } else {
-                    ""
-                }
             )
         } else {
             format!(
@@ -255,13 +253,10 @@ pub fn run_copy(
         }
     };
 
-    let root_metadata = metadata_at(&preflight.source)
-        .map_err(|error| BigcpError::io("read source root metadata", error))?;
-    if root_metadata.kind != ObjectKind::Directory {
-        return Err(BigcpError::Invalid(
-            "source must resolve to a real directory, not a file or reparse point".to_owned(),
-        ));
-    }
+    // Pre-flight already read and validated the source root's metadata (a
+    // real directory) moments ago through the pinned root; re-reading it here
+    // was a duplicate metadata round trip that could prove nothing more.
+    let root_metadata = preflight.source_root_metadata.clone();
 
     let worker_cancel = Arc::new(AtomicBool::new(false));
     let relative_ntfs_creates = should_use_relative_ntfs_creates(
@@ -280,17 +275,30 @@ pub fn run_copy(
             .is_same_spindle()
             .then_some(preflight.profile.transport.burst_bytes),
     )?;
+    let settings = Arc::new(EngineSettings {
+        run_id: run_id.clone(),
+        tuning: EngineTuning {
+            chunk_bytes: preflight.profile.chunk_bytes,
+            large_threshold: options.large_threshold(),
+            checkpoint_threshold: options.checkpoint_threshold(),
+            transport: preflight.profile.transport,
+            verify: options.verify,
+            flush: options.flush,
+        },
+        source: SourceCaps {
+            supports_streams: preflight.source_volume.capabilities.named_streams,
+            supports_eas: preflight.source_volume.capabilities.extended_attributes,
+            is_wsl: preflight.source_volume.endpoint == EndpointKind::Wsl,
+        },
+        destination: DestinationCaps::from_policy(&destination_policy),
+    });
     let mut runner = Runner {
         options,
         observer,
-        run_id: &run_id,
+        settings,
         source_root: &preflight.source,
         destination_root: &preflight.destination,
-        source_supports_streams: preflight.source_volume.capabilities.named_streams,
-        source_supports_eas: preflight.source_volume.capabilities.extended_attributes,
         destination_policy,
-        chunk_bytes: preflight.profile.chunk_bytes,
-        transport: preflight.profile.transport,
         relative_ntfs_creates,
         source_is_volume_root: same_path(&preflight.source, &preflight.source_volume.root)?,
         counters: Counters::default(),
@@ -315,6 +323,7 @@ pub fn run_copy(
         next_independent_shard: 0,
         worker_cancel,
         last_snapshot: Instant::now(),
+        recent_paths: VecDeque::new(),
     };
     if destination_policy.is_degraded() {
         runner.increment_warning("degraded_filesystem");
@@ -445,6 +454,12 @@ pub fn run_copy(
         provenance: "best sustained window observed during this run; no probe I/O".to_owned(),
     };
     let hints = derive_hints(&runner, &preflight);
+    if runner.stats.timeline_truncated() {
+        // Without this marker a very long run's report would silently imply
+        // its bounded timeline (and the phases derived from it) covers the
+        // whole run.
+        runner.increment_warning("timeline_truncated");
+    }
     let phases = summarize_phases(runner.stats.timeline());
     // Capture the terminal UI state before moving aggregate collections into
     // the report, but do not publish it until both artifacts are complete.
@@ -556,14 +571,12 @@ pub fn run_copy(
 struct Runner<'a> {
     options: &'a CopyOptions,
     observer: &'a dyn RunObserver,
-    run_id: &'a str,
+    /// Run-constant engine parameters, constructed once at run setup and
+    /// shared with every worker job.
+    settings: Arc<EngineSettings>,
     source_root: &'a Path,
     destination_root: &'a Path,
-    source_supports_streams: bool,
-    source_supports_eas: bool,
     destination_policy: FilesystemPolicy,
-    chunk_bytes: usize,
-    transport: TransportProfile,
     /// Distinct-drive local NTFS plain-small jobs may create children through
     /// one verified parent handle cached by their directory-affine worker.
     relative_ntfs_creates: bool,
@@ -598,7 +611,13 @@ struct Runner<'a> {
     /// Coordinator-owned cancellation state shared with streamed file jobs.
     worker_cancel: Arc<AtomicBool>,
     last_snapshot: Instant,
+    /// Most recently settled file paths (newest last), published in snapshots
+    /// so the dashboard can show where the run currently is in the tree.
+    recent_paths: VecDeque<PathBuf>,
 }
+
+/// How many recently settled paths a snapshot carries for display.
+const RECENT_PATH_LIMIT: usize = 4;
 
 enum DirectoryTask {
     Enter {
@@ -644,9 +663,21 @@ fn should_use_relative_ntfs_creates(
 /// Selects only files whose correctness does not require coordinator-owned
 /// journal access. Local behavior remains small-file-only; redirectors may
 /// additionally stream independent files through the bounded worker pool.
+///
+/// INVARIANT — this gate is the mirror image of `engine::copy_file`'s
+/// routing plus the promote net in `engine::open_file`: a file that could
+/// need the journal (any stream at or above the checkpoint threshold) must
+/// either stay inline (`None` here) or be guaranteed to promote back to the
+/// coordinator *before any destination write*, which requires
+/// `promote_threshold` to never exceed the smallest stream size that would
+/// have kept the file inline. Relaxing either side without the other
+/// silently loses checkpoint coverage (for example a nominally small file
+/// with a huge hidden ADS).
+#[allow(clippy::fn_params_excessive_bools)]
 fn worker_dispatch(
     transport: TransportProfile,
     destination_is_wsl: bool,
+    source_is_wsl: bool,
     journal_available: bool,
     unnamed_size: u64,
     large_threshold: u64,
@@ -672,11 +703,45 @@ fn worker_dispatch(
     Some(WorkerDispatch {
         promote_threshold,
         // NTFS and generic redirectors retain the measured same-directory
-        // create serialization. WSL's Plan 9 destination instead stripes
-        // small creates: serial affinity there merely exposes one provider
-        // round trip at a time and protects no local NTFS directory index.
-        directory_affine: unnamed_size < large_threshold && !destination_is_wsl,
+        // create serialization. Either WSL side instead stripes small files.
+        // A Plan 9 *destination* under serial affinity merely exposes one
+        // provider round trip at a time and protects no local NTFS directory
+        // index. With a Plan 9 *source* the per-file cost is dominated by
+        // source-side round trips (measured 2026-08-02: open_src 1.5 ms +
+        // read 0.8 ms of the ~2.4 ms total, vs 0.33 ms for the local NTFS
+        // create), so serializing a directory onto one worker to protect the
+        // local create index costs far more than the index convoy it avoids
+        // — affine dispatch collapsed WSL→Win small files to ~720–2,000
+        // files/s while robocopy's interleaved creates reach 2,600 files/s
+        // on the same tree.
+        directory_affine: unnamed_size < large_threshold && !destination_is_wsl && !source_is_wsl,
     })
+}
+
+/// Journal verdict for one destination-only `.bigcp-…part` child name.
+///
+/// Verdicts are decided against the journal state at directory-join time,
+/// because the entry loop can legitimately consume a live checkpoint (and
+/// retire it) before the extras accounting at the bottom of the directory
+/// runs. A candidate with no verdict is unproven: ordinary extra, never
+/// deleted.
+enum ResumeTempDisposition {
+    /// A resumable checkpoint's final file is a source child of this
+    /// directory, so this run consumes (or already consumed) the temp:
+    /// skip it silently — bigcp's own in-flight asset is not a user extra.
+    Live,
+    /// The journal proves bigcp created this temp (name plus recorded
+    /// identity) but no source child can reach the checkpoint. Reclaim only
+    /// under the full proof in `reclaim_orphaned_temp`; on any failure fall
+    /// back to ordinary extra reporting.
+    Orphan {
+        /// Live resumable journal key to retire after a successful discard
+        /// (`None` when the proof came from the reclaimable harvest, whose
+        /// records are already unreachable by replay).
+        retire_key: Option<String>,
+        /// Filesystem identity recorded when bigcp created the temporary.
+        temp_identity: CheckpointFileIdentity,
+    },
 }
 
 impl Runner<'_> {
@@ -689,7 +754,7 @@ impl Runner<'_> {
             .then(|| metadata_at(self.destination_root))
             .transpose()
             .map_err(|error| BigcpError::io("read destination root metadata", error))?;
-        let mut tasks = std::collections::VecDeque::new();
+        let mut tasks = VecDeque::new();
         tasks.push_back(DirectoryTask::Enter {
             source: self.source_root.to_path_buf(),
             destination: self.destination_root.to_path_buf(),
@@ -776,6 +841,15 @@ impl Runner<'_> {
                     // (guaranteed progress) and revisit this exit after the
                     // remaining tasks, so sibling directories keep feeding
                     // their affine workers instead of serializing dir-by-dir.
+                    //
+                    // INVARIANT: this yield means Exit records do NOT run in
+                    // strict post-order across directories — a parent's Exit
+                    // can run before a still-busy child's Exit. That is safe
+                    // only while (a) each Exit waits solely on its OWN
+                    // direct file jobs and (b) finalizing a child (stamping,
+                    // directory ADS/EA writes) never mutates its parent's
+                    // basic metadata. Adding parent-directory work to child
+                    // finalization would silently break parent timestamps.
                     if self.dir_outstanding.contains_key(&relative) && !tasks.is_empty() {
                         self.receive_file_job()?;
                         tasks.push_front(DirectoryTask::Exit {
@@ -824,6 +898,166 @@ impl Runner<'_> {
         Ok(())
     }
 
+    /// Pre-computes the journal's verdict for every destination-only child
+    /// whose name has bigcp's cheap `.bigcp-*.part` shape (the full decision
+    /// table sits above the extras loop in `enter_directory`).
+    ///
+    /// A checkpoint speaks only for the directory that holds its final
+    /// path, so a same-named object anywhere else stays an ordinary extra.
+    fn classify_resume_temps(
+        &mut self,
+        source_entries: &[DirectoryEntry],
+        destination_map: &HashMap<Vec<u16>, DirectoryEntry>,
+        relative: &Path,
+    ) -> HashMap<String, ResumeTempDisposition> {
+        let mut dispositions = HashMap::new();
+        // Dry-run never opens a journal (resume state is covered by the
+        // zero-destination-write promise), so nothing can classify and
+        // nothing can ever be deleted; the explicit gate is belt and braces
+        // should the journal policy ever change.
+        if self.options.dry_run {
+            return dispositions;
+        }
+        let Some(journal) = self.journal.as_mut() else {
+            return dispositions;
+        };
+        if !journal.has_temp_records() {
+            return dispositions;
+        }
+        for entry in destination_map.values() {
+            let Some(name) = entry.name.to_str() else {
+                continue;
+            };
+            // Cheap exact-shape pre-filter only (temp names are always this
+            // lowercase form); `DestinationTemp::resume` re-validates the
+            // full shape before any handle is opened.
+            if name
+                .strip_prefix(".bigcp-")
+                .and_then(|rest| rest.strip_suffix(".part"))
+                .is_none()
+            {
+                continue;
+            }
+            let resumable = journal
+                .resume_temp_record(name)
+                .map(|(key, identity)| (key.to_owned(), identity.cloned()));
+            if let Some((key, identity)) = resumable {
+                let Some(final_path) =
+                    key_to_path(&key).filter(|path| path.parent() == Some(relative))
+                else {
+                    continue;
+                };
+                let source_has_final_file = final_path.file_name().is_some_and(|final_name| {
+                    source_entries
+                        .iter()
+                        .any(|child| child.name.as_os_str() == final_name)
+                });
+                if source_has_final_file {
+                    dispositions.insert(name.to_owned(), ResumeTempDisposition::Live);
+                } else if let Some(identity) = identity {
+                    dispositions.insert(
+                        name.to_owned(),
+                        ResumeTempDisposition::Orphan {
+                            retire_key: Some(key),
+                            temp_identity: identity,
+                        },
+                    );
+                }
+                // An identity-less version-one record can never be proven:
+                // deliberately left unclassified (ordinary extra, never
+                // deleted).
+            } else if let Some(harvested) = journal.take_reclaimable_temp(name, relative) {
+                dispositions.insert(
+                    name.to_owned(),
+                    ResumeTempDisposition::Orphan {
+                        retire_key: None,
+                        temp_identity: harvested.temp_identity,
+                    },
+                );
+            }
+        }
+        dispositions
+    }
+
+    /// Deletes one journal-proven orphaned resume temporary, or proves
+    /// nothing and leaves the object untouched.
+    ///
+    /// SAFETY CORE — all four parts must hold before the delete disposition
+    /// is armed (VISION: never delete destination-only data bigcp cannot
+    /// prove it created):
+    /// 1. `DestinationTemp::resume` structurally enforces bigcp's opaque
+    ///    temp shape, rejects `:` (alternate-stream escapes), opens the
+    ///    final component non-following with DELETE access, and requires an
+    ///    ordinary file — reused, never reimplemented.
+    /// 2. The caller only reaches here with a journal record carrying this
+    ///    exact temp name AND a recorded temp identity (identity-less
+    ///    version-one records never classify as orphans).
+    /// 3. The opened handle's identity must equal the recorded identity,
+    ///    proving this is the very object bigcp created — not a user file
+    ///    that later landed under the same name.
+    /// 4. Never in dry-run: dry-run opens no journal, so no orphan can
+    ///    classify there. Deletion is delete-on-close through the verified
+    ///    handle (no path-based delete, no TOCTOU window).
+    ///
+    /// Returns `Ok(true)` only after the verified handle armed
+    /// delete-on-close; any open, identity, or discard failure returns
+    /// `Ok(false)` so the caller falls back to ordinary extra reporting —
+    /// never deletion.
+    fn reclaim_orphaned_temp(
+        &mut self,
+        directory: &Path,
+        relative: &Path,
+        name: &str,
+        recorded: &CheckpointFileIdentity,
+        retire_key: Option<&str>,
+    ) -> Result<bool, BigcpError> {
+        debug_assert!(
+            !self.options.dry_run,
+            "orphan classification is unreachable in dry-run"
+        );
+        let Ok(temp) = DestinationTemp::resume(directory, name, false) else {
+            return Ok(false);
+        };
+        let Ok(identity) = temp.identity() else {
+            return Ok(false);
+        };
+        if !recorded.matches(identity) {
+            return Ok(false);
+        }
+        if temp.discard().is_err() {
+            return Ok(false);
+        }
+        let rel = relative.join(name);
+        self.increment_warning("temp_reclaimed");
+        self.audit.emit(&AuditEvent::Warning {
+            kind: "temp_reclaimed".to_owned(),
+            rel: Some(AuditPath::from_path(&rel)),
+            message: "orphaned bigcp resume temporary was identity-verified and reclaimed"
+                .to_owned(),
+        })?;
+        if let Some(key) = retire_key
+            && let Some(journal) = self.journal.as_mut()
+            && journal
+                .append(JournalEvent::PartDone {
+                    relative_path: key.to_owned(),
+                })
+                .is_err()
+        {
+            // Mirror every other PartDone failure: degrade checkpointing
+            // with a warning, never fail the run — the reclamation itself
+            // already happened through the verified handle and the retired
+            // hint can only fail closed on a later replay.
+            self.increment_warning("checkpointing_disabled");
+            self.audit.emit(&AuditEvent::Warning {
+                kind: "checkpointing_disabled".to_owned(),
+                rel: Some(AuditPath::from_path(&rel)),
+                message: "reclaimed-temp retirement could not be journaled; this run continues without further resume checkpoints".to_owned(),
+            })?;
+            self.journal = None;
+        }
+        Ok(true)
+    }
+
     fn enter_directory(
         &mut self,
         source: PathBuf,
@@ -832,7 +1066,7 @@ impl Runner<'_> {
         source_metadata: ObjectMetadata,
         destination_exists: bool,
         destination_metadata: Option<ObjectMetadata>,
-        tasks: &mut std::collections::VecDeque<DirectoryTask>,
+        tasks: &mut VecDeque<DirectoryTask>,
     ) -> Result<(), BigcpError> {
         self.counters.dirs_discovered = self.counters.dirs_discovered.saturating_add(1);
         let phase_timer = Instant::now();
@@ -865,7 +1099,14 @@ impl Runner<'_> {
         } else {
             HashMap::new()
         };
-        self.phases.record(6, phase_timer.elapsed());
+        self.phases
+            .record(crate::phase::PHASE_COORD_ENUM_JOIN, phase_timer.elapsed());
+        // Journal verdicts for destination-only `.bigcp-…part` names are
+        // decided NOW, against the join-time journal state: the entry loop
+        // below may legitimately consume a live checkpoint (retiring it via
+        // PartDone) before the extras accounting at the bottom runs.
+        let resume_temp_dispositions =
+            self.classify_resume_temps(&source_entries, &destination_map, &relative);
         let mut seen_source = HashSet::new();
         let mut child_directories = Vec::new();
         let relative_destination_parent = if self.relative_ntfs_creates {
@@ -889,6 +1130,16 @@ impl Runner<'_> {
                 // A tripped breaker stops mid-directory too: a failure storm
                 // inside one huge directory must not keep dispatching doomed
                 // work until the directory is exhausted.
+                //
+                // Graceful cancel deliberately does NOT stop mid-directory:
+                // the per-entry loop checks only the breaker, so every entry
+                // of the current directory still settles (VISION sizes one
+                // directory at up to ~1M entries — that bounds cancel
+                // latency). Streamed transfers do poll cancellation between
+                // chunks; plain small worker jobs run to completion. This
+                // matches the printed "no new directories will be
+                // dispatched" message; tightening it means auditing every
+                // partially-dispatched accounting path.
                 match source_entry.metadata.kind {
                     ObjectKind::File => {
                         self.record_file(
@@ -986,13 +1237,64 @@ impl Runner<'_> {
             }
             // Includes any completions drained under backpressure — the
             // coordinator's whole per-entry serial cost is the number to beat.
-            self.phases.record(7, phase_timer.elapsed());
+            self.phases
+                .record(crate::phase::PHASE_COORD_ENTRY, phase_timer.elapsed());
         }
         // No drain here: keeping worker jobs in flight across sibling
         // directories is where cross-directory pipelining comes from (the
         // per-directory barrier measurably serialized small-file runs). The
         // drain happens at directory exit, before timestamps are stamped.
+        // Destination-only accounting for bigcp's own `.bigcp-…part` resume
+        // temporaries. Decision table (contract-critical — VISION lines
+        // 29–35 and 59, README FAQ: reclaim only what the journal PROVES
+        // bigcp created; report, never delete, everything else):
+        //
+        //   LIVE    — a resumable checkpoint names this temp and its final
+        //             file is a source child of this directory, so this run
+        //             consumes it (or already did) → skip silently; counting
+        //             it would overstate `extras` in a report whose numbers
+        //             must be exactly true.
+        //   ORPHAN  — the journal proves creation (temp name + recorded
+        //             identity) but the checkpoint is unreachable: the
+        //             source file is gone, `--fresh` truncated the journal,
+        //             or the job signature changed. Reclaimed only under
+        //             the four-part proof in `reclaim_orphaned_temp`; any
+        //             failed proof falls through to UNKNOWN.
+        //   UNKNOWN — no journal proof (including identity-less version-one
+        //             records and non-UTF-8 names) → ordinary extra
+        //             accounting below; never deleted.
+        //
+        // Dry-run never opens a journal, so nothing classifies there: every
+        // candidate stays a reported extra and no destination write occurs.
         for extra in destination_map.into_values() {
+            match extra.name.to_str().and_then(|name| {
+                resume_temp_dispositions
+                    .get(name)
+                    .map(|found| (name, found))
+            }) {
+                Some((_, ResumeTempDisposition::Live)) => continue,
+                Some((
+                    name,
+                    ResumeTempDisposition::Orphan {
+                        retire_key,
+                        temp_identity,
+                    },
+                )) => {
+                    let reclaimed = self.reclaim_orphaned_temp(
+                        &destination,
+                        &relative,
+                        name,
+                        temp_identity,
+                        retire_key.as_deref(),
+                    )?;
+                    if reclaimed {
+                        continue;
+                    }
+                    // Unproven after all: fall through to ordinary extra
+                    // accounting below.
+                }
+                None => {}
+            }
             let rel = relative.join(extra.name);
             self.counters.extra = self.counters.extra.saturating_add(1);
             self.extras.count = self.extras.count.saturating_add(1);
@@ -1225,7 +1527,7 @@ impl Runner<'_> {
                     || destination_metadata.is_some_and(|metadata| metadata.ea_size > 0)
                     || relative.as_os_str().is_empty()
                 {
-                    let source_eas = if self.source_supports_eas {
+                    let source_eas = if self.settings.source.supports_eas {
                         read_extended_attributes_checked(source, current_source_metadata.identity)
                             .map_err(|error| source_access_error("read_dir_ea", relative, &error))
                     } else {
@@ -1319,7 +1621,7 @@ impl Runner<'_> {
         expected_source: FileIdentity,
         expected_destination: FileIdentity,
     ) -> Result<u64, OperationError> {
-        if !self.source_supports_streams {
+        if !self.settings.source.supports_streams {
             return Ok(0);
         }
         let streams = list_streams(source)
@@ -1335,7 +1637,13 @@ impl Runner<'_> {
             }
             return Ok(dropped);
         }
-        let mut buffer = vec![0_u8; self.chunk_bytes.clamp(64 * 1024, 8 * 1024 * 1024)];
+        let mut buffer = vec![
+            0_u8;
+            self.settings
+                .tuning
+                .chunk_bytes
+                .clamp(64 * 1024, 8 * 1024 * 1024)
+        ];
         for stream in named {
             let mut input = SourceStream::open_reparse(source, stream)
                 .map_err(|error| source_access_error("open_dir_stream", relative, &error))?;
@@ -1411,10 +1719,10 @@ impl Runner<'_> {
         relative: PathBuf,
         relative_destination_parent: Option<FileIdentity>,
     ) -> Result<(), BigcpError> {
-        if self
+        if let Some(limit) = self
             .destination_policy
             .maximum_file_size()
-            .is_some_and(|limit| source.metadata.size > limit)
+            .filter(|limit| source.metadata.size > *limit)
         {
             return self.record_file(
                 &relative,
@@ -1428,7 +1736,7 @@ impl Runner<'_> {
                             "{} cannot store a {}-byte file; its maximum is {} bytes",
                             self.destination_policy.filesystem().name(),
                             source.metadata.size,
-                            u32::MAX
+                            limit
                         ),
                     ),
                 },
@@ -1510,7 +1818,7 @@ impl Runner<'_> {
                         &fields,
                         &relative,
                         self.destination_policy,
-                        self.source_supports_eas,
+                        self.settings.source.supports_eas,
                     ) {
                         Ok(()) => FileOutcome::MetadataFixed {
                             bytes: source.metadata.size,
@@ -1619,8 +1927,9 @@ impl Runner<'_> {
                 && !self.options.no_sparse
                 && is_sparse(source.metadata.basic.attributes);
             if let Some(dispatch) = worker_dispatch(
-                self.transport,
+                self.settings.tuning.transport,
                 self.destination_policy.endpoint() == EndpointKind::Wsl,
+                self.settings.source.is_wsl,
                 self.journal.is_some(),
                 unnamed,
                 self.options.large_threshold(),
@@ -1637,34 +1946,10 @@ impl Runner<'_> {
                         fields,
                         destination_newer,
                     }),
-                    run_id: self.run_id.to_owned(),
-                    large_threshold: self.options.large_threshold(),
-                    verify: self.options.verify,
-                    flush: self.options.flush,
-                    source_supports_streams: self.source_supports_streams,
-                    source_supports_eas: self.source_supports_eas,
-                    destination_supports_streams: self.destination_policy.supports_streams(),
-                    destination_supports_eas: self.destination_policy.supports_eas(),
-                    destination_supports_encryption: self.destination_policy.supports_encryption(),
-                    destination_supports_preallocation: self
-                        .destination_policy
-                        .supports_preallocation(),
-                    destination_supports_persistent_acls: self
-                        .destination_policy
-                        .supports_persistent_acls(),
-                    destination_supports_posix_unlink_rename: self
-                        .destination_policy
-                        .supports_posix_unlink_rename(),
+                    settings: Arc::clone(&self.settings),
                     destination_metadata: self
                         .destination_policy
                         .project_basic(source.metadata.basic),
-                    destination_requires_post_write_stamp: self
-                        .destination_policy
-                        .requires_post_write_stamp(),
-                    destination_is_wsl: self.destination_policy.endpoint() == EndpointKind::Wsl,
-                    chunk_bytes: self.chunk_bytes,
-                    transport: self.transport,
-                    checkpoint_threshold: self.options.checkpoint_threshold(),
                     streams: None,
                     logical_bytes: unnamed,
                     promote_threshold: dispatch.promote_threshold,
@@ -1675,7 +1960,7 @@ impl Runner<'_> {
                 return self.submit_file_job(job);
             }
         }
-        if self.transport.is_same_spindle() && !self.options.dry_run {
+        if self.settings.tuning.transport.is_same_spindle() && !self.options.dry_run {
             // The coordinator owns transactional/large files. Letting one run
             // while the phased small-file worker is active would interleave
             // source and destination I/O and undo the same-spindle policy.
@@ -1691,7 +1976,7 @@ impl Runner<'_> {
                 replacement.map(|(fields, _)| fields),
             );
         }
-        let streams = if self.source_supports_streams {
+        let streams = if self.settings.source.supports_streams {
             match list_streams(&source.path) {
                 Ok(streams) => streams,
                 Err(error) => {
@@ -1770,31 +2055,9 @@ impl Runner<'_> {
             relative_path: relative,
             source_snapshot,
             replacement_snapshot: destination_snapshot,
-            run_id: self.run_id,
-            large_threshold: self.options.large_threshold(),
-            verify: self.options.verify,
-            flush: self.options.flush,
-            source_supports_streams: self.source_supports_streams,
-            source_supports_eas: self.source_supports_eas,
-            destination_supports_streams: self.destination_policy.supports_streams(),
-            destination_supports_eas: self.destination_policy.supports_eas(),
-            chunk_bytes: self.chunk_bytes,
-            transport: self.transport,
+            settings: &self.settings,
             preserve_sparse: self.destination_policy.supports_sparse() && !self.options.no_sparse,
-            checkpoint_threshold: self.options.checkpoint_threshold(),
-            destination_supports_encryption: self.destination_policy.supports_encryption(),
-            destination_supports_preallocation: self.destination_policy.supports_preallocation(),
-            destination_supports_persistent_acls: self
-                .destination_policy
-                .supports_persistent_acls(),
-            destination_supports_posix_unlink_rename: self
-                .destination_policy
-                .supports_posix_unlink_rename(),
             destination_metadata: self.destination_policy.project_basic(source.metadata.basic),
-            destination_requires_post_write_stamp: self
-                .destination_policy
-                .requires_post_write_stamp(),
-            destination_is_wsl: self.destination_policy.endpoint() == EndpointKind::Wsl,
             known_streams: Some(&streams),
             cancel: &cancel_probe,
             promote_threshold: None,
@@ -1880,7 +2143,8 @@ impl Runner<'_> {
         }
         let phase_timer = Instant::now();
         let outcome = self.finish_copy(completed);
-        self.phases.record(8, phase_timer.elapsed());
+        self.phases
+            .record(crate::phase::PHASE_COORD_FINISH, phase_timer.elapsed());
         outcome
     }
 
@@ -1899,6 +2163,14 @@ impl Runner<'_> {
             // and mid-file cancellation, and copied nothing. Rerun the file
             // inline where the journal and the cancel probe live; the rerun
             // records the real outcome, so this attempt contributes nothing.
+            //
+            // Note on recursion: copy_classified can drain further worker
+            // completions, whose promoted hand-backs re-enter finish_copy →
+            // copy_classified. Depth is bounded by the same-spindle worker
+            // queue (PER_WORKER_QUEUE), which is far below stack limits for
+            // realistic EngineRequest frames; if that queue ever grows or
+            // frames get large, convert this hand-back into a coordinator
+            // work-list instead of recursing.
             let CompletedCopy {
                 source_path,
                 source_snapshot,
@@ -1959,6 +2231,12 @@ impl Runner<'_> {
                         rel: Some(AuditPath::from_path(relative)),
                         message: "checkpoint persistence failed; this run continues without further resume checkpoints".to_owned(),
                     })?;
+                    // Make the message true: a state-dir append that failed
+                    // once (full disk, dead handle) will keep failing, and
+                    // the sibling PartDone/End failure paths already adopt
+                    // run-level disablement. Copying continues; only resume
+                    // hints stop.
+                    self.journal = None;
                 }
                 if result.efs_downgraded {
                     self.increment_warning("efs_downgrade");
@@ -2166,7 +2444,7 @@ impl Runner<'_> {
                                 &fields,
                                 &relative,
                                 self.destination_policy,
-                                self.source_supports_eas,
+                                self.settings.source.supports_eas,
                             )
                         },
                     );
@@ -2295,7 +2573,7 @@ impl Runner<'_> {
                 match copy_reparse(
                     &source.path,
                     &destination_path,
-                    self.run_id,
+                    &self.settings.run_id,
                     &source.metadata,
                     destination_snapshot
                         .as_ref()
@@ -2470,7 +2748,20 @@ impl Runner<'_> {
         source_root: &Path,
         relative_root: &Path,
     ) -> Result<(), BigcpError> {
-        let mut directories = vec![(source_root.to_path_buf(), relative_root.to_path_buf())];
+        self.drain_not_attempted_directories(vec![(
+            source_root.to_path_buf(),
+            relative_root.to_path_buf(),
+        )])
+    }
+
+    /// Drains a queue of unattempted directories, accounting every reachable
+    /// descendant as `not_attempted`. An unreadable subtree stays silent by
+    /// design: the parent's one recorded failure is the cause for the whole
+    /// subtree.
+    fn drain_not_attempted_directories(
+        &mut self,
+        mut directories: Vec<(PathBuf, PathBuf)>,
+    ) -> Result<(), BigcpError> {
         while let Some((source, relative)) = directories.pop() {
             let Ok(entries) = enumerate_directory(&source) else {
                 continue;
@@ -2540,16 +2831,7 @@ impl Runner<'_> {
             let relative = parent_relative.join(&entry.name);
             self.account_entry_not_attempted(entry, relative, &mut directories)?;
         }
-        while let Some((source, relative)) = directories.pop() {
-            let Ok(children) = enumerate_directory(&source) else {
-                continue;
-            };
-            for entry in children {
-                let child_relative = relative.join(&entry.name);
-                self.account_entry_not_attempted(&entry, child_relative, &mut directories)?;
-            }
-        }
-        Ok(())
+        self.drain_not_attempted_directories(directories)
     }
 
     fn record_file(
@@ -2568,6 +2850,10 @@ impl Runner<'_> {
         ) {
             self.breaker_streak = 0;
         }
+        if self.recent_paths.len() >= RECENT_PATH_LIMIT {
+            self.recent_paths.pop_front();
+        }
+        self.recent_paths.push_back(relative.to_path_buf());
         let (action, size, hash, error, reason, replacement_event) = match &outcome {
             FileOutcome::CopiedNew { bytes, digest } => {
                 ("copied", *bytes, digest.clone(), None, None, None)
@@ -2889,7 +3175,7 @@ impl Runner<'_> {
             read_bytes_per_second,
             write_bytes_per_second,
             failures_by_category,
-            active_paths: Vec::new(),
+            active_paths: self.recent_paths.iter().cloned().collect(),
         }
     }
 }
@@ -2904,6 +3190,9 @@ fn is_default_system_exclusion(name: &OsStr) -> bool {
 struct Preflight {
     source: PathBuf,
     destination: PathBuf,
+    /// Validated source-root metadata (a real directory), reused by
+    /// `run_copy` so the root is not stat'ed a second time.
+    source_root_metadata: ObjectMetadata,
     destination_exists: bool,
     source_volume: VolumeInfo,
     destination_volume: VolumeInfo,
@@ -2986,8 +3275,12 @@ fn preflight(options: &CopyOptions) -> Result<Preflight, BigcpError> {
         && !options.accept_remote_paths
         && !options.dry_run
     {
+        // Do not advise "rerun interactively": the CLI's lexical volume probe
+        // can miss a remote endpoint the pinned-root probe here still sees
+        // (for example across a junction), so an interactive rerun may fail
+        // identically. The flag is the reliable path.
         return Err(BigcpError::Invalid(
-            "UNC/WSL copying requires explicit remote-path acceptance; rerun interactively or pass --accept-remote-paths"
+            "UNC/WSL copying requires explicit remote-path acceptance; review the remote/WSL limitations and pass --accept-remote-paths"
                 .to_owned(),
         ));
     }
@@ -2996,7 +3289,7 @@ fn preflight(options: &CopyOptions) -> Result<Preflight, BigcpError> {
         && !options.dry_run
     {
         return Err(BigcpError::Invalid(format!(
-            "{} destination requires explicit fidelity-degradation acceptance; rerun interactively or pass --accept-degraded-filesystem",
+            "{} destination requires explicit fidelity-degradation acceptance; review the FAT/exFAT limitations and pass --accept-degraded-filesystem",
             destination_volume.filesystem.name()
         )));
     }
@@ -3050,6 +3343,7 @@ fn preflight(options: &CopyOptions) -> Result<Preflight, BigcpError> {
     Ok(Preflight {
         source,
         destination,
+        source_root_metadata,
         destination_exists: destination_preexisted || !options.dry_run,
         source_volume,
         destination_volume,
@@ -3662,7 +3956,16 @@ mod tests {
         const MIB_USIZE: usize = 1024 * 1024;
         let transport = TransportProfile::redirector(8 * MIB_USIZE);
         assert_eq!(
-            worker_dispatch(transport, false, true, 64 * MIB, 16 * MIB, 256 * MIB, false,),
+            worker_dispatch(
+                transport,
+                false,
+                false,
+                true,
+                64 * MIB,
+                16 * MIB,
+                256 * MIB,
+                false,
+            ),
             Some(WorkerDispatch {
                 promote_threshold: Some(256 * MIB),
                 directory_affine: false,
@@ -3671,6 +3974,7 @@ mod tests {
         assert_eq!(
             worker_dispatch(
                 transport,
+                false,
                 false,
                 true,
                 256 * MIB,
@@ -3681,7 +3985,16 @@ mod tests {
             None
         );
         assert_eq!(
-            worker_dispatch(transport, false, true, 8 * MIB, 16 * MIB, 256 * MIB, true,),
+            worker_dispatch(
+                transport,
+                false,
+                false,
+                true,
+                8 * MIB,
+                16 * MIB,
+                256 * MIB,
+                true,
+            ),
             None
         );
     }
@@ -3692,25 +4005,78 @@ mod tests {
         const MIB_USIZE: usize = 1024 * 1024;
         let transport = TransportProfile::standard(8 * MIB_USIZE);
         assert!(
-            worker_dispatch(transport, false, true, 8 * MIB, 16 * MIB, 256 * MIB, false,).is_some()
+            worker_dispatch(
+                transport,
+                false,
+                false,
+                true,
+                8 * MIB,
+                16 * MIB,
+                256 * MIB,
+                false,
+            )
+            .is_some()
         );
         assert_eq!(
-            worker_dispatch(transport, false, true, 64 * MIB, 16 * MIB, 256 * MIB, false,),
+            worker_dispatch(
+                transport,
+                false,
+                false,
+                true,
+                64 * MIB,
+                16 * MIB,
+                256 * MIB,
+                false,
+            ),
             None
         );
     }
 
     #[test]
-    fn wsl_destination_stripes_small_files_without_changing_other_affinity() {
+    fn wsl_endpoints_stripe_small_files_without_changing_other_affinity() {
         const MIB: u64 = 1024 * 1024;
         const MIB_USIZE: usize = 1024 * 1024;
         let transport = TransportProfile::wsl(8 * MIB_USIZE);
-        let wsl = worker_dispatch(transport, true, true, 8 * MIB, 16 * MIB, 256 * MIB, false);
-        assert!(wsl.is_some_and(|dispatch| !dispatch.directory_affine));
+        let wsl_destination = worker_dispatch(
+            transport,
+            true,
+            false,
+            true,
+            8 * MIB,
+            16 * MIB,
+            256 * MIB,
+            false,
+        );
+        assert!(wsl_destination.is_some_and(|dispatch| !dispatch.directory_affine));
 
-        let local_destination =
-            worker_dispatch(transport, false, true, 8 * MIB, 16 * MIB, 256 * MIB, false);
-        assert!(local_destination.is_some_and(|dispatch| dispatch.directory_affine));
+        // A WSL *source* stripes too: the per-file cost is 9P source-side
+        // round trips (measured 2026-08-02), so directory affinity would
+        // serialize the expensive side to protect the cheap one.
+        let wsl_source = worker_dispatch(
+            transport,
+            false,
+            true,
+            true,
+            8 * MIB,
+            16 * MIB,
+            256 * MIB,
+            false,
+        );
+        assert!(wsl_source.is_some_and(|dispatch| !dispatch.directory_affine));
+
+        // Neither endpoint WSL (transport pinned for the counterfactual):
+        // local/generic creates keep the measured directory affinity.
+        let local_both = worker_dispatch(
+            transport,
+            false,
+            false,
+            true,
+            8 * MIB,
+            16 * MIB,
+            256 * MIB,
+            false,
+        );
+        assert!(local_both.is_some_and(|dispatch| dispatch.directory_affine));
     }
 
     #[test]

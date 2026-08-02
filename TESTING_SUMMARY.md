@@ -1,6 +1,46 @@
 # Implementation testing and drive-safety summary
 
-Latest review: 2026-07-31
+Latest review: 2026-08-02
+
+## 2026-08-02 WSL segmented parallel transfers and measured profile
+
+ADR 0052's changes — the 32-worker WSL Auto row, either-side WSL small-file
+striping, segmented parallel large-file transfers, and three per-file
+round-trip cuts — landed with new confined coverage. Engine unit tests
+`segment_plan_rejects_every_ineligible_modality` and
+`segment_plan_clamps_counts_and_covers_exactly` pin the planner's eligibility
+list, the `K = clamp(size/64 MiB, 2, 8)` bound, and exact chunk-aligned
+coverage; `segmented_copy_publishes_identical_content_and_digest_both_directions`
+proves patterned content and the whole-file digest in both directions;
+`segmented_copy_cancel_leaves_no_destination_object` proves a mid-file cancel
+leaves neither final name nor temp; and bigcp-win's
+`segment_writer_requires_identity_proof_and_preserves_delete_on_close` proves
+a path reopen with the wrong identity gets `InvalidData` and no write handle
+while delete-on-close survives the reopen cycle. Two existing pins were
+extended: `wsl_endpoints_stripe_small_files_without_changing_other_affinity`
+now also proves WSL-source striping and the non-WSL affinity counterfactual,
+and `remote_source_caps_local_workers_and_wsl_is_independently_profiled` pins
+the measured 32-worker row. All 218 confined workspace tests passed with zero
+failures; formatting, warning-denied Clippy, and the frozen-input and
+test-storage safety scripts passed. The segmented engine tests inject the WSL
+endpoint policy while their files stay inside local sandboxes, so routine CI
+still never touches WSL.
+
+Real-endpoint verification ran manually, outside CI, against
+`\\wsl.localhost\u2` (WSL 2, kernel 6.18.33.2, ext4 on VHDX) with every
+Linux-side write confined to a disposable test-owned `/tmp/bigcp-bench`
+subtree — the operator-approved, pre-named scratch endpoint that
+`docs/TESTING.md` requires for any live WSL source/destination test.
+Standalone `bigcp verify` passed on the segmented large copies in both
+directions and on the small tree (2,021/2,021 objects), destination hashes
+were byte-identical, and a local→local regression check ran 7,419 files/s
+(no regression). The performance evidence — workloads, warm/cold discipline,
+direction, transport/chunk/workers, verification mode, and the exact robocopy
+comparators required by the TESTING.md WSL run protocol — is recorded in
+`BENCHMARKS.md` (2026-08-02); those medians of 3 warm runs are indicative,
+not the certified ≥5-repetition protocol. No distribution was stopped or
+restarted, no disconnect was forced, and no stress, endurance, or
+large-scale test ran.
 
 ## 2026-07-31 distinct-drive NTFS small-file relative creates
 

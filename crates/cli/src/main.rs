@@ -116,6 +116,11 @@ struct CopyFlags {
     #[arg(long)]
     accept_remote_paths: bool,
 
+    /// Continue without prompting when the destination drive uses the slower
+    /// Windows "Quick removal" write-cache policy.
+    #[arg(long)]
+    accept_write_cache_policy: bool,
+
     /// Device class (auto|nvme|sata-ssd|usb-ssd|hdd|unknown), or "SRC,DST".
     #[arg(long, value_parser = parse_profiles, value_name = "CLASS[,CLASS]")]
     profile: Option<(DeviceClass, DeviceClass)>,
@@ -204,7 +209,11 @@ fn execute(cli: Cli) -> Result<u8, (u8, String)> {
                 print_report_summary(&report)
                     .map_err(|error| (6, format!("write report summary: {error}")))?;
             } else {
-                show_report(&report).map_err(|error| (6, format!("report browser: {error}")))?;
+                // The browser honors the NO_COLOR convention like the copy
+                // dashboard does (README documents the convention globally).
+                let no_color = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
+                show_report(&report, !no_color)
+                    .map_err(|error| (6, format!("report browser: {error}")))?;
             }
             Ok(0)
         }
@@ -227,6 +236,7 @@ fn execute(cli: Cli) -> Result<u8, (u8, String)> {
                     accepted: PreflightAcceptance {
                         degraded_filesystem: cli.flags.accept_degraded_filesystem,
                         remote_paths: cli.flags.accept_remote_paths,
+                        write_cache_policy: cli.flags.accept_write_cache_policy,
                     },
                     dry_run: cli.flags.dry_run,
                 },
@@ -258,13 +268,21 @@ fn execute(cli: Cli) -> Result<u8, (u8, String)> {
                 options.destination_profile = destination_profile;
             }
 
+            // Graceful Ctrl+C for every copy mode: the first request cancels
+            // between bounded work units (exit 3), a second falls through to
+            // default termination. If installation fails, Ctrl+C keeps its
+            // default hard-kill behavior, which the abort-and-rerun contract
+            // already covers.
+            let console_cancel = bigcp_win::install_cancel_handler()
+                .ok()
+                .map(|()| bigcp_win::cancel_requested as fn() -> bool);
             let report = match display_mode {
                 CopyDisplayMode::Plain { quiet } => {
-                    let observer = PlainObserver::new(quiet);
+                    let observer = PlainObserver::new(quiet, console_cancel);
                     run_copy(&options, &observer)
                 }
                 CopyDisplayMode::Dashboard { color_enabled } => {
-                    run_dashboard_with_color(options, color_enabled)
+                    run_dashboard_with_color(options, color_enabled, console_cancel)
                 }
             }
             .map_err(|error| (exit_for_error(&error), error.to_string()))?;
@@ -308,6 +326,7 @@ fn reject_copy_only_flags(flags: &CopyFlags) -> Result<(), (u8, String)> {
         || flags.fresh
         || flags.accept_degraded_filesystem
         || flags.accept_remote_paths
+        || flags.accept_write_cache_policy
         || flags.profile.is_some()
         || flags.tune.is_some()
         || flags.state_dir.is_some()
@@ -319,7 +338,10 @@ fn reject_copy_only_flags(flags: &CopyFlags) -> Result<(), (u8, String)> {
     if used {
         Err((
             5,
-            "copy flags are not accepted by verify or report subcommands".to_owned(),
+            "copy flags are not accepted by verify or report subcommands \
+             (subcommand-specific flags go after the subcommand, e.g. \
+             bigcp report FILE --plain)"
+                .to_owned(),
         ))
     } else {
         Ok(())
@@ -425,6 +447,10 @@ fn exit_for_error(error: &bigcp_core::BigcpError) -> u8 {
 struct PreflightAcceptance {
     degraded_filesystem: bool,
     remote_paths: bool,
+    /// CLI-only: silences the advisory Quick-removal prompt. Core does not
+    /// re-gate on this because a slow write-cache policy is a performance
+    /// notice, not a fidelity or safety loss (VISION line 11).
+    write_cache_policy: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -509,10 +535,14 @@ fn confirm_preflight_warnings(
          performance', and check\n  'Enable write caching on the device'. Leave 'Turn off \
          Windows write-cache buffer flushing'\n  UNCHECKED — that setting risks filesystem \
          corruption on power loss, which a re-run cannot\n  repair. With caching on, always \
-         use Safely Remove Hardware before unplugging."
+         use Safely Remove Hardware before unplugging.\n  To continue without this prompt \
+         next time, pass --accept-write-cache-policy."
         )
         .map_err(|error| (6, format!("write preflight warning: {error}")))?;
     }
+    // The Quick-removal notice always prints, but its interactive opt-out is
+    // suppressed once the user has explicitly accepted the policy.
+    let prompt_for_write_cache = quick_removal && !options.accepted.write_cache_policy;
 
     let needs_degradation_confirmation =
         degraded && !options.accepted.degraded_filesystem && !options.dry_run;
@@ -533,7 +563,7 @@ fn confirm_preflight_warnings(
             ),
         ));
     }
-    if options.interactive && (needs_required_confirmation || quick_removal) {
+    if options.interactive && (needs_required_confirmation || prompt_for_write_cache) {
         let mut stderr = std::io::stderr().lock();
         if needs_required_confirmation {
             write!(
@@ -562,6 +592,7 @@ fn confirm_preflight_warnings(
             degraded_filesystem: options.accepted.degraded_filesystem
                 || needs_degradation_confirmation,
             remote_paths: options.accepted.remote_paths || needs_remote_confirmation,
+            write_cache_policy: options.accepted.write_cache_policy || prompt_for_write_cache,
         });
     }
     Ok(options.accepted)
@@ -579,8 +610,10 @@ fn prompt_answer_accepted(answer: &str, degradation_confirmation: bool) -> bool 
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, CopyDisplayMode, copy_display_mode, execute, prompt_answer_accepted,
+        Cli, Command, CopyDisplayMode, copy_display_mode, execute, exit_for_error, parse_profiles,
+        parse_size, parse_tune, prompt_answer_accepted,
     };
+    use bigcp_core::{BigcpError, DeviceClass};
     use clap::Parser;
 
     #[test]
@@ -722,6 +755,140 @@ mod tests {
             "--accept-remote-paths",
         ]);
         assert!(verify.is_err());
+    }
+
+    #[test]
+    fn sizes_parse_binary_suffixes_case_insensitively_and_reject_nonsense() {
+        assert_eq!(parse_size("4096"), Ok(4096));
+        assert_eq!(parse_size("64KiB"), Ok(64 * 1024));
+        assert_eq!(parse_size("10mib"), Ok(10 * 1024 * 1024));
+        assert_eq!(parse_size("2GiB"), Ok(2 * 1024 * 1024 * 1024));
+        assert!(parse_size("0").is_err());
+        assert!(parse_size("").is_err());
+        assert!(parse_size("12MB").is_err());
+        // Overflow in the multiplier must fail, not wrap.
+        assert!(parse_size("99999999999999999999GiB").is_err());
+        assert!(parse_size(&format!("{}GiB", u64::MAX)).is_err());
+    }
+
+    #[test]
+    fn profile_classes_fan_out_and_reject_unknown_or_extra_entries() {
+        assert_eq!(
+            parse_profiles("hdd"),
+            Ok((DeviceClass::Hdd, DeviceClass::Hdd))
+        );
+        assert_eq!(
+            parse_profiles("nvme,usb-ssd"),
+            Ok((DeviceClass::Nvme, DeviceClass::UsbSsd))
+        );
+        assert!(parse_profiles("ssd").is_err());
+        assert!(parse_profiles("nvme,hdd,auto").is_err());
+        // A trailing comma is an empty second entry, not a silent single.
+        assert!(parse_profiles("nvme,").is_err());
+    }
+
+    #[test]
+    fn tune_items_require_known_keys_and_key_value_form() {
+        assert!(parse_tune("streams=2").is_err());
+        assert!(parse_tune("chunk").is_err());
+        let parsed = parse_tune("chunk=1MiB,threads=4");
+        assert!(parsed.as_ref().is_ok_and(|tune| {
+            tune.chunk_bytes == Some(1024 * 1024) && tune.threads == Some(4)
+        }));
+    }
+
+    #[test]
+    fn library_errors_map_to_preflight_or_internal_exit_codes() {
+        assert_eq!(exit_for_error(&BigcpError::Locked("x".to_owned())), 5);
+        assert_eq!(exit_for_error(&BigcpError::Invalid("x".to_owned())), 5);
+        assert_eq!(exit_for_error(&BigcpError::Audit("x".to_owned())), 6);
+        assert_eq!(exit_for_error(&BigcpError::Invariant("x".to_owned())), 6);
+        assert_eq!(exit_for_error(&BigcpError::Format("x".to_owned())), 6);
+    }
+
+    #[test]
+    fn redirected_stdout_always_selects_plain_progress() {
+        let parsed = Cli::try_parse_from(["bigcp", "source", "destination"]);
+        assert!(parsed.is_ok());
+        let Some(parsed) = parsed.ok() else {
+            return;
+        };
+        assert_eq!(
+            copy_display_mode(&parsed.flags, false, false),
+            CopyDisplayMode::Plain { quiet: false }
+        );
+    }
+
+    /// Completeness guard: every copy flag must be listed both here (with a
+    /// sample invocation) and in `reject_copy_only_flags`. Adding a flag to
+    /// `CopyFlags` without updating the rejection list makes this test fail
+    /// with a "not accepted" mismatch; forgetting the sample fails the
+    /// missing-list assertion.
+    #[test]
+    fn every_copy_flag_is_rejected_before_a_subcommand() {
+        let samples: &[(&str, &[&str])] = &[
+            ("dry-run", &["--dry-run"]),
+            ("verify", &["--verify"]),
+            ("include-system", &["--include-system"]),
+            ("skip-cloud", &["--skip-cloud"]),
+            ("replace", &["--replace=false"]),
+            ("flush", &["--flush"]),
+            ("no-sparse", &["--no-sparse"]),
+            ("analyze", &["--analyze"]),
+            ("raw-reparse", &["--raw-reparse"]),
+            ("fresh", &["--fresh"]),
+            (
+                "accept-degraded-filesystem",
+                &["--accept-degraded-filesystem"],
+            ),
+            ("accept-remote-paths", &["--accept-remote-paths"]),
+            (
+                "accept-write-cache-policy",
+                &["--accept-write-cache-policy"],
+            ),
+            ("profile", &["--profile", "hdd"]),
+            ("tune", &["--tune", "chunk=1MiB"]),
+            ("state-dir", &["--state-dir", "state"]),
+            ("log", &["--log", "log.jsonl"]),
+            ("report", &["--report", "report.json"]),
+            ("plain", &["--plain"]),
+            ("no-color", &["--no-color"]),
+            ("quiet", &["--quiet"]),
+        ];
+        let command = <Cli as clap::CommandFactory>::command();
+        let mut missing = Vec::new();
+        for argument in command.get_arguments() {
+            let Some(long) = argument.get_long() else {
+                continue;
+            };
+            if long == "help" || long == "version" {
+                continue;
+            }
+            let Some((_, invocation)) = samples.iter().find(|(name, _)| *name == long) else {
+                missing.push(long.to_owned());
+                continue;
+            };
+            let mut argv = vec!["bigcp"];
+            argv.extend_from_slice(invocation);
+            argv.extend_from_slice(&["verify", "source", "destination"]);
+            let parsed = Cli::try_parse_from(&argv);
+            assert!(parsed.is_ok(), "{long}: flag failed to parse before verify");
+            let Some(parsed) = parsed.ok() else {
+                return;
+            };
+            let result = execute(parsed);
+            assert!(
+                result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|(code, message)| *code == 5 && message.contains("not accepted")),
+                "--{long} was not rejected before the verify subcommand: {result:?}"
+            );
+        }
+        assert!(
+            missing.is_empty(),
+            "add sample invocations and a rejection-list entry for: {missing:?}"
+        );
     }
 
     #[test]

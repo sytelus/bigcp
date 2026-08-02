@@ -2,9 +2,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, Write};
-use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use time::OffsetDateTime;
@@ -31,13 +29,7 @@ impl AuditPath {
     pub fn from_path(path: &Path) -> Self {
         let display = path.to_string_lossy();
         let round_trips = path.as_os_str().to_str().is_some();
-        let path_raw = (!round_trips).then(|| {
-            let mut bytes = Vec::new();
-            for code_unit in path.as_os_str().encode_wide() {
-                bytes.extend_from_slice(&code_unit.to_le_bytes());
-            }
-            hex::encode(bytes)
-        });
+        let path_raw = (!round_trips).then(|| crate::journal::utf16le_hex(path.as_os_str()));
         Self {
             path: display.into_owned(),
             path_raw,
@@ -100,7 +92,10 @@ pub enum AuditEvent {
         action: String,
         /// Relative object path.
         rel: AuditPath,
-        /// Logical unnamed-stream bytes.
+        /// Logical source bytes represented by the outcome. For copied
+        /// outcomes this includes named streams when the stream set was
+        /// opened, matching `Counters::bytes_logical_copied` — it is not
+        /// only the unnamed stream.
         size: u64,
         /// Optional content digest.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -198,7 +193,6 @@ pub struct AuditWriter {
     fallback_path: PathBuf,
     file: File,
     degraded: bool,
-    last_flush: Instant,
 }
 
 impl AuditWriter {
@@ -214,7 +208,6 @@ impl AuditWriter {
             fallback_path: fallback,
             file,
             degraded: false,
-            last_flush: Instant::now(),
         })
     }
 
@@ -250,19 +243,20 @@ impl AuditWriter {
                 }
             }
         }
-        if self.last_flush.elapsed() >= Duration::from_secs(2) {
-            self.flush()?;
-        }
         Ok(())
     }
 
-    /// Flushes all event bytes to the operating system.
+    /// Confirms every event line has reached the operating system.
+    ///
+    /// Event lines are written directly on the unbuffered `File`, so bytes
+    /// reach the OS on each `emit` and `File::flush` performs no syscall.
+    /// This method exists as the explicit ordering point before durability
+    /// claims (`finish`) and cancellation summaries; a former 2-second flush
+    /// cadence in `emit` was removed because it never moved any bytes.
     pub fn flush(&mut self) -> Result<(), BigcpError> {
         self.file
             .flush()
-            .map_err(|error| BigcpError::io("flush JSONL log", error))?;
-        self.last_flush = Instant::now();
-        Ok(())
+            .map_err(|error| BigcpError::io("flush JSONL log", error))
     }
 
     /// Flushes and durably synchronizes the terminal audit record.
@@ -372,9 +366,17 @@ pub fn option_summary(options: &CopyOptions) -> serde_json::Value {
 }
 
 fn open_log(path: &Path) -> io::Result<File> {
+    // Deliberately write+read, NOT append: a Windows append-mode handle holds
+    // FILE_APPEND_DATA without FILE_WRITE_DATA, and `set_len` (the torn-line
+    // rollback in write_atomic_line) requires FILE_WRITE_DATA — with append
+    // mode every rollback failed, `safe_to_retry` was always false, and the
+    // documented one-shot same-path reopen could never trigger. The single
+    // coordinator writer seeks to End before each write, which preserves
+    // append behavior without the crippled access mask.
     OpenOptions::new()
         .create(true)
-        .append(true)
+        .truncate(false)
+        .write(true)
         .read(true)
         .open(path)
 }
@@ -420,10 +422,37 @@ fn format_timestamp(timestamp: OffsetDateTime) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::{Seek, SeekFrom, Write};
     use std::path::Path;
 
-    use super::{AuditEvent, AuditWriter, encode_event, failover_notice};
+    use super::{AuditEvent, AuditWriter, encode_event, failover_notice, open_log};
     use crate::model::Counters;
+
+    #[test]
+    fn log_handles_support_the_torn_line_rollback() {
+        // Regression: `.append(true)` produced a Windows handle holding
+        // FILE_APPEND_DATA without FILE_WRITE_DATA, so the set_len rollback
+        // in write_atomic_line always failed and every torn write became
+        // unrecoverable. The log handle must be able to truncate itself.
+        let sandbox = tempfile::tempdir();
+        assert!(sandbox.is_ok());
+        let Some(sandbox) = sandbox.ok() else {
+            return;
+        };
+        let path = sandbox.path().join("audit.log.jsonl");
+        let file = open_log(&path);
+        assert!(file.is_ok());
+        let Some(mut file) = file.ok() else {
+            return;
+        };
+        assert!(file.seek(SeekFrom::End(0)).is_ok());
+        assert!(file.write_all(b"{\"partial\":").is_ok());
+        assert!(file.set_len(0).is_ok(), "rollback truncation must succeed");
+        // Appended writes continue after rollback on the same handle.
+        assert!(file.seek(SeekFrom::End(0)).is_ok());
+        assert!(file.write_all(b"{}\n").is_ok());
+        assert_eq!(fs::read(&path).ok(), Some(b"{}\n".to_vec()));
+    }
 
     #[test]
     fn failover_notice_is_a_complete_escaped_event() {

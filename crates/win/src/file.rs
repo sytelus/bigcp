@@ -37,6 +37,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FileAllocationInfo, FileBasicInfo, FileDispositionInfo,
     FileRenameInfo, FileRenameInfoEx, FlushFileBuffers, SYNCHRONIZE, SetFileInformationByHandle,
+    WRITE_DAC,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 use windows_sys::Win32::System::WindowsProgramming::{
@@ -231,10 +232,16 @@ impl DestinationTemp {
             let mut options = OpenOptions::new();
             options
                 // Keep std's creation validation in sync with the explicit
-                // Win32 access mask below.
+                // Win32 access mask below. WRITE_DAC is required because
+                // apply_protected_dacl sets security through this same
+                // handle, and SetSecurityInfo checks the handle's granted
+                // access (GENERIC_WRITE maps to FILE_GENERIC_WRITE, which
+                // does not include WRITE_DAC).
                 .read(true)
                 .write(true)
-                .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE | FILE_WRITE_ATTRIBUTES)
+                .access_mode(
+                    GENERIC_READ | GENERIC_WRITE | DELETE | FILE_WRITE_ATTRIBUTES | WRITE_DAC,
+                )
                 .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
                 .create_new(true);
             if sequential {
@@ -306,7 +313,9 @@ impl DestinationTemp {
                 0
             };
         options
-            .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE | FILE_WRITE_ATTRIBUTES)
+            // WRITE_DAC: see DestinationTemp::create — a resumed temp can
+            // also receive a preserved protected DACL before commit.
+            .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE | FILE_WRITE_ATTRIBUTES | WRITE_DAC)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(flags);
         let file = options.open(&path)?;
@@ -394,6 +403,53 @@ impl DestinationTemp {
         mark_sparse(self.file_ref()?)
     }
 
+    /// Opens one additional identity-proven writer over this owned temporary
+    /// for parallel segment writes.
+    ///
+    /// Windows refuses a path open while the base file has a pending delete
+    /// disposition, so — mirroring [`Self::create_stream`] exactly — the
+    /// disposition is cleared only for the open syscall and re-armed before
+    /// returning (including on the open's error path). The reopen goes
+    /// through the temporary's opaque *path*, and a path reopen without
+    /// identity proof must never be written through: the freshly opened
+    /// handle is required to be an ordinary file whose identity equals
+    /// `expected` (the same discipline as [`Self::resume`]); on mismatch the
+    /// new handle is closed and `InvalidData` is returned without a write.
+    ///
+    /// Callers must open every segment writer from a single thread: the
+    /// disarm/re-arm cycle mutates the shared coordinator handle's delete
+    /// disposition and is not safe to interleave.
+    pub fn open_segment_writer(&self, expected: FileIdentity) -> io::Result<SegmentWriter> {
+        let armed = !self.persistent;
+        if armed {
+            set_delete_on_close(self.file_ref()?, false)?;
+        }
+        let mut options = OpenOptions::new();
+        options
+            .access_mode(GENERIC_WRITE | FILE_READ_ATTRIBUTES)
+            // FILE_SHARE_DELETE is required for the open to succeed at all:
+            // the coordinator's owning handle holds DELETE access (for the
+            // delete-on-close discipline), and Windows sharing checks demand
+            // that every later open share the accesses existing handles
+            // already hold. It grants this writer no delete authority.
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        let opened = options.open(&self.path);
+        if armed && let Err(error) = set_delete_on_close(self.file_ref()?, true) {
+            drop(opened);
+            return Err(error);
+        }
+        let file = opened?;
+        let metadata = metadata_from_file(&file)?;
+        if metadata.kind != ObjectKind::File || metadata.identity != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "segment writer target is not the identity-proven bigcp temporary",
+            ));
+        }
+        Ok(SegmentWriter { file })
+    }
+
     /// Creates a named data stream attached to this owned temporary.
     pub fn create_stream(&self, stream: &StreamInfo) -> io::Result<DestinationStream> {
         // Windows refuses a new stream open while the base file has a pending
@@ -464,8 +520,16 @@ impl DestinationTemp {
         set_basic_by_handle(&file, metadata)?;
         if flush {
             // SAFETY: file owns a valid file handle for this call.
-            unsafe {
-                bool_result(FlushFileBuffers(file.as_raw_handle().cast()))?;
+            let flushed = unsafe { bool_result(FlushFileBuffers(file.as_raw_handle().cast())) };
+            if let Err(error) = flushed {
+                // The file now has the source's exact size and mtime, so the
+                // rerun's skip heuristic would classify it Same and never
+                // retry the flush the user asked for. Best-effort poison of
+                // the stamp keeps the failure detectable; if the device is
+                // gone this fails too, and the reread/verify guidance in the
+                // docs is the remaining recourse.
+                let _ = set_basic_by_handle(&file, poison_stamp());
+                return Err(error);
             }
         }
         close_file(file)
@@ -527,6 +591,35 @@ impl Read for DestinationTemp {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         let file = self.file_mut()?;
         read_retry_interrupted(file, buffer)
+    }
+}
+
+/// Additional write-only handle over one identity-proven [`DestinationTemp`],
+/// used by the parallel segment strategy for large one-sided WSL files.
+///
+/// Constructed only by [`DestinationTemp::open_segment_writer`], which proves
+/// the reopened path still names the owned temporary before any write. This
+/// handle carries no delete disposition of its own: the delete-on-close armed
+/// on the coordinator's [`DestinationTemp`] handle still owns cleanup, so an
+/// uncommitted temporary disappears once every handle (segment writers
+/// included) closes.
+pub struct SegmentWriter {
+    file: File,
+}
+
+impl Write for SegmentWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.file.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl Seek for SegmentWriter {
+    fn seek(&mut self, position: io::SeekFrom) -> io::Result<u64> {
+        self.file.seek(position)
     }
 }
 
@@ -667,8 +760,14 @@ impl DestinationFinal {
             // measured create-time-only fast path by passing None.
             set_basic_by_handle(&self.file, metadata)?;
         }
-        if flush {
-            self.file.sync_all()?;
+        if flush && let Err(error) = self.file.sync_all() {
+            // The destination already carries the source's size and mtime
+            // (stamped at create time on NTFS, just above elsewhere), so a
+            // rerun would skip it as Same and silently drop the user's
+            // durability request. Poison the stamp best-effort so the rerun
+            // detects and replaces the file instead.
+            let _ = set_basic_by_handle(&self.file, poison_stamp());
+            return Err(error);
         }
         // Report success only after the direct destination handle is closed.
         // `File`'s Drop cannot surface a CloseHandle failure, while the
@@ -915,7 +1014,15 @@ pub(crate) fn rename_by_handle(
         (*info).RootDirectory = null_mut();
         (*info).FileNameLength = u32::try_from(name_bytes)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "rename path is too long"))?;
-        std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
+        // The name pointer is a raw place projection: calling
+        // `FileName.as_mut_ptr()` would autoref a `&mut [u16; 1]` whose
+        // provenance covers only the one-element array, making the copy
+        // beyond it undefined behavior under the aliasing model.
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            (&raw mut (*info).FileName).cast::<u16>(),
+            name.len(),
+        );
         let extended = bool_result(SetFileInformationByHandle(
             file.as_raw_handle().cast(),
             FileRenameInfoEx,
@@ -968,6 +1075,23 @@ fn unsupported_rename_class(error: &io::Error) -> bool {
     )
 }
 
+/// Returns a stamp that makes a destination detectably different from its
+/// source after a failed durable flush.
+///
+/// The skip heuristic compares size and last-write time; after a flush
+/// failure both already match the source, so a rerun would classify the
+/// possibly-non-durable file as Same and never retry. Timestamp value `1`
+/// (1601-01-01 + 100ns) is a legal FILETIME no real source carries; the zero
+/// fields mean "leave unchanged" to `FILE_BASIC_INFO`.
+pub(crate) const fn poison_stamp() -> BasicMetadata {
+    BasicMetadata {
+        creation_time: 0,
+        last_access_time: 0,
+        last_write_time: 1,
+        attributes: 0,
+    }
+}
+
 pub(crate) fn set_basic_by_handle(file: &File, metadata: BasicMetadata) -> io::Result<()> {
     let attributes = metadata.attributes & COPYABLE_ATTRIBUTES;
     let info = FILE_BASIC_INFO {
@@ -1010,7 +1134,7 @@ mod tests {
     use crate::metadata::BasicMetadata;
     use std::ffi::OsString;
     use std::fs;
-    use std::io::{Read, Write};
+    use std::io::{Read, Seek, Write};
     use std::os::windows::ffi::OsStringExt;
     use std::os::windows::fs::symlink_file;
     use std::path::PathBuf;
@@ -1126,6 +1250,59 @@ mod tests {
         );
         drop(resumed);
         assert_eq!(fs::read(path).ok(), Some(b"unrelated replacement".to_vec()));
+    }
+
+    #[test]
+    fn segment_writer_requires_identity_proof_and_preserves_delete_on_close() {
+        let sandbox = tempfile::tempdir();
+        assert!(sandbox.is_ok());
+        let Some(sandbox) = sandbox.ok() else {
+            return;
+        };
+        let temp = DestinationTemp::create(sandbox.path(), "segment-writer", false, false);
+        assert!(temp.is_ok(), "temporary creation failed: {:?}", temp.err());
+        let Some(mut temp) = temp.ok() else {
+            return;
+        };
+        assert!(temp.set_len(8).is_ok());
+        let identity = temp.identity();
+        assert!(identity.is_ok());
+        let Some(identity) = identity.ok() else {
+            return;
+        };
+
+        // Correct identity: the writer opens and writes at an offset.
+        let writer = temp.open_segment_writer(identity);
+        assert!(writer.is_ok(), "segment open failed: {:?}", writer.err());
+        let Some(mut writer) = writer.ok() else {
+            return;
+        };
+        assert!(writer.seek(std::io::SeekFrom::Start(4)).is_ok());
+        assert!(writer.write_all(b"BBBB").is_ok());
+        drop(writer);
+        // Verify through the owned handle: a path-based read would be
+        // refused while the temporary is (correctly) still delete-pending.
+        assert!(temp.seek(std::io::SeekFrom::Start(0)).is_ok());
+        let mut contents = Vec::new();
+        assert!(temp.read_to_end(&mut contents).is_ok());
+        assert_eq!(contents, vec![0, 0, 0, 0, b'B', b'B', b'B', b'B']);
+
+        // Wrong identity: InvalidData, and no write handle is returned.
+        let mut wrong = identity;
+        wrong.file_id[0] ^= 0xFF;
+        let mismatch = temp.open_segment_writer(wrong);
+        assert!(
+            mismatch
+                .as_ref()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::InvalidData)
+        );
+        drop(mismatch);
+
+        // The uncommitted temporary still deletes through the coordinator
+        // handle's re-armed delete-on-close once every handle is closed.
+        let path = temp.path().to_path_buf();
+        drop(temp);
+        assert!(!path.exists());
     }
 
     #[test]

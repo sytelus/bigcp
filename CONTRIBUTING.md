@@ -1,5 +1,9 @@
 # Contributing
 
+New to the repository? Start with [CLAUDE.md](CLAUDE.md) — the one-page entry
+point (build commands, binding safety rules, code map, and the
+which-document-for-which-change matrix) for human and AI maintainers alike.
+
 Use a focused branch and keep unrelated user changes intact. Treat `PLAN.md`,
 `VISION.md`, and `LIMITATIONS.md` as governing inputs: change them only when the
 task explicitly authorizes a contract/scope/documentation update, then update

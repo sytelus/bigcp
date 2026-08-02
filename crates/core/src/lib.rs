@@ -35,3 +35,6 @@ pub const REPORT_SCHEMA_VERSION: u32 = 1;
 
 /// The JSONL log schema version emitted by this build.
 pub const LOG_SCHEMA_VERSION: u32 = 1;
+
+/// The resume-journal record version (`j` field) emitted by this build.
+pub const JOURNAL_SCHEMA_VERSION: u32 = 1;

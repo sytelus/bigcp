@@ -24,6 +24,30 @@ pub const PHASE_NAMES: [&str; 9] = [
     "coord_finish",
 ];
 
+// Call sites must use these named indices, never literals: `record` silently
+// ignores an out-of-range index, so a drifted literal would misattribute
+// every later phase's measurements without any error. The unit test below
+// pins each constant to its `PHASE_NAMES` entry.
+
+/// Engine phase: opening the source file.
+pub const PHASE_OPEN_SRC: usize = 0;
+/// Engine phase: enumerating the source stream set.
+pub const PHASE_LIST_STREAMS: usize = 1;
+/// Engine phase: source data reads.
+pub const PHASE_READ: usize = 2;
+/// Engine phase: creating the destination object.
+pub const PHASE_CREATE_DST: usize = 3;
+/// Engine phase: destination data writes.
+pub const PHASE_WRITE: usize = 4;
+/// Engine phase: destination metadata stamping.
+pub const PHASE_SET_META: usize = 5;
+/// Coordinator phase: directory enumeration and join.
+pub const PHASE_COORD_ENUM_JOIN: usize = 6;
+/// Coordinator phase: per-entry classification and dispatch.
+pub const PHASE_COORD_ENTRY: usize = 7;
+/// Coordinator phase: worker-result accounting.
+pub const PHASE_COORD_FINISH: usize = 8;
+
 /// Thread-safe phase measurements belonging to exactly one copy run.
 #[derive(Debug)]
 pub struct PhaseTracker {
@@ -90,9 +114,27 @@ mod tests {
     fn measurements_are_isolated_per_run() {
         let first = PhaseTracker::new();
         let second = PhaseTracker::new();
-        first.record(0, Duration::from_micros(10));
+        first.record(super::PHASE_OPEN_SRC, Duration::from_micros(10));
 
         assert!(first.summary().contains("open_src:"));
         assert!(second.summary().is_empty());
+    }
+
+    #[test]
+    fn phase_index_constants_match_their_reported_names() {
+        use super::{
+            PHASE_COORD_ENTRY, PHASE_COORD_ENUM_JOIN, PHASE_COORD_FINISH, PHASE_CREATE_DST,
+            PHASE_LIST_STREAMS, PHASE_NAMES, PHASE_OPEN_SRC, PHASE_READ, PHASE_SET_META,
+            PHASE_WRITE,
+        };
+        assert_eq!(PHASE_NAMES[PHASE_OPEN_SRC], "open_src");
+        assert_eq!(PHASE_NAMES[PHASE_LIST_STREAMS], "list_streams");
+        assert_eq!(PHASE_NAMES[PHASE_READ], "read");
+        assert_eq!(PHASE_NAMES[PHASE_CREATE_DST], "create_dst");
+        assert_eq!(PHASE_NAMES[PHASE_WRITE], "write");
+        assert_eq!(PHASE_NAMES[PHASE_SET_META], "set_meta");
+        assert_eq!(PHASE_NAMES[PHASE_COORD_ENUM_JOIN], "coord_enum_join");
+        assert_eq!(PHASE_NAMES[PHASE_COORD_ENTRY], "coord_entry");
+        assert_eq!(PHASE_NAMES[PHASE_COORD_FINISH], "coord_finish");
     }
 }

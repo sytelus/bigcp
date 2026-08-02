@@ -11,20 +11,30 @@ $ScanFiles = @(
     Get-ChildItem -LiteralPath 'scripts' -Recurse -File -ErrorAction SilentlyContinue
     Get-ChildItem -LiteralPath '.github' -Recurse -File -ErrorAction SilentlyContinue
     Get-ChildItem -Filter 'build.rs' -Recurse -File -ErrorAction SilentlyContinue
-) | Where-Object { (Resolve-Path $_.FullName).Path -ne $Self }
+) | Where-Object {
+    # target\ holds third-party build scripts this repository does not control;
+    # only sources the repo owns are subject to the backstop.
+    (Resolve-Path $_.FullName).Path -ne $Self -and
+    $_.FullName -notmatch '\\target\\'
+}
 
 # Plain substrings (no regex fragility): none of these has a legitimate use in
 # this repo in any spelling, escaped or raw.
 $ForbiddenSubstrings = @(
     'PhysicalDrive'          # raw disk access, any string spelling
     'diskpart'
+    'fsutil'                 # volume/filesystem mutation utility
     'Format-Volume'
     'Clear-Disk'
     'Initialize-Disk'
     'New-Partition'
+    'New-Volume'
+    'Set-Partition'
+    'Remove-Partition'
     'Mount-VHD'
     'Dismount-VHD'
     'New-VHD'
+    'mountvol /d'            # volume unmount
     'FSCTL_DISMOUNT_VOLUME'
     'shutdown /'             # machine-stability operations
     'Restart-Computer'
@@ -52,12 +62,20 @@ function Assert-CodeLine {
 Assert-CodeLine 'crates/testkit/src/sandbox.rs' `
     'fn allowed_test_drives' `
     'Sandbox guard no longer declares the system+code drive whitelist.'
+# The cap assertions pin the literal values, not just the identifiers:
+# silently raising a limit is the same regression as deleting it.
 Assert-CodeLine 'crates/testkit/src/generator.rs' `
-    'HARD_ENTRY_LIMIT' `
-    'Generator no longer caps scenario entry count (VISION scale prohibition).'
+    'HARD_ENTRY_LIMIT: usize = 10_000;' `
+    'Generator hard entry cap is missing or no longer 10,000 (VISION scale prohibition).'
 Assert-CodeLine 'crates/testkit/src/generator.rs' `
-    'ROUTINE_ENTRY_LIMIT' `
-    'Generator no longer separates routine caps from opt-in heavy scenarios.'
+    'HARD_WRITE_LIMIT: u64 = 1024 \* 1024 \* 1024;' `
+    'Generator hard write cap is missing or no longer 1 GiB.'
+Assert-CodeLine 'crates/testkit/src/generator.rs' `
+    'ROUTINE_ENTRY_LIMIT: usize = 1_000;' `
+    'Generator routine entry cap is missing, no longer 1,000, or no longer separates routine caps from opt-in heavy scenarios.'
+Assert-CodeLine 'crates/testkit/src/generator.rs' `
+    'ROUTINE_WRITE_LIMIT: u64 = 64 \* 1024 \* 1024;' `
+    'Generator routine write cap is missing or no longer 64 MiB.'
 Assert-CodeLine 'crates/testkit/src/generator.rs' `
     'fn planned_entry_counts' `
     'Generator no longer counts implicit parent directories before enforcing entry caps.'

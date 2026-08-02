@@ -16,7 +16,10 @@ only with fresh evidence.
 
 1. `profile_device` regains a query-only `IOCTL_DISK_GET_CACHE_INFORMATION`
    probe (`DeviceInfo::write_cache_enabled`); bigcp never modifies the
-   policy.
+   policy. [Amendment 2026-08-01: the probe now uses
+   `IOCTL_STORAGE_QUERY_PROPERTY`/`StorageDeviceWriteCacheProperty` — the
+   disk-cache IOCTL encodes read access that the zero-access volume handle
+   can never satisfy, so this probe had never actually fired.]
 2. When the destination reports write caching disabled, the run emits an
    audit warning, the report carries a high-confidence hint with the
    measured factor, and — owner-mandated amendment to the no-prompts rule

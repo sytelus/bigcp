@@ -7,6 +7,7 @@ use std::os::windows::fs::symlink_file;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use bigcp_core::journal::{Checkpoint, CheckpointFileIdentity, Journal, JournalEvent, path_key};
 use bigcp_core::{
     CopyOptions, DeviceClass, RunObserver, RunSnapshot, RunState, VerifyOptions, run_copy,
 };
@@ -14,11 +15,27 @@ use bigcp_testkit::sandbox::{initialize_empty, validated_system_temp};
 use bigcp_testkit::{SandboxRoot, check_trees};
 use bigcp_win::{
     BasicMetadata, DestinationStream, DestinationTemp, ExtendedAttributes, SourceStream,
-    StreamInfo, clear_extended_attributes, is_sparse, metadata_at, read_extended_attributes,
-    write_extended_attributes,
+    StreamInfo, absolute_extended, clear_extended_attributes, final_path, is_sparse, metadata_at,
+    open_root, read_extended_attributes, write_extended_attributes,
 };
+use xxhash_rust::xxh3::Xxh3;
 
 const FIXTURE_WRITE_BUDGET: u64 = 16 * 1024 * 1024;
+
+/// Builds the options every end-to-end run starts from. The state directory
+/// is always a child of the test's own sandbox: without an explicit
+/// `state_dir` the product would fall back to the machine-wide
+/// `%LOCALAPPDATA%` state root, which tests must never touch.
+fn sandboxed_options(
+    sandbox: &SandboxRoot,
+    source: PathBuf,
+    destination: PathBuf,
+    state_label: &str,
+) -> Result<CopyOptions, Box<dyn std::error::Error>> {
+    let mut options = CopyOptions::new(source, destination);
+    options.state_dir = Some(sandbox.child(Path::new(state_label))?);
+    Ok(options)
+}
 
 struct SilentObserver;
 
@@ -153,9 +170,8 @@ fn copy_rerun_and_both_verification_forms_converge() -> Result<(), Box<dyn std::
         .saturating_add(large_bytes.len() as u64)
         .saturating_add(fs::metadata(&sparse_path)?.len());
 
-    let mut options = CopyOptions::new(source.clone(), destination.clone());
+    let mut options = sandboxed_options(&sandbox, source.clone(), destination.clone(), "state")?;
     options.verify = true;
-    options.state_dir = Some(state.clone());
     options.tune.large_threshold = Some(4 * 1024 * 1024);
     options.tune.checkpoint_threshold = Some(1024 * 1024);
     let first = run_copy(&options, &SilentObserver)?;
@@ -256,9 +272,9 @@ fn dry_run_never_creates_destination_and_direct_replacement_converges()
     alternate.flush()?;
     drop(alternate);
 
-    let mut options = CopyOptions::new(source.clone(), destination.clone());
+    let mut options =
+        sandboxed_options(&sandbox, source.clone(), destination.clone(), "dry-state")?;
     options.dry_run = true;
-    options.state_dir = Some(sandbox.child(Path::new("dry-state"))?);
     let modeled = run_copy(&options, &SilentObserver)?;
     assert_eq!(modeled.run.exit, 0);
     assert_eq!(modeled.counters.would_copy_new, 1);
@@ -271,8 +287,7 @@ fn dry_run_never_creates_destination_and_direct_replacement_converges()
         "dry-run created the destination tree"
     );
 
-    options.dry_run = false;
-    options.state_dir = Some(sandbox.child(Path::new("copy-state"))?);
+    let options = sandboxed_options(&sandbox, source.clone(), destination.clone(), "copy-state")?;
     let initial = run_copy(&options, &SilentObserver)?;
     assert_eq!(initial.run.exit, 0, "copy errors: {:?}", initial.errors);
     assert_eq!(initial.counters.copied_new, 1);
@@ -309,8 +324,7 @@ fn replace_false_preserves_bytes_and_audits_the_withheld_change()
     fs::write(source.join("different.txt"), b"new source bytes")?;
     fs::write(destination.join("different.txt"), b"old")?;
 
-    let mut options = CopyOptions::new(source, destination.clone());
-    options.state_dir = Some(sandbox.child(Path::new("state"))?);
+    let mut options = sandboxed_options(&sandbox, source, destination.clone(), "state")?;
     options.replace = false;
     let report = run_copy(&options, &SilentObserver)?;
 
@@ -354,8 +368,7 @@ fn direct_replacement_handles_a_read_only_destination() -> Result<(), Box<dyn st
     permissions.set_readonly(true);
     fs::set_permissions(&destination_file, permissions)?;
 
-    let mut options = CopyOptions::new(source, destination);
-    options.state_dir = Some(sandbox.child(Path::new("state"))?);
+    let options = sandboxed_options(&sandbox, source, destination, "state")?;
     let report = run_copy(&options, &SilentObserver)?;
 
     assert_eq!(report.run.exit, 0, "errors: {:?}", report.errors);
@@ -378,8 +391,7 @@ fn cancellation_accounts_every_directory_already_discovered()
     fs::create_dir(&source)?;
     fs::create_dir(source.join("not-visited"))?;
 
-    let mut options = CopyOptions::new(source, destination);
-    options.state_dir = Some(sandbox.child(Path::new("state"))?);
+    let options = sandboxed_options(&sandbox, source, destination, "state")?;
     let report = run_copy(&options, &ImmediateCancel)?;
     assert_eq!(report.run.exit, 3);
     assert_eq!(report.counters.dirs_discovered, 1);
@@ -425,7 +437,9 @@ fn unsafe_audit_path_is_rejected_before_destination_creation()
     fs::create_dir(&source)?;
     fs::write(source.join("fixture.txt"), b"bounded fixture")?;
 
-    let mut options = CopyOptions::new(source, destination.clone());
+    let mut options = sandboxed_options(&sandbox, source, destination.clone(), "state")?;
+    // Deliberate override of the safe sandbox default: the run must reject an
+    // audit state directory that nests inside the destination tree.
     options.state_dir = Some(destination.join("state"));
     let result = run_copy(&options, &SilentObserver);
     assert!(result.is_err());
@@ -451,8 +465,7 @@ fn colliding_audit_roles_are_rejected_before_destination_creation()
     fs::create_dir(&source)?;
     fs::write(source.join("fixture.txt"), b"bounded fixture")?;
 
-    let mut options = CopyOptions::new(source, destination.clone());
-    options.state_dir = Some(state.clone());
+    let mut options = sandboxed_options(&sandbox, source, destination.clone(), "state")?;
     options.log_path = Some(shared_artifact.clone());
     options.report_path = Some(shared_artifact.clone());
     let result = run_copy(&options, &SilentObserver);
@@ -468,13 +481,11 @@ fn report_fallback_and_terminal_audit_record_agree() -> Result<(), Box<dyn std::
     let sandbox = SandboxRoot::create_system_temp("report-fallback")?;
     let source = sandbox.child(Path::new("source"))?;
     let destination = sandbox.child(Path::new("destination"))?;
-    let state = sandbox.child(Path::new("state"))?;
     let unusable_report_path = sandbox.child(Path::new("existing-directory"))?;
     fs::create_dir(&source)?;
     fs::create_dir(&unusable_report_path)?;
 
-    let mut options = CopyOptions::new(source, destination);
-    options.state_dir = Some(state);
+    let mut options = sandboxed_options(&sandbox, source, destination, "state")?;
     options.report_path = Some(unusable_report_path.clone());
     let report = run_copy(&options, &SilentObserver)?;
 
@@ -501,14 +512,12 @@ fn complete_snapshot_is_published_after_final_artifacts() -> Result<(), Box<dyn 
     let sandbox = SandboxRoot::create_system_temp("terminal-artifacts")?;
     let source = sandbox.child(Path::new("source"))?;
     let destination = sandbox.child(Path::new("destination"))?;
-    let state = sandbox.child(Path::new("state"))?;
     let log_path = sandbox.child(Path::new("audit.jsonl"))?;
     let report_path = sandbox.child(Path::new("report.json"))?;
     fs::create_dir(&source)?;
     fs::write(source.join("fixture.txt"), b"bounded fixture")?;
 
-    let mut options = CopyOptions::new(source, destination);
-    options.state_dir = Some(state);
+    let mut options = sandboxed_options(&sandbox, source, destination, "state")?;
     options.log_path = Some(log_path.clone());
     options.report_path = Some(report_path.clone());
     let observer = TerminalArtifactObserver {
@@ -531,8 +540,7 @@ fn same_run_verification_mismatch_is_audited() -> Result<(), Box<dyn std::error:
     fs::create_dir(&source)?;
     fs::write(source.join("fixture.txt"), b"good")?;
 
-    let mut options = CopyOptions::new(source, destination.clone());
-    options.state_dir = Some(sandbox.child(Path::new("state"))?);
+    let mut options = sandboxed_options(&sandbox, source, destination.clone(), "state")?;
     options.verify = true;
     let observer = CorruptOnVerify {
         destination_file: destination.join("fixture.txt"),
@@ -576,8 +584,7 @@ fn existing_file_is_rejected_as_a_destination_root() -> Result<(), Box<dyn std::
     fs::create_dir(&source)?;
     fs::write(&destination, b"sentinel must remain unchanged")?;
 
-    let mut options = CopyOptions::new(source, destination.clone());
-    options.state_dir = Some(sandbox.child(Path::new("state"))?);
+    let options = sandboxed_options(&sandbox, source, destination.clone(), "state")?;
     assert!(run_copy(&options, &SilentObserver).is_err());
     assert_eq!(fs::read(&destination)?, b"sentinel must remain unchanged");
     Ok(())
@@ -617,8 +624,7 @@ fn failed_parent_subtree_logs_every_discovered_descendant() -> Result<(), Box<dy
     )?;
     fs::write(destination.join("conflict"), b"type-conflict sentinel")?;
 
-    let mut options = CopyOptions::new(source, destination.clone());
-    options.state_dir = Some(sandbox.child(Path::new("state"))?);
+    let options = sandboxed_options(&sandbox, source, destination.clone(), "state")?;
     let report = run_copy(&options, &SilentObserver)?;
     assert_eq!(report.run.exit, 2);
     assert_eq!(report.counters.not_attempted, 1);
@@ -672,8 +678,7 @@ fn relative_symbolic_links_are_recreated_as_links_when_available()
     output.flush()?;
     drop(output);
 
-    let mut options = CopyOptions::new(source, destination.clone());
-    options.state_dir = Some(sandbox.child(Path::new("state"))?);
+    let options = sandboxed_options(&sandbox, source, destination.clone(), "state")?;
     let report = run_copy(&options, &SilentObserver)?;
     assert_eq!(report.run.exit, 0, "link errors: {:?}", report.errors);
     assert_eq!(report.counters.links_copied, 1);
@@ -708,13 +713,11 @@ fn analyze_flag_produces_bounded_insight() -> Result<(), Box<dyn std::error::Err
     let sandbox = initialize_empty(lease.path())?;
     let source = sandbox.child(Path::new("source"))?;
     let destination = sandbox.child(Path::new("destination"))?;
-    let state = sandbox.child(Path::new("state"))?;
     fs::create_dir(&source)?;
     fs::write(source.join("tiny.txt"), b"tiny")?;
     fs::write(source.join("bigger.bin"), vec![0x11_u8; 256 * 1024])?;
 
-    let mut options = CopyOptions::new(source, destination);
-    options.state_dir = Some(state);
+    let mut options = sandboxed_options(&sandbox, source, destination, "state")?;
     options.analyze = true;
     let report = run_copy(&options, &SilentObserver)?;
     assert_eq!(report.run.exit, 0);
@@ -800,8 +803,7 @@ fn same_spindle_profile_batches_small_files_and_bursts_large_data()
         true,
     )?;
 
-    let mut options = CopyOptions::new(source, destination);
-    options.state_dir = Some(sandbox.child(Path::new("state"))?);
+    let mut options = sandboxed_options(&sandbox, source, destination, "state")?;
     // Both roots are on this one test volume. The explicit rotational class
     // makes the deterministic topology policy testable on SSD-only CI.
     options.source_profile = DeviceClass::Hdd;
@@ -858,8 +860,7 @@ fn graceful_cancel_stops_inside_a_large_file() -> Result<(), Box<dyn std::error:
     fs::create_dir(&source)?;
     fs::write(source.join("large.bin"), vec![0x7e_u8; 512 * 1024])?;
 
-    let mut options = CopyOptions::new(source, destination.clone());
-    options.state_dir = Some(sandbox.child(Path::new("state"))?);
+    let mut options = sandboxed_options(&sandbox, source, destination.clone(), "state")?;
     // Route the file through the inline large-file path in small chunks so
     // several cancel polls happen inside one file.
     options.tune.large_threshold = Some(64 * 1024);
@@ -919,8 +920,7 @@ fn hidden_large_stream_is_promoted_from_worker_to_inline_streaming()
     alternate.flush()?;
     drop(alternate);
 
-    let mut options = CopyOptions::new(source.clone(), destination.clone());
-    options.state_dir = Some(sandbox.child(Path::new("state"))?);
+    let mut options = sandboxed_options(&sandbox, source.clone(), destination.clone(), "state")?;
     options.verify = true;
     options.tune.large_threshold = Some(64 * 1024);
     let report = run_copy(&options, &SilentObserver)?;
@@ -934,5 +934,349 @@ fn hidden_large_stream_is_promoted_from_worker_to_inline_streaming()
         destination,
     })?;
     assert_eq!(full.failed, 0, "verify mismatches: {:?}", full.mismatches);
+    Ok(())
+}
+
+#[test]
+fn verified_checkpoint_resume_completes_an_interrupted_large_file()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Deterministic synthetic interruption: the destination holds a persistent
+    // opaque temp with a correct 1 MiB prefix and the state directory holds
+    // the matching journal checkpoint — exactly what a canceled run leaves
+    // behind — so the rerun must resume through verified-prefix validation
+    // instead of restarting. Fresh writes stay near 5 MiB, inside the 16 MiB
+    // fixture budget.
+    let allowed_temp = validated_system_temp()?;
+    let lease = tempfile::Builder::new()
+        .prefix("bigcp-resume-")
+        .tempdir_in(allowed_temp)?;
+    let sandbox = initialize_empty(lease.path())?;
+    let source = sandbox.child(Path::new("source"))?;
+    let destination = sandbox.child(Path::new("destination"))?;
+    let state = sandbox.child(Path::new("state"))?;
+    fs::create_dir(&source)?;
+    fs::create_dir(&destination)?;
+
+    let size = 2 * 1024 * 1024_u64;
+    let watermark = 1024 * 1024_u64;
+    let mut payload = vec![0_u8; usize::try_from(size)?];
+    let mut pattern = 0x2f_u8;
+    for byte in &mut payload {
+        pattern = pattern.wrapping_mul(31).wrapping_add(7);
+        *byte = pattern;
+    }
+    let source_file = source.join("large.bin");
+    fs::write(&source_file, &payload)?;
+    let source_metadata = metadata_at(&source_file)?;
+
+    // The interrupted-run partial: a bigcp-shaped opaque sibling holding
+    // exactly the checkpointed prefix, persisted for journal-backed resume.
+    let prefix = &payload[..usize::try_from(watermark)?];
+    let mut temp = DestinationTemp::create(&destination, "resume-seed", false, false)?;
+    temp.write_all(prefix)?;
+    temp.flush()?;
+    temp.persist_for_resume()?;
+    let temp_identity = CheckpointFileIdentity::from_file(temp.identity()?);
+    let temp_name = temp
+        .path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .ok_or("opaque temporary name was not valid UTF-8")?;
+    drop(temp);
+    let mut prefix_hasher = Xxh3::new();
+    prefix_hasher.update(prefix);
+
+    // The matching journal. Its job signature must reproduce what run_copy
+    // computes — final-path-resolved roots plus the resume-protocol constant —
+    // or begin_job would discard the checkpoint; a signature drift therefore
+    // fails this test loudly instead of skipping the resume silently.
+    let resolved_source = final_path(&open_root(&absolute_extended(&source)?)?)?;
+    let resolved_destination = final_path(&open_root(&absolute_extended(&destination)?)?)?;
+    let journal_path = state.join("journal.jsonl");
+    let mut journal = Journal::open(journal_path.clone(), false)?;
+    journal.begin_job(
+        "interrupted-run".to_owned(),
+        path_key(&resolved_source),
+        path_key(&resolved_destination),
+        "resume-protocol-v1".to_owned(),
+        "2026-08-01T00:00:00Z".to_owned(),
+    )?;
+    journal.append(JournalEvent::Checkpoint(Checkpoint {
+        relative_path: path_key(Path::new("large.bin")),
+        stream: String::new(),
+        temp_name: temp_name.clone(),
+        temp_identity: Some(temp_identity.clone()),
+        source_identity: Some(CheckpointFileIdentity::from_file(source_metadata.identity)),
+        source_size: size,
+        source_mtime: source_metadata.basic.last_write_time,
+        watermark,
+        prefix_digest: format!("xxh3:{:032x}", prefix_hasher.digest128()),
+    }))?;
+    drop(journal);
+    assert!(destination.join(&temp_name).is_file());
+
+    let mut options = sandboxed_options(&sandbox, source, destination.clone(), "state")?;
+    // Make the 2 MiB fixture checkpoint-eligible so it takes the same
+    // journaled transactional path a 40 GB production file would.
+    options.tune.checkpoint_threshold = Some(64 * 1024);
+    let report = run_copy(&options, &SilentObserver)?;
+
+    assert_eq!(report.run.exit, 0, "resume errors: {:?}", report.errors);
+    assert_eq!(report.counters.copied_new, 1);
+    // Resumed, not restarted: the run re-hashed exactly the checkpointed
+    // prefix from the temp and read only the remaining tail from the source.
+    assert_eq!(report.counters.bytes_verified, watermark);
+    assert_eq!(report.counters.bytes_read_source, size - watermark);
+    assert_eq!(report.counters.bytes_written_destination, size - watermark);
+    let final_file = destination.join("large.bin");
+    assert_eq!(fs::read(&final_file)?, payload);
+    // The seeded temp object itself became the final file (same filesystem
+    // identity), proving the partial was consumed rather than replaced.
+    assert!(temp_identity.matches(metadata_at(&final_file)?.identity));
+    let leftovers: Vec<_> = fs::read_dir(&destination)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .filter(|name| name.to_string_lossy().starts_with(".bigcp-"))
+        .collect();
+    assert!(leftovers.is_empty(), "unconsumed partials: {leftovers:?}");
+    // The retired checkpoint is gone: a clean end compacts the journal back
+    // to its job header alone (PLAN section 5.12).
+    let compacted = fs::read_to_string(&journal_path)?;
+    assert_eq!(compacted.lines().count(), 1, "journal: {compacted}");
+    assert!(compacted.contains("\"ev\":\"job\""));
+    let oracle = check_trees(&sandbox, Path::new("source"), Path::new("destination"))?;
+    assert_eq!(oracle.mismatches, 0, "oracle samples: {:?}", oracle.samples);
+    Ok(())
+}
+
+/// Seeds exactly what an interrupted run leaves behind: a persistent opaque
+/// destination temp holding `prefix` plus this destination's journal
+/// checkpoint describing it (real temp identity, run_copy-compatible job
+/// signature). Returns the temp's name and recorded identity.
+fn seed_checkpointed_partial(
+    source: &Path,
+    destination: &Path,
+    state: &Path,
+    relative_file: &str,
+    prefix: &[u8],
+    source_size: u64,
+    source_mtime: i64,
+    source_identity: Option<CheckpointFileIdentity>,
+) -> Result<(String, CheckpointFileIdentity), Box<dyn std::error::Error>> {
+    let mut temp = DestinationTemp::create(destination, "reclaim-seed", false, false)?;
+    temp.write_all(prefix)?;
+    temp.flush()?;
+    temp.persist_for_resume()?;
+    let temp_identity = CheckpointFileIdentity::from_file(temp.identity()?);
+    let temp_name = temp
+        .path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .ok_or("opaque temporary name was not valid UTF-8")?;
+    drop(temp);
+    let mut prefix_hasher = Xxh3::new();
+    prefix_hasher.update(prefix);
+    // The job signature must reproduce what run_copy computes (resolved
+    // roots plus the resume-protocol constant) or begin_job would discard
+    // the checkpoint through the signature-change path instead of the one
+    // under test.
+    let resolved_source = final_path(&open_root(&absolute_extended(source)?)?)?;
+    let resolved_destination = final_path(&open_root(&absolute_extended(destination)?)?)?;
+    let mut journal = Journal::open(state.join("journal.jsonl"), false)?;
+    journal.begin_job(
+        "interrupted-run".to_owned(),
+        path_key(&resolved_source),
+        path_key(&resolved_destination),
+        "resume-protocol-v1".to_owned(),
+        "2026-08-01T00:00:00Z".to_owned(),
+    )?;
+    journal.append(JournalEvent::Checkpoint(Checkpoint {
+        relative_path: path_key(Path::new(relative_file)),
+        stream: String::new(),
+        temp_name: temp_name.clone(),
+        temp_identity: Some(temp_identity.clone()),
+        source_identity,
+        source_size,
+        source_mtime,
+        watermark: u64::try_from(prefix.len())?,
+        prefix_digest: format!("xxh3:{:032x}", prefix_hasher.digest128()),
+    }))?;
+    drop(journal);
+    Ok((temp_name, temp_identity))
+}
+
+#[test]
+fn orphaned_temp_with_deleted_source_is_reclaimed() -> Result<(), Box<dyn std::error::Error>> {
+    // Scenario (a) of the orphan contract: the checkpointed source file was
+    // deleted before the rerun, so the persisted partial would otherwise
+    // squat at the destination forever. The journal proves bigcp created it
+    // (name plus matching filesystem identity), so the rerun reclaims it.
+    let allowed_temp = validated_system_temp()?;
+    let lease = tempfile::Builder::new()
+        .prefix("bigcp-reclaim-")
+        .tempdir_in(allowed_temp)?;
+    let sandbox = initialize_empty(lease.path())?;
+    let source = sandbox.child(Path::new("source"))?;
+    let destination = sandbox.child(Path::new("destination"))?;
+    let state = sandbox.child(Path::new("state"))?;
+    fs::create_dir(&source)?;
+    fs::create_dir(&destination)?;
+    fs::write(source.join("keep.txt"), b"unrelated survivor")?;
+    let (temp_name, _) = seed_checkpointed_partial(
+        &source,
+        &destination,
+        &state,
+        "ghost.bin",
+        &vec![0x42_u8; 4096],
+        64 * 1024,
+        12345,
+        None,
+    )?;
+    assert!(destination.join(&temp_name).is_file());
+
+    let options = sandboxed_options(&sandbox, source, destination.clone(), "state")?;
+    let report = run_copy(&options, &SilentObserver)?;
+    assert_eq!(report.run.exit, 0, "errors: {:?}", report.errors);
+    assert!(
+        !destination.join(&temp_name).exists(),
+        "identity-proven orphan must be reclaimed"
+    );
+    assert_eq!(report.warnings.get("temp_reclaimed").copied(), Some(1));
+    assert_eq!(report.counters.extra, 0, "a reclaimed temp is not an extra");
+    // The reclaimed checkpoint was retired, so clean-end compaction leaves
+    // only the job header: replay cannot resurrect the hint.
+    let compacted = fs::read_to_string(state.join("journal.jsonl"))?;
+    assert_eq!(compacted.lines().count(), 1, "journal: {compacted}");
+
+    // A rerun stays clean: nothing re-reports and nothing re-reclaims.
+    let rerun = run_copy(&options, &SilentObserver)?;
+    assert_eq!(rerun.run.exit, 0, "rerun errors: {:?}", rerun.errors);
+    assert!(!rerun.warnings.contains_key("temp_reclaimed"));
+    assert_eq!(rerun.counters.extra, 0);
+    Ok(())
+}
+
+#[test]
+fn temp_name_reuse_with_wrong_identity_is_never_deleted() -> Result<(), Box<dyn std::error::Error>>
+{
+    // The journal names this temp, but the object now at that name is a
+    // different filesystem object (the user removed bigcp's temp and put
+    // their own file there). Identity mismatch means no proof: the file is
+    // reported as an ordinary extra and must never be deleted.
+    let allowed_temp = validated_system_temp()?;
+    let lease = tempfile::Builder::new()
+        .prefix("bigcp-noproof-")
+        .tempdir_in(allowed_temp)?;
+    let sandbox = initialize_empty(lease.path())?;
+    let source = sandbox.child(Path::new("source"))?;
+    let destination = sandbox.child(Path::new("destination"))?;
+    let state = sandbox.child(Path::new("state"))?;
+    fs::create_dir(&source)?;
+    fs::create_dir(&destination)?;
+    let (temp_name, _) = seed_checkpointed_partial(
+        &source,
+        &destination,
+        &state,
+        "ghost.bin",
+        &vec![0x42_u8; 4096],
+        64 * 1024,
+        12345,
+        None,
+    )?;
+    let user_payload = b"user data that happens to share the temp name".to_vec();
+    fs::remove_file(destination.join(&temp_name))?;
+    fs::write(destination.join(&temp_name), &user_payload)?;
+
+    let options = sandboxed_options(&sandbox, source, destination.clone(), "state")?;
+    let report = run_copy(&options, &SilentObserver)?;
+    assert_eq!(report.run.exit, 0, "errors: {:?}", report.errors);
+    assert_eq!(
+        fs::read(destination.join(&temp_name))?,
+        user_payload,
+        "an unproven look-alike must survive byte-for-byte"
+    );
+    assert!(!report.warnings.contains_key("temp_reclaimed"));
+    assert_eq!(
+        report.counters.extra, 1,
+        "the look-alike stays a reported extra"
+    );
+    assert!(
+        report
+            .extras
+            .samples
+            .iter()
+            .any(|sample| sample.contains(&temp_name)),
+        "extras samples: {:?}",
+        report.extras.samples
+    );
+    Ok(())
+}
+
+#[test]
+fn fresh_run_reclaims_the_previous_partial() -> Result<(), Box<dyn std::error::Error>> {
+    // Scenario (b): `--fresh` truncates the journal, so the previous run's
+    // partial can never be resumed — but the pre-truncation records still
+    // prove bigcp created it, so the fresh run recopies the file in full
+    // and reclaims the now-orphaned temp.
+    let allowed_temp = validated_system_temp()?;
+    let lease = tempfile::Builder::new()
+        .prefix("bigcp-freshgc-")
+        .tempdir_in(allowed_temp)?;
+    let sandbox = initialize_empty(lease.path())?;
+    let source = sandbox.child(Path::new("source"))?;
+    let destination = sandbox.child(Path::new("destination"))?;
+    let state = sandbox.child(Path::new("state"))?;
+    fs::create_dir(&source)?;
+    fs::create_dir(&destination)?;
+
+    let size = 2 * 1024 * 1024_u64;
+    let watermark = 1024 * 1024_usize;
+    let mut payload = vec![0_u8; usize::try_from(size)?];
+    let mut pattern = 0x2f_u8;
+    for byte in &mut payload {
+        pattern = pattern.wrapping_mul(31).wrapping_add(7);
+        *byte = pattern;
+    }
+    let source_file = source.join("large.bin");
+    fs::write(&source_file, &payload)?;
+    let source_metadata = metadata_at(&source_file)?;
+    let (temp_name, temp_identity) = seed_checkpointed_partial(
+        &source,
+        &destination,
+        &state,
+        "large.bin",
+        &payload[..watermark],
+        size,
+        source_metadata.basic.last_write_time,
+        Some(CheckpointFileIdentity::from_file(source_metadata.identity)),
+    )?;
+    assert!(destination.join(&temp_name).is_file());
+
+    let mut options = sandboxed_options(&sandbox, source, destination.clone(), "state")?;
+    options.fresh = true;
+    options.tune.checkpoint_threshold = Some(64 * 1024);
+    let report = run_copy(&options, &SilentObserver)?;
+    assert_eq!(report.run.exit, 0, "errors: {:?}", report.errors);
+    assert_eq!(report.counters.copied_new, 1);
+    // Full recopy, not a resume: every source byte was read and no
+    // checkpointed prefix was digest-verified.
+    assert_eq!(report.counters.bytes_read_source, size);
+    assert_eq!(report.counters.bytes_verified, 0);
+    let final_file = destination.join("large.bin");
+    assert_eq!(fs::read(&final_file)?, payload);
+    // The final file is a fresh object — the seeded partial was not spliced
+    // in — and the orphan was reclaimed without becoming an extra.
+    assert!(!temp_identity.matches(metadata_at(&final_file)?.identity));
+    assert!(!destination.join(&temp_name).exists());
+    assert_eq!(report.warnings.get("temp_reclaimed").copied(), Some(1));
+    assert_eq!(report.counters.extra, 0);
+    let leftovers: Vec<_> = fs::read_dir(&destination)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .filter(|name| name.to_string_lossy().starts_with(".bigcp-"))
+        .collect();
+    assert!(leftovers.is_empty(), "stray partials: {leftovers:?}");
     Ok(())
 }

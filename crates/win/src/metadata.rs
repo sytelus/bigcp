@@ -249,33 +249,45 @@ pub fn enumerate_directory(path: &Path) -> io::Result<Vec<DirectoryEntry>> {
                     "directory enumeration returned a truncated record",
                 ));
             }
-            // SAFETY: offset was bounds checked and records are naturally
-            // aligned by the kernel. We copy fixed fields before reusing the
-            // enumeration buffer.
             if !offset.is_multiple_of(size_of::<u64>()) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "directory enumeration returned a misaligned record",
                 ));
             }
+            // SAFETY: offset and eight-byte alignment were checked above.
+            // The fixed prefix is copied by value — a `&FILE_ID_EXTD_DIR_INFO`
+            // is never formed, because a reference's provenance would not
+            // cover the variable-length name that follows the struct.
             let record = unsafe {
-                &*buffer
+                buffer
                     .as_ptr()
                     .add(offset / size_of::<u64>())
                     .cast::<FILE_ID_EXTD_DIR_INFO>()
+                    .read()
             };
+            let name_field_offset = std::mem::offset_of!(FILE_ID_EXTD_DIR_INFO, FileName);
             let (name_units, next_offset) = directory_record_layout(
                 offset,
                 byte_len,
                 size_of::<FILE_ID_EXTD_DIR_INFO>(),
-                std::mem::offset_of!(FILE_ID_EXTD_DIR_INFO, FileName),
+                name_field_offset,
                 record.FileNameLength,
                 record.NextEntryOffset,
                 "directory enumeration",
             )?;
-            // SAFETY: the name bounds and two-byte alignment were checked.
-            let name_slice =
-                unsafe { std::slice::from_raw_parts(record.FileName.as_ptr(), name_units) };
+            // SAFETY: the name bounds and two-byte alignment were checked by
+            // directory_record_layout; the pointer derives from the backing
+            // buffer, so its provenance spans the whole allocation.
+            let name_slice = unsafe {
+                std::slice::from_raw_parts(
+                    buffer
+                        .as_ptr()
+                        .cast::<u16>()
+                        .add((offset + name_field_offset) / size_of::<u16>()),
+                    name_units,
+                )
+            };
             let name = OsString::from_wide(name_slice);
             if validate_child_name(&name)? {
                 let kind = classify_kind(record.FileAttributes, record.ReparsePointTag);
@@ -370,25 +382,38 @@ fn enumerate_directory_legacy(
                     "legacy directory enumeration returned a misaligned record",
                 ));
             }
-            // SAFETY: fixed record and alignment were checked above.
+            // SAFETY: fixed record size and alignment were checked above. The
+            // fixed prefix is copied by value — no reference is formed whose
+            // provenance would exclude the trailing variable-length name.
             let record = unsafe {
-                &*buffer
+                buffer
                     .as_ptr()
                     .add(offset / size_of::<u64>())
                     .cast::<FILE_ID_BOTH_DIR_INFO>()
+                    .read()
             };
+            let name_field_offset = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
             let (name_units, next_offset) = directory_record_layout(
                 offset,
                 byte_len,
                 size_of::<FILE_ID_BOTH_DIR_INFO>(),
-                std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName),
+                name_field_offset,
                 record.FileNameLength,
                 record.NextEntryOffset,
                 "legacy directory enumeration",
             )?;
-            // SAFETY: the name bounds and two-byte alignment were checked.
-            let name_slice =
-                unsafe { std::slice::from_raw_parts(record.FileName.as_ptr(), name_units) };
+            // SAFETY: the name bounds and two-byte alignment were checked by
+            // directory_record_layout; the pointer derives from the backing
+            // buffer, so its provenance spans the whole allocation.
+            let name_slice = unsafe {
+                std::slice::from_raw_parts(
+                    buffer
+                        .as_ptr()
+                        .cast::<u16>()
+                        .add((offset + name_field_offset) / size_of::<u16>()),
+                    name_units,
+                )
+            };
             let name = OsString::from_wide(name_slice);
             if validate_child_name(&name)? {
                 // FAT/exFAT do not support reparse points. Preserving the
@@ -496,6 +521,16 @@ fn validate_child_name(name: &OsStr) -> io::Result<bool> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "directory enumeration returned a name containing NUL",
+        ));
+    }
+    // No real local filesystem returns `:` inside a child name, but a hostile
+    // or buggy redirector could. `dir\victim.txt:payload` parses as a single
+    // normal component, and joining it would address an alternate data stream
+    // of a *sibling* at the destination — data landing in the wrong file.
+    if name.encode_wide().any(|unit| unit == u16::from(b':')) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "directory enumeration returned a name containing a stream separator",
         ));
     }
     let mut components = Path::new(name).components();
@@ -628,7 +663,17 @@ mod tests {
             Some(true)
         );
         assert_eq!(validate_child_name(OsStr::new(".")).ok(), Some(false));
-        for invalid in [r"\escape", r"..\escape", r"C:escape", "two/parts"] {
+        // `victim.txt:payload` is a single Normal component to the path
+        // parser, but joining it would address a sibling's alternate data
+        // stream at the destination — it must be rejected outright.
+        for invalid in [
+            r"\escape",
+            r"..\escape",
+            r"C:escape",
+            "two/parts",
+            "victim.txt:payload",
+            ":bare-stream",
+        ] {
             assert!(validate_child_name(OsStr::new(invalid)).is_err());
         }
         assert!(validate_child_name(&OsString::from_wide(&[u16::from(b'a'), 0])).is_err());

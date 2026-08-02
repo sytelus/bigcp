@@ -34,8 +34,15 @@ pub(crate) fn classify(
         data_differences.push("mtime");
     }
     if !data_differences.is_empty() {
-        let destination_newer =
-            destination.metadata.basic.last_write_time > source.metadata.basic.last_write_time;
+        // "Destination newer" feeds the replacement log and summary stats, so
+        // it uses the same quantized comparison as the mtime membership test:
+        // on FAT/exFAT a raw tick difference inside the representable quantum
+        // is storage granularity, not a genuinely newer destination.
+        let destination_newer = !policy.last_write_equal(
+            source.metadata.basic.last_write_time,
+            destination.metadata.basic.last_write_time,
+        ) && destination.metadata.basic.last_write_time
+            > source.metadata.basic.last_write_time;
         return if replace {
             Classification::Replace {
                 fields: data_differences,
@@ -178,6 +185,36 @@ mod tests {
         assert!(matches!(
             classify(&source, Some(&destination), true, policy(FileSystem::Ntfs, true)),
             Classification::MetadataDiff(fields) if fields == ["ea_size"]
+        ));
+    }
+
+    #[test]
+    fn destination_newer_respects_the_filesystem_timestamp_quantum() {
+        // FAT represents mtime in 2-second steps. A size-only difference with
+        // policy-equal mtimes must not claim the destination is newer merely
+        // because the raw ticks differ inside one quantum.
+        let source = entry(2, 20_000_000, 0, ObjectKind::File);
+        let destination = entry(1, 20_000_009, 0, ObjectKind::File);
+        assert!(matches!(
+            classify(
+                &source,
+                Some(&destination),
+                true,
+                policy(FileSystem::Fat, false)
+            ),
+            Classification::Replace {
+                destination_newer: false,
+                ..
+            }
+        ));
+        // A genuinely newer destination (outside the quantum) still reports.
+        let newer = entry(1, 60_000_000, 0, ObjectKind::File);
+        assert!(matches!(
+            classify(&source, Some(&newer), true, policy(FileSystem::Fat, false)),
+            Classification::Replace {
+                destination_newer: true,
+                ..
+            }
         ));
     }
 

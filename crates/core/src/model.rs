@@ -355,7 +355,8 @@ pub struct RunSnapshot {
     pub write_bytes_per_second: f64,
     /// Running failures by category.
     pub failures_by_category: BTreeMap<ErrorCategory, u64>,
-    /// Most recently active relative paths.
+    /// Most recently settled relative file paths, oldest first. Bounded to a
+    /// handful of entries; display surfaces typically show the last one.
     pub active_paths: Vec<PathBuf>,
 }
 

@@ -27,6 +27,31 @@ struct VerificationFeatures {
     eas: bool,
 }
 
+// Verification reads both trees, so a read failure must indict the side that
+// was actually read: categories and hints otherwise send operators to the
+// wrong tree.
+#[derive(Clone, Copy)]
+enum VerifySide {
+    Source,
+    Destination,
+}
+
+impl VerifySide {
+    const fn noun(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Destination => "destination",
+        }
+    }
+
+    const fn changed_category(self) -> ErrorCategory {
+        match self {
+            Self::Source => ErrorCategory::SourceChanged,
+            Self::Destination => ErrorCategory::DestinationChanged,
+        }
+    }
+}
+
 /// One file and source digest captured during a copy run.
 pub struct VerificationTarget {
     /// Relative path used in mismatch reports.
@@ -66,6 +91,7 @@ pub(crate) fn verify_written_targets(
                 streams: policy.supports_streams(),
                 eas: policy.supports_eas(),
             },
+            VerifySide::Destination,
         ) {
             Ok((size, digest, streams, ea_digest)) => match metadata_at(&target.destination_path) {
                 Ok(metadata) => {
@@ -244,10 +270,27 @@ pub fn run_standalone_verify(options: &VerifyOptions) -> Result<VerificationSumm
     }
     let mut tasks = vec![(source, destination, PathBuf::new())];
     while let Some((source_dir, destination_dir, relative_dir)) = tasks.pop() {
-        let source_entries = enumerate_directory(&source_dir)
-            .map_err(|error| BigcpError::io("enumerate verify source", error))?;
-        let destination_entries = enumerate_directory(&destination_dir)
-            .map_err(|error| BigcpError::io("enumerate verify destination", error))?;
+        // An unenumerable directory fails verification for that subtree but
+        // must not abort the run: the rest of the tree still gets a verdict.
+        let source_entries = match enumerate_directory(&source_dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                record_enumeration_failure(&mut summary, &relative_dir, VerifySide::Source, &error);
+                continue;
+            }
+        };
+        let destination_entries = match enumerate_directory(&destination_dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                record_enumeration_failure(
+                    &mut summary,
+                    &relative_dir,
+                    VerifySide::Destination,
+                    &error,
+                );
+                continue;
+            }
+        };
         let mut destination_map = HashMap::new();
         for entry in destination_entries {
             let key = comparison_key(&entry.name, policy.names_are_case_sensitive())
@@ -443,22 +486,24 @@ fn verify_file_pair(
     if !metadata_equal {
         return Err("copied metadata differs".to_owned());
     }
-    let comparison_features = VerificationFeatures {
-        streams: destination_features.streams,
-        eas: destination_features.eas,
-    };
     let (_, source_digest, source_streams, source_eas) = digest_file_streams_and_eas(
         source,
         counters,
         VerificationFeatures {
-            streams: comparison_features.streams && source_features.streams,
-            eas: comparison_features.eas && source_features.eas,
+            streams: destination_features.streams && source_features.streams,
+            eas: destination_features.eas && source_features.eas,
         },
+        VerifySide::Source,
     )
     .map_err(|error| format!("could not be verified (read failed: {error})"))?;
     let (_, destination_digest, destination_streams, destination_eas) =
-        digest_file_streams_and_eas(destination, counters, comparison_features)
-            .map_err(|error| format!("could not be verified (read failed: {error})"))?;
+        digest_file_streams_and_eas(
+            destination,
+            counters,
+            destination_features,
+            VerifySide::Destination,
+        )
+        .map_err(|error| format!("could not be verified (read failed: {error})"))?;
     if source_digest != destination_digest
         || source_streams != destination_streams
         || source_eas != destination_eas
@@ -470,7 +515,11 @@ fn verify_file_pair(
     Ok(())
 }
 
-fn digest_file(path: &Path, counters: &mut Counters) -> Result<(u64, String), OperationError> {
+fn digest_file(
+    path: &Path,
+    counters: &mut Counters,
+    side: VerifySide,
+) -> Result<(u64, String), OperationError> {
     let mut file = SourceFile::open(path)
         .map_err(|error| OperationError::from_io("verify_open", path.to_path_buf(), &error))?;
     let opened = file.opened_metadata().clone();
@@ -496,10 +545,10 @@ fn digest_file(path: &Path, counters: &mut Counters) -> Result<(u64, String), Op
         || observed.basic.last_write_time != opened.basic.last_write_time
         || observed.size != total
     {
-        return Err(OperationError::semantic(
-            ErrorCategory::SourceChanged,
+        return Err(changed_during_verify(
+            side,
             "verify_revalidate",
-            path.to_path_buf(),
+            path,
             "file size changed during verification",
         ));
     }
@@ -510,12 +559,13 @@ fn digest_file_streams_and_eas(
     path: &Path,
     counters: &mut Counters,
     features: VerificationFeatures,
+    side: VerifySide,
 ) -> Result<DigestedFile, OperationError> {
     let before = metadata_at(path)
         .map_err(|error| OperationError::from_io("verify_stat", path.to_path_buf(), &error))?;
-    let (size, digest) = digest_file(path, counters)?;
+    let (data_size, digest) = digest_file(path, counters, side)?;
     let named = if features.streams {
-        digest_named_streams(path, counters, false)?
+        digest_named_streams(path, counters, false, side)?
     } else {
         Vec::new()
     };
@@ -536,20 +586,21 @@ fn digest_file_streams_and_eas(
         || before.size != after.size
         || before.basic.last_write_time != after.basic.last_write_time
     {
-        return Err(OperationError::semantic(
-            ErrorCategory::SourceChanged,
+        return Err(changed_during_verify(
+            side,
             "verify_revalidate",
-            path.to_path_buf(),
+            path,
             "file identity, size, or last-write time changed during stream verification",
         ));
     }
-    Ok((size, digest, named, ea_digest))
+    Ok((data_size, digest, named, ea_digest))
 }
 
 fn digest_named_streams(
     path: &Path,
     counters: &mut Counters,
     open_reparse: bool,
+    side: VerifySide,
 ) -> Result<Vec<(StreamInfo, String)>, OperationError> {
     let streams = list_streams(path)
         .map_err(|error| OperationError::from_io("verify_streams", path.to_path_buf(), &error))?;
@@ -578,10 +629,10 @@ fn digest_named_streams(
             counters.bytes_verified = counters.bytes_verified.saturating_add(count as u64);
         }
         if total != stream.size {
-            return Err(OperationError::semantic(
-                ErrorCategory::SourceChanged,
+            return Err(changed_during_verify(
+                side,
                 "verify_read_stream",
-                path.to_path_buf(),
+                path,
                 "named stream size changed during verification",
             ));
         }
@@ -600,13 +651,13 @@ fn directory_aux_equal(
     destination_features: VerificationFeatures,
 ) -> std::io::Result<bool> {
     let source_streams = if destination_features.streams && source_features.streams {
-        digest_named_streams(source, counters, open_reparse)
+        digest_named_streams(source, counters, open_reparse, VerifySide::Source)
             .map_err(|error| std::io::Error::other(error.to_string()))?
     } else {
         Vec::new()
     };
     let destination_streams = if destination_features.streams {
-        digest_named_streams(destination, counters, open_reparse)
+        digest_named_streams(destination, counters, open_reparse, VerifySide::Destination)
             .map_err(|error| std::io::Error::other(error.to_string()))?
     } else {
         Vec::new()
@@ -624,8 +675,255 @@ fn directory_aux_equal(
     Ok(source_streams == destination_streams && source_eas == destination_eas)
 }
 
+fn changed_during_verify(
+    side: VerifySide,
+    operation: &str,
+    path: &Path,
+    what: &str,
+) -> OperationError {
+    OperationError::semantic(
+        side.changed_category(),
+        operation,
+        path.to_path_buf(),
+        format!("{} {what}", side.noun()),
+    )
+}
+
+fn record_enumeration_failure(
+    summary: &mut VerificationSummary,
+    relative_dir: &Path,
+    side: VerifySide,
+    error: &std::io::Error,
+) {
+    summary.failed = summary.failed.saturating_add(1);
+    push_mismatch(
+        summary,
+        format!(
+            "{}: {} directory could not be enumerated (read failed: {error})",
+            relative_dir.display(),
+            side.noun()
+        ),
+    );
+}
+
 fn push_mismatch(summary: &mut VerificationSummary, message: String) {
     if summary.mismatches.len() < MISMATCH_SAMPLE_LIMIT {
         summary.mismatches.push(message);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use bigcp_win::{metadata_at, set_basic_at};
+
+    use super::{
+        MISMATCH_SAMPLE_LIMIT, VerifySide, changed_during_verify, record_enumeration_failure,
+        run_standalone_verify,
+    };
+    use crate::error::ErrorCategory;
+    use crate::options::VerifyOptions;
+    use crate::report::VerificationSummary;
+
+    fn stamp_matching_basic(source: &Path, destination: &Path) {
+        let metadata = metadata_at(source);
+        assert!(metadata.is_ok());
+        let Some(metadata) = metadata.ok() else {
+            return;
+        };
+        assert!(set_basic_at(destination, metadata.basic).is_ok());
+    }
+
+    // Standalone verification compares timestamps exactly on NTFS, so the
+    // independently created destination is restamped from source metadata.
+    fn align_destination_metadata(source: &Path, destination: &Path) {
+        for relative in ["alpha.txt", "beta.bin", "sub/gamma.txt", "sub"] {
+            stamp_matching_basic(&source.join(relative), &destination.join(relative));
+        }
+        stamp_matching_basic(source, destination);
+    }
+
+    fn build_matching_trees(sandbox: &Path) -> (PathBuf, PathBuf) {
+        let source = sandbox.join("source");
+        let destination = sandbox.join("destination");
+        for root in [&source, &destination] {
+            assert!(fs::create_dir(root).is_ok());
+            assert!(fs::create_dir(root.join("sub")).is_ok());
+            assert!(fs::write(root.join("alpha.txt"), b"alpha contents").is_ok());
+            assert!(fs::write(root.join("beta.bin"), [0x5a_u8; 1024]).is_ok());
+            assert!(fs::write(root.join("sub").join("gamma.txt"), b"gamma contents").is_ok());
+        }
+        align_destination_metadata(&source, &destination);
+        (source, destination)
+    }
+
+    fn verified(source: PathBuf, destination: PathBuf) -> Option<VerificationSummary> {
+        let summary = run_standalone_verify(&VerifyOptions {
+            source,
+            destination,
+        });
+        assert!(
+            summary.is_ok(),
+            "standalone verify failed: {:?}",
+            summary.as_ref().err()
+        );
+        summary.ok()
+    }
+
+    #[test]
+    fn identical_trees_verify_with_no_failures() {
+        let sandbox = tempfile::tempdir();
+        assert!(sandbox.is_ok());
+        let Some(sandbox) = sandbox.ok() else {
+            return;
+        };
+        let (source, destination) = build_matching_trees(sandbox.path());
+        let Some(summary) = verified(source, destination) else {
+            return;
+        };
+        assert_eq!(summary.failed, 0, "mismatches: {:?}", summary.mismatches);
+        assert!(summary.passed > 0);
+    }
+
+    #[test]
+    fn changed_content_is_counted_and_named() {
+        let sandbox = tempfile::tempdir();
+        assert!(sandbox.is_ok());
+        let Some(sandbox) = sandbox.ok() else {
+            return;
+        };
+        let (source, destination) = build_matching_trees(sandbox.path());
+        // Same length keeps the size gate equal so only the digest differs.
+        assert!(fs::write(destination.join("alpha.txt"), b"ALPHA CONTENTS").is_ok());
+        align_destination_metadata(&source, &destination);
+        let Some(summary) = verified(source, destination) else {
+            return;
+        };
+        assert!(summary.failed >= 1);
+        assert!(
+            summary
+                .mismatches
+                .iter()
+                .any(|line| line.contains("alpha.txt") && line.contains("differ"))
+        );
+    }
+
+    #[test]
+    fn missing_destination_file_is_counted_as_missing() {
+        let sandbox = tempfile::tempdir();
+        assert!(sandbox.is_ok());
+        let Some(sandbox) = sandbox.ok() else {
+            return;
+        };
+        let (source, destination) = build_matching_trees(sandbox.path());
+        assert!(fs::remove_file(destination.join("sub").join("gamma.txt")).is_ok());
+        // The removal restamps only the directory it changed.
+        stamp_matching_basic(&source.join("sub"), &destination.join("sub"));
+        let Some(summary) = verified(source, destination) else {
+            return;
+        };
+        assert!(summary.failed >= 1);
+        assert!(
+            summary
+                .mismatches
+                .iter()
+                .any(|line| line.contains("gamma.txt") && line.ends_with(": missing"))
+        );
+    }
+
+    #[test]
+    fn extra_destination_file_is_counted_as_extra() {
+        let sandbox = tempfile::tempdir();
+        assert!(sandbox.is_ok());
+        let Some(sandbox) = sandbox.ok() else {
+            return;
+        };
+        let (source, destination) = build_matching_trees(sandbox.path());
+        assert!(fs::write(destination.join("extra.txt"), b"leftover").is_ok());
+        stamp_matching_basic(&source, &destination);
+        let Some(summary) = verified(source, destination) else {
+            return;
+        };
+        assert!(summary.failed >= 1);
+        assert!(
+            summary
+                .mismatches
+                .iter()
+                .any(|line| line.ends_with("extra.txt: extra"))
+        );
+    }
+
+    #[test]
+    fn enumeration_failures_fold_into_the_summary_and_stay_bounded() {
+        let mut summary = VerificationSummary::default();
+        record_enumeration_failure(
+            &mut summary,
+            Path::new("sub"),
+            VerifySide::Source,
+            &std::io::Error::from_raw_os_error(5),
+        );
+        assert_eq!(summary.failed, 1);
+        assert!(summary.mismatches.first().is_some_and(|line| {
+            line.starts_with("sub: source directory could not be enumerated (read failed:")
+        }));
+        record_enumeration_failure(
+            &mut summary,
+            Path::new("sub"),
+            VerifySide::Destination,
+            &std::io::Error::from_raw_os_error(5),
+        );
+        assert!(
+            summary
+                .mismatches
+                .get(1)
+                .is_some_and(|line| line.contains("destination directory could not be enumerated"))
+        );
+        for _ in 0..MISMATCH_SAMPLE_LIMIT {
+            record_enumeration_failure(
+                &mut summary,
+                Path::new("sub"),
+                VerifySide::Source,
+                &std::io::Error::from_raw_os_error(5),
+            );
+        }
+        let recorded = u64::try_from(MISMATCH_SAMPLE_LIMIT);
+        assert!(recorded.is_ok());
+        let Some(recorded) = recorded.ok() else {
+            return;
+        };
+        assert_eq!(summary.failed, recorded.saturating_add(2));
+        assert_eq!(summary.mismatches.len(), MISMATCH_SAMPLE_LIMIT);
+    }
+
+    #[test]
+    fn read_failures_name_and_classify_the_side_that_was_read() {
+        let source_error = changed_during_verify(
+            VerifySide::Source,
+            "verify_revalidate",
+            Path::new("alpha.txt"),
+            "file size changed during verification",
+        );
+        assert_eq!(source_error.category, ErrorCategory::SourceChanged);
+        assert_eq!(
+            source_error.message,
+            "source file size changed during verification"
+        );
+        let destination_error = changed_during_verify(
+            VerifySide::Destination,
+            "verify_revalidate",
+            Path::new("alpha.txt"),
+            "file size changed during verification",
+        );
+        assert_eq!(
+            destination_error.category,
+            ErrorCategory::DestinationChanged
+        );
+        assert_eq!(
+            destination_error.message,
+            "destination file size changed during verification"
+        );
+        assert!(destination_error.hint.contains("destination"));
     }
 }

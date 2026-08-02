@@ -28,12 +28,13 @@ is recorded in the log/report and changes scheduling only—not copy semantics.
 The repository is currently **pre-1.0**. The ordinary-tree engine, safety
 contract, and measured performance work are implemented (bigcp leads robocopy
 on every measured small-file cell with default settings; see `BENCHMARKS.md`).
-A bounded fallback for exceptionally large single directories and the final
-production-validation pass in PLAN §12.10 remain before a 1.0 claim. Do not
-treat this build as v1.0 certified for its NTFS contract until those gates
-pass. Non-NTFS filesystems are intentionally best-effort rather than
-certification-gated. Current evidence and status are summarized in
-[docs/PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md).
+The remaining 1.0 gates — among them a bounded fallback for exceptionally
+large single directories and the final production-validation pass in PLAN
+§12.10 — are tracked authoritatively in
+[docs/PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md); do not treat
+this build as v1.0 certified for its NTFS contract until that list closes.
+Non-NTFS filesystems are intentionally best-effort rather than
+certification-gated.
 
 ## Safety contract
 
@@ -108,8 +109,9 @@ bigcp C:\source D:\destination --dry-run --plain
 # Full, authoritative comparison of both trees
 bigcp verify C:\source D:\destination
 
-# Reopen a saved report
+# Reopen a saved report; --plain prints the stable summary instead of the browser
 bigcp report C:\audit\run.report.json
+bigcp report C:\audit\run.report.json --plain
 ```
 
 The normal rerun command is the same command again. Completed files are
@@ -132,6 +134,7 @@ xxh3-128 digest agrees.
 | `--fresh` | Ignore prior partial checkpoints. |
 | `--accept-degraded-filesystem` | Accept FAT/exFAT destination losses without an interactive startup confirmation. |
 | `--accept-remote-paths` | Accept UNC/WSL disconnect, metadata, and remote-durability limits without an interactive startup confirmation. |
+| `--accept-write-cache-policy` | Continue past the Quick-removal write-cache notice without the interactive prompt; the notice still prints. |
 | `--profile CLASS[,CLASS]` | Force static source/destination device classes. |
 | `--tune key=value,...` | Override bounded advanced settings. |
 | `--analyze` | Collect bounded live-run insight (size-class timings, top-20 slowest copies, finer stat samples) into the log and report. |
@@ -150,11 +153,15 @@ transfers use a fixed two-buffer pipeline and may run independent files below
 the checkpoint threshold on the bounded worker pool; local standard transfers
 retain the original request-at-a-time loop. WSL has a distinct transport/profile
 identity even though it reuses the ordered pipeline: Auto uses 8 MiB requests
-and up to 16 workers, and WSL destination creates are striped across those
-workers instead of inheriting NTFS directory affinity.
-Manual bounds are enforced in the core library as well as the CLI: workers are
-`1..=256`, chunks `64 KiB..=64 MiB`, and thresholds
-must be positive. On the standard path, a `mem` budget reserves one coordinator
+and up to 32 workers, and small-file work is striped across those workers
+whenever either side is WSL instead of inheriting NTFS directory affinity.
+Large non-sparse, non-checkpointed files with exactly one WSL side transfer
+as 2–8 parallel identity-verified segments of one temporary, because a single
+Plan 9 handle caps well below what the boundary can carry in aggregate
+(measured in BENCHMARKS.md; ADR 0052).
+Manual bounds are enforced in the core library — workers `1..=256`, chunks
+`64 KiB..=64 MiB`, thresholds positive — while the CLI itself validates only
+syntax and positivity. On the standard path, a `mem` budget reserves one coordinator
 chunk and must also hold at least one large-threshold worker buffer. The
 redirector path reserves two coordinator chunks and
 `max(large-threshold, 2 × chunk)` for each worker. Remaining bytes cap the
@@ -175,7 +182,8 @@ topology policy.
   that was not verified prints a ready-to-run standalone verification command.
 - Saved reports open on a Summary tab. Errors, device/profile facts,
   performance evidence, hints, and audit locations remain one key away. Empty
-  error views say so explicitly instead of showing an unexplained blank table.
+  error and hint views say so explicitly instead of showing an unexplained
+  blank pane.
 - `--plain` progress remains stable and machine-friendly. Standalone
   verification continues to emit JSON on stdout so it can be redirected or
   parsed without scraping human text.
@@ -186,7 +194,7 @@ topology policy.
 |---:|---|
 | 0 | Run completed and all attempted objects succeeded. |
 | 2 | One or more objects failed or verification found mismatches. |
-| 3 | Graceful user cancellation; rerun to continue. Cancel takes effect between chunks, so even a huge in-flight file stops promptly and safely. |
+| 3 | Graceful user cancellation; rerun to continue. `q`/Esc/Ctrl+C request it in the dashboard; in plain, quiet, or redirected runs the first Ctrl+C cancels and a second force-quits (the rerun repairs). Cancel takes effect between chunks, so even a huge in-flight file stops promptly and safely. |
 | 4 | Stopped early by the circuit breaker: repeated device/share disconnect or disk-full failures. Reconnect the endpoint or free space, then rerun to resume. |
 | 5 | Preflight, configuration, root-lock, or fatal I/O failure. |
 | 6 | Audit, output/format, or internal invariant failure. |
@@ -224,11 +232,15 @@ portable contract; Linux uid/gid/mode/xattrs, special files, Windows
 creation/access times and attributes, ADS/EAs, ACLs, EFS state, sparse layout,
 and reparse objects are not claimed. Unsupported reparse objects fail rather
 than being followed or flattened. The WSL path uses bounded two-buffer overlap,
-striped destination creates, sequential cache hints, and one authoritative
-post-write metadata stamp to reduce Plan 9 calls. Windows access still crosses
-that translation boundary, so native Linux tools remain faster for sustained
-work entirely inside a distribution. The WSL defaults are correctness-tested
-but remain performance-unmeasured until an approved disposable path is used.
+striped small-file dispatch on either WSL side, segmented parallel large-file
+transfers, sequential cache hints, and one authoritative post-write metadata
+stamp to reduce Plan 9 calls. Measured on a real `\\wsl.localhost` endpoint
+(2026-08-02, BENCHMARKS.md): small files into WSL run ~50% ahead of
+robocopy's best swept `/MT` setting (out of WSL, within ~9% of it), and
+large files land within ~9% in both directions, with the best Win→WSL run
+tying it. Windows access still crosses
+the translation boundary, so native Linux tools remain faster for sustained
+work entirely inside a distribution.
 See [LIMITATIONS.md](LIMITATIONS.md) and the normative
 [docs/SEMANTICS.md](docs/SEMANTICS.md).
 
@@ -246,7 +258,9 @@ measured at **~3.4× on a 20,000-file workload** (BENCHMARKS.md):
 - **Quick removal** (Windows default): you may unplug without clicking
   anything, but every file's metadata is pushed to the drive individually —
   the slow path. bigcp detects this before a copy starts, warns, and (in an
-  interactive terminal) asks once whether to continue.
+  interactive terminal) asks once whether to continue. Pass
+  `--accept-write-cache-policy` to skip that prompt in scripts and automation;
+  the notice still prints.
 - **Better performance** — the recommended setting, with its two checkboxes
   handled differently:
   - **"Enable write caching on the device": CHECK IT.** This is where the
@@ -282,7 +296,11 @@ or remove that destination object and rerun so bigcp can recreate it.
   it with a fully finished copy. That is the crash-safety design working.
 - **What are `.bigcp-…part` files?** Opaque in-flight temps for transactional
   files (ADS/EA, sparse, or large). In-process kills remove them automatically;
-  a resumable large-file partial persists on purpose and is verified before reuse. Anything the journal
+  a resumable large-file partial persists on purpose and is verified before reuse. When a partial's
+  checkpoint becomes unreachable (its source file was deleted, `--fresh`, or a
+  changed job signature), a rerun automatically reclaims it after verifying the
+  journal-recorded filesystem identity — proof that bigcp created that exact
+  file. Anything the journal
   cannot prove bigcp created is reported, never auto-deleted.
 - **A run was interrupted — can I trust the destination?** Not until a rerun
   completes. Plain small files write directly to their final names for speed,

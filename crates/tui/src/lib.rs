@@ -15,7 +15,7 @@ use bigcp_core::report::VerificationSummary;
 use bigcp_core::{
     BigcpError, CopyOptions, RunObserver, RunReport, RunSnapshot, RunState, run_copy,
 };
-use crossterm::event::{self, Event, KeyCode};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -53,13 +53,20 @@ pub fn stdout_is_terminal() -> bool {
 /// Plain, log-friendly observer for redirected output and scripts.
 pub struct PlainObserver {
     quiet: bool,
+    /// External cancellation source (typically a console Ctrl+C flag). The
+    /// TUI crate forbids unsafe code, so the caller supplies the probe as a
+    /// plain function instead of this crate touching Win32 itself.
+    cancel: Option<fn() -> bool>,
 }
 
 impl PlainObserver {
     /// Creates a plain observer.
+    ///
+    /// `cancel`, when provided, is polled by the copy engine between bounded
+    /// work units; returning true requests a graceful stop (exit 3).
     #[must_use]
-    pub const fn new(quiet: bool) -> Self {
-        Self { quiet }
+    pub const fn new(quiet: bool, cancel: Option<fn() -> bool>) -> Self {
+        Self { quiet, cancel }
     }
 }
 
@@ -92,6 +99,10 @@ impl RunObserver for PlainObserver {
             let _ = writeln!(io::stdout().lock(), "{message}");
         }
     }
+
+    fn cancellation_requested(&self) -> bool {
+        self.cancel.is_some_and(|cancel| cancel())
+    }
 }
 
 #[derive(Default)]
@@ -103,6 +114,10 @@ struct LiveState {
 struct DashboardObserver {
     state: Arc<Mutex<LiveState>>,
     canceled: Arc<AtomicBool>,
+    /// Console Ctrl+C flag. While the dashboard owns the terminal, raw mode
+    /// turns Ctrl+C into a key event handled by the event loop; this probe
+    /// matters when the dashboard has died and the copy continues headless.
+    console_cancel: Option<fn() -> bool>,
 }
 
 impl RunObserver for DashboardObserver {
@@ -117,28 +132,27 @@ impl RunObserver for DashboardObserver {
     }
 
     fn cancellation_requested(&self) -> bool {
-        self.canceled.load(Ordering::Relaxed)
+        self.canceled.load(Ordering::Relaxed) || self.console_cancel.is_some_and(|cancel| cancel())
     }
-}
-
-/// Runs a copy worker beside the full-screen live dashboard.
-pub fn run_dashboard(options: CopyOptions) -> Result<RunReport, BigcpError> {
-    run_dashboard_with_color(options, true)
 }
 
 /// Runs a copy worker beside the dashboard, optionally without color styling.
 ///
 /// Disabling color does not select line-oriented output; callers use
 /// [`PlainObserver`] explicitly when they need a script-friendly stream.
+/// `console_cancel`, when provided, lets a console Ctrl+C flag request a
+/// graceful stop even if the dashboard itself has failed.
 pub fn run_dashboard_with_color(
     options: CopyOptions,
     color_enabled: bool,
+    console_cancel: Option<fn() -> bool>,
 ) -> Result<RunReport, BigcpError> {
     let state = Arc::new(Mutex::new(LiveState::default()));
     let canceled = Arc::new(AtomicBool::new(false));
     let observer = DashboardObserver {
         state: Arc::clone(&state),
         canceled: Arc::clone(&canceled),
+        console_cancel,
     };
     let (sender, receiver) = mpsc::sync_channel(1);
     std::thread::scope(|scope| {
@@ -152,17 +166,29 @@ pub fn run_dashboard_with_color(
             Ok(None) => receiver.recv().map_err(|error| {
                 BigcpError::Invariant(format!("copy worker disappeared: {error}"))
             })?,
-            Err(error) => receiver.recv().map_err(|recv| {
-                BigcpError::Invariant(format!(
-                    "dashboard failed ({error}) and copy worker disappeared ({recv})"
-                ))
-            })?,
+            Err(error) => {
+                // The TerminalSession was restored when dashboard_loop
+                // returned, so stderr reaches the user. The copy worker is
+                // unaffected; without this notice the terminal would sit
+                // silent for the rest of the run and the user would have no
+                // way to know the copy is still progressing.
+                let _ = writeln!(
+                    io::stderr(),
+                    "bigcp: live dashboard failed ({error}); the copy continues without display. \
+                     Ctrl+C still cancels between chunks; a second Ctrl+C force-quits (rerun resumes)."
+                );
+                receiver.recv().map_err(|recv| {
+                    BigcpError::Invariant(format!(
+                        "dashboard failed ({error}) and copy worker disappeared ({recv})"
+                    ))
+                })?
+            }
         }
     })
 }
 
 /// Opens the saved-report browser or prints a plain summary when redirected.
-pub fn show_report(report: &RunReport) -> io::Result<()> {
+pub fn show_report(report: &RunReport, color_enabled: bool) -> io::Result<()> {
     if !stdout_is_terminal() {
         return print_report_summary(report);
     }
@@ -171,24 +197,59 @@ pub fn show_report(report: &RunReport) -> io::Result<()> {
     loop {
         session
             .terminal
-            .draw(|frame| draw_report(frame, report, tab))?;
+            .draw(|frame| draw_report(frame, report, tab, color_enabled))?;
         if event::poll(Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break,
-                    KeyCode::Tab | KeyCode::Right => tab = (tab + 1) % REPORT_TABS.len(),
-                    KeyCode::BackTab | KeyCode::Left => {
-                        tab = (tab + REPORT_TABS.len() - 1) % REPORT_TABS.len();
-                    }
-                    KeyCode::Char(value @ '1'..='6') => {
-                        tab = usize::from(value as u8 - b'1');
-                    }
-                    _ => {}
+                match key_action(&key, tab, REPORT_TABS.len()) {
+                    KeyAction::Quit => break,
+                    KeyAction::SelectTab(next) => tab = next,
+                    KeyAction::None => {}
                 }
             }
         }
     }
     Ok(())
+}
+
+/// One decoded navigation action shared by both full-screen event loops.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KeyAction {
+    None,
+    Quit,
+    SelectTab(usize),
+}
+
+/// Maps a key event to a navigation action for a `tab_count`-tab screen.
+///
+/// Windows consoles deliver both press and release key events; acting on
+/// anything but `Press` fires every key twice, and with tab-cycling that made
+/// the odd-numbered tabs unreachable (each Tab advanced two positions).
+/// Ctrl+C is an explicit quit/cancel gesture here because raw mode disables
+/// the console's default Ctrl+C processing.
+fn key_action(key: &KeyEvent, current_tab: usize, tab_count: usize) -> KeyAction {
+    if key.kind != KeyEventKind::Press {
+        return KeyAction::None;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c' | 'C'))
+    {
+        return KeyAction::Quit;
+    }
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc => KeyAction::Quit,
+        KeyCode::Tab | KeyCode::Right => KeyAction::SelectTab((current_tab + 1) % tab_count),
+        KeyCode::BackTab | KeyCode::Left => {
+            KeyAction::SelectTab((current_tab + tab_count - 1) % tab_count)
+        }
+        KeyCode::Char(digit @ '1'..='9') => {
+            let index = usize::from(digit as u8 - b'1');
+            if index < tab_count {
+                KeyAction::SelectTab(index)
+            } else {
+                KeyAction::None
+            }
+        }
+        _ => KeyAction::None,
+    }
 }
 
 /// Prints the durable final summary used by both UI modes.
@@ -218,8 +279,6 @@ fn write_report_summary(output: &mut impl Write, report: &RunReport) -> io::Resu
             report.counters.would_copy_replaced,
             report.counters.would_meta_fix
         )?;
-    }
-    if report.run.dry_run {
         writeln!(
             output,
             "  Existing:    {} unchanged, {} withheld",
@@ -578,18 +637,13 @@ fn dashboard_loop(
             .draw(|frame| draw_live(frame, state, tab, color_enabled))?;
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => {
-                        canceled.store(true, Ordering::Relaxed);
-                    }
-                    KeyCode::Tab | KeyCode::Right => tab = (tab + 1) % LIVE_TABS.len(),
-                    KeyCode::BackTab | KeyCode::Left => {
-                        tab = (tab + LIVE_TABS.len() - 1) % LIVE_TABS.len();
-                    }
-                    KeyCode::Char(value @ '1'..='6') => {
-                        tab = usize::from(value as u8 - b'1');
-                    }
-                    _ => {}
+                match key_action(&key, tab, LIVE_TABS.len()) {
+                    // Quit is a graceful-cancel request, not an exit: the
+                    // loop keeps rendering until the worker acknowledges and
+                    // sends its final result.
+                    KeyAction::Quit => canceled.store(true, Ordering::Relaxed),
+                    KeyAction::SelectTab(next) => tab = next,
+                    KeyAction::None => {}
                 }
             }
         }
@@ -598,24 +652,31 @@ fn dashboard_loop(
 
 /// Formats the live remaining-time estimate (VISION's `/ETA` default).
 ///
-/// Discovery streams alongside copying, so the estimate covers the work
-/// found *so far* and grows as enumeration continues. It is suppressed while
-/// writes are idle — a skip-heavy rerun settles files without writing, and
-/// dividing by a near-zero write rate would display a meaningless figure.
+/// Discovery streams alongside copying, so the outstanding figure covers the
+/// work found *so far* and grows as enumeration continues. It may include
+/// bytes of files a rerun will end up skipping, so the estimate is an upper
+/// bound and advisory only. It is suppressed while writes are idle — a
+/// skip-heavy rerun settles files without writing, and dividing by a
+/// near-zero write rate would display a meaningless figure.
 fn eta_line(snapshot: &RunSnapshot) -> String {
-    let remaining = snapshot
+    let outstanding = snapshot
         .counters
         .bytes_enumerated
         .saturating_sub(snapshot.counters.bytes_logical_discovered);
-    if remaining == 0 || snapshot.write_bytes_per_second < 64.0 * 1024.0 {
+    if outstanding == 0 || snapshot.write_bytes_per_second < 64.0 * 1024.0 {
         return "ETA: —".to_owned();
     }
-    let seconds = remaining as f64 / snapshot.write_bytes_per_second;
+    let seconds = outstanding as f64 / snapshot.write_bytes_per_second;
     format!(
-        "ETA: {} for the {:.1} MiB discovered so far",
+        "ETA: {} for {:.1} MiB outstanding",
         format_eta(seconds),
-        remaining as f64 / (1024.0 * 1024.0)
+        mib(outstanding as f64)
     )
+}
+
+/// Converts a byte quantity (or bytes-per-second rate) to MiB for display.
+fn mib(bytes: f64) -> f64 {
+    bytes / (1024.0 * 1024.0)
 }
 
 #[allow(
@@ -711,8 +772,8 @@ fn draw_live(
                         "Data: {} read, {} written  Rate: {:.1} MiB/s read, {:.1} MiB/s write",
                         format_bytes(snapshot.counters.bytes_read_source),
                         format_bytes(snapshot.counters.bytes_written_destination),
-                        snapshot.read_bytes_per_second / (1024.0 * 1024.0),
-                        snapshot.write_bytes_per_second / (1024.0 * 1024.0)
+                        mib(snapshot.read_bytes_per_second),
+                        mib(snapshot.write_bytes_per_second)
                     )),
                     Line::from(eta_line(snapshot)),
                     Line::from(snapshot.active_paths.last().map_or_else(
@@ -729,8 +790,8 @@ fn draw_live(
         2 => frame.render_widget(
             Paragraph::new(format!(
                 "Current application read: {:.1} MiB/s\nCurrent application write: {:.1} MiB/s\n\nEndpoint kinds, static device classes, topology-selected transport, chunk/burst sizes, worker count, and confidence are persisted in the final report.",
-                snapshot.read_bytes_per_second / (1024.0 * 1024.0),
-                snapshot.write_bytes_per_second / (1024.0 * 1024.0)
+                mib(snapshot.read_bytes_per_second),
+                mib(snapshot.write_bytes_per_second)
             ))
             .wrap(Wrap { trim: true })
             .block(Block::default().borders(Borders::ALL).title("Devices")),
@@ -739,8 +800,8 @@ fn draw_live(
         3 => frame.render_widget(
             Paragraph::new(format!(
                 "Read: {:.1} MiB/s\nWrite: {:.1} MiB/s\nLogical data copied: {}\nFiles discovered: {}",
-                snapshot.read_bytes_per_second / (1024.0 * 1024.0),
-                snapshot.write_bytes_per_second / (1024.0 * 1024.0),
+                mib(snapshot.read_bytes_per_second),
+                mib(snapshot.write_bytes_per_second),
                 format_bytes(snapshot.counters.bytes_logical_copied),
                 snapshot.counters.files_discovered
             ))
@@ -768,7 +829,7 @@ fn draw_live(
         ),
     }
     frame.render_widget(
-        Paragraph::new("1–6 tabs  Tab/Shift-Tab navigate  q/Esc cancel gracefully")
+        Paragraph::new("1–6 tabs  Tab/Shift-Tab navigate  q/Esc/Ctrl+C cancel gracefully")
             .style(muted_style(color_enabled)),
         chunks[2],
     );
@@ -802,7 +863,12 @@ fn draw_live_errors(
     );
 }
 
-fn draw_report(frame: &mut ratatui::Frame<'_>, report: &RunReport, tab: usize) {
+fn draw_report(
+    frame: &mut ratatui::Frame<'_>,
+    report: &RunReport,
+    tab: usize,
+    color_enabled: bool,
+) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -811,7 +877,7 @@ fn draw_report(frame: &mut ratatui::Frame<'_>, report: &RunReport, tab: usize) {
             Constraint::Length(2),
         ])
         .split(frame.area());
-    draw_tabs(frame, chunks[0], tab, &REPORT_TABS, true);
+    draw_tabs(frame, chunks[0], tab, &REPORT_TABS, color_enabled);
     match tab {
         0 => frame.render_widget(
             Paragraph::new(format!(
@@ -896,6 +962,13 @@ fn draw_report(frame: &mut ratatui::Frame<'_>, report: &RunReport, tab: usize) {
             .block(Block::default().borders(Borders::ALL).title("Performance")),
             chunks[1],
         ),
+        // An empty view states so explicitly; a silent blank pane reads as a
+        // rendering failure (README "Command output" promises this).
+        4 if report.hints.is_empty() => frame.render_widget(
+            Paragraph::new("No hints were recorded for this run.")
+                .block(Block::default().borders(Borders::ALL).title("Hints")),
+            chunks[1],
+        ),
         4 => frame.render_widget(
             Paragraph::new(
                 report
@@ -926,7 +999,7 @@ fn draw_report(frame: &mut ratatui::Frame<'_>, report: &RunReport, tab: usize) {
     }
     frame.render_widget(
         Paragraph::new("1–6 tabs  Tab/Shift-Tab navigate  q quit")
-            .style(Style::default().fg(Color::DarkGray)),
+            .style(muted_style(color_enabled)),
         chunks[2],
     );
 }
@@ -1002,7 +1075,22 @@ impl TerminalSession {
         }
         let backend = CrosstermBackend::new(stdout);
         match Terminal::new(backend) {
-            Ok(terminal) => Ok(Self { terminal }),
+            Ok(terminal) => {
+                // Release builds abort on panic (workspace `panic = "abort"`),
+                // so Drop never runs on that path — without this hook a panic
+                // anywhere in the process (including the copy worker thread)
+                // would strand the user's console in raw mode inside the
+                // alternate screen. Panic hooks still run before an abort.
+                // bigcp installs no other hooks, so restoring the default on
+                // Drop is sufficient.
+                let previous = std::panic::take_hook();
+                std::panic::set_hook(Box::new(move |info| {
+                    let _ = disable_raw_mode();
+                    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+                    previous(info);
+                }));
+                Ok(Self { terminal })
+            }
             Err(error) => {
                 let _ = execute!(io::stdout(), LeaveAlternateScreen);
                 let _ = disable_raw_mode();
@@ -1014,31 +1102,110 @@ impl TerminalSession {
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
+        drop(std::panic::take_hook());
         let _ = disable_raw_mode();
         let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
         let _ = self.terminal.show_cursor();
     }
 }
 
-/// Returns the human-readable product name.
-#[must_use]
-pub const fn product_name() -> &'static str {
-    "bigcp"
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        LIVE_TABS, LiveState, draw_live, format_bytes, format_duration, friendly_path, next_step,
-        skipped_counts, verification_counts,
+        KeyAction, LIVE_TABS, LiveState, REPORT_TABS, draw_live, draw_report, format_bytes,
+        format_duration, format_eta, friendly_path, key_action, next_step, skipped_counts,
+        verification_counts, write_report_summary,
     };
-    use bigcp_core::report::VerificationSummary;
+    use bigcp_core::report::{
+        BottleneckSummary, PhaseSummary, RunInfo, RunReport, VerificationSummary,
+    };
     use bigcp_core::{Counters, RunSnapshot, RunState};
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::collections::BTreeMap;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
+
+    /// A minimal completed-run report for pure formatting/rendering tests.
+    #[allow(
+        clippy::default_trait_access,
+        reason = "several field types (serde_json::Value, bigcp_win::EndpointKind) are not \
+                  nameable here without adding test-only dependencies"
+    )]
+    fn sample_report() -> RunReport {
+        RunReport {
+            v: 1,
+            run: RunInfo {
+                id: "test-run".to_owned(),
+                started: "2026-08-01T00:00:00Z".to_owned(),
+                ended: "2026-08-01T00:01:05Z".to_owned(),
+                duration_seconds: 65.0,
+                exit: 0,
+                dry_run: false,
+                durability: "logical".to_owned(),
+                audit: "ok".to_owned(),
+                source: r"C:\source".to_owned(),
+                destination: r"D:\destination".to_owned(),
+                source_filesystem: "NTFS".to_owned(),
+                destination_filesystem: "NTFS".to_owned(),
+                log_path: PathBuf::from(r"\\?\C:\audit\run.log.jsonl"),
+                report_path: PathBuf::from(r"\\?\C:\audit\run.report.json"),
+            },
+            config: Default::default(),
+            devices: sample_profile(),
+            counters: Counters::default(),
+            replacements: Default::default(),
+            errors: Vec::new(),
+            warnings: BTreeMap::new(),
+            extras: Default::default(),
+            folders: BTreeMap::new(),
+            timeline: Vec::new(),
+            phases: PhaseSummary::default(),
+            bottleneck: BottleneckSummary {
+                hypothesis: "balanced".to_owned(),
+                confidence: "low".to_owned(),
+                evidence: "test".to_owned(),
+                observed_peak_mbps: 100.0,
+                average_mbps: 50.0,
+                efficiency_vs_observed_peak: 0.5,
+                provenance: "test".to_owned(),
+            },
+            hints: Vec::new(),
+            analysis: None,
+            verify: None,
+            integrity: "ok".to_owned(),
+        }
+    }
+
+    #[allow(
+        clippy::default_trait_access,
+        reason = "TransportProfile lives in a core module this test does not otherwise use"
+    )]
+    fn sample_profile() -> bigcp_core::devprofile::CopyProfile {
+        bigcp_core::devprofile::CopyProfile {
+            source: sample_side(),
+            destination: sample_side(),
+            chunk_bytes: 1024 * 1024,
+            workers: 4,
+            same_physical_disk: false,
+            transport: Default::default(),
+        }
+    }
+
+    #[allow(
+        clippy::default_trait_access,
+        reason = "EndpointKind is a bigcp-win type not nameable without a new dependency"
+    )]
+    fn sample_side() -> bigcp_core::devprofile::SideProfile {
+        bigcp_core::devprofile::SideProfile {
+            endpoint: Default::default(),
+            class: bigcp_core::DeviceClass::Unknown,
+            confidence: "low".to_owned(),
+            chunk_bytes: 1024 * 1024,
+            workers: 4,
+        }
+    }
 
     #[test]
     fn every_live_tab_renders_in_a_bounded_terminal() {
@@ -1136,7 +1303,7 @@ mod tests {
         snapshot.write_bytes_per_second = 1024.0 * 1024.0;
         assert_eq!(
             super::eta_line(&snapshot),
-            "ETA: 1m 30s for the 90.0 MiB discovered so far"
+            "ETA: 1m 30s for 90.0 MiB outstanding"
         );
         // Nothing outstanding: suppressed again.
         snapshot.counters.bytes_logical_discovered = snapshot.counters.bytes_enumerated;
@@ -1154,6 +1321,155 @@ mod tests {
             skipped_counts(&counters),
             "skipped-same=2 skipped-different=3"
         );
+    }
+
+    #[test]
+    fn key_actions_fire_once_per_press_and_never_on_release() {
+        // Windows consoles deliver Press and Release for every key; only
+        // Press may act, or each keystroke advances tabs twice and the
+        // odd-numbered tabs become unreachable.
+        let press = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(key_action(&press, 0, 6), KeyAction::SelectTab(1));
+        let release =
+            KeyEvent::new_with_kind(KeyCode::Tab, KeyModifiers::NONE, KeyEventKind::Release);
+        assert_eq!(key_action(&release, 0, 6), KeyAction::None);
+
+        let back = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert_eq!(key_action(&back, 0, 6), KeyAction::SelectTab(5));
+        let digit = KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE);
+        assert_eq!(key_action(&digit, 0, 6), KeyAction::SelectTab(2));
+        let out_of_range = KeyEvent::new(KeyCode::Char('7'), KeyModifiers::NONE);
+        assert_eq!(key_action(&out_of_range, 0, 6), KeyAction::None);
+
+        let quit = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert_eq!(key_action(&quit, 0, 6), KeyAction::Quit);
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(key_action(&ctrl_c, 0, 6), KeyAction::Quit);
+        let plain_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
+        assert_eq!(key_action(&plain_c, 0, 6), KeyAction::None);
+    }
+
+    #[test]
+    fn eta_formatting_covers_each_unit_and_clamps() {
+        assert_eq!(format_eta(45.0), "45s");
+        assert_eq!(format_eta(125.0), "2m 05s");
+        assert_eq!(format_eta(7_290.0), "2h 01m");
+        // Absurd inputs clamp to the 99-hour ceiling instead of overflowing.
+        assert_eq!(format_eta(1.0e12), "99h 00m");
+        assert_eq!(format_eta(-5.0), "0s");
+    }
+
+    #[test]
+    fn byte_units_scale_through_tebibytes() {
+        assert_eq!(format_bytes(5 * 1024 * 1024 * 1024), "5.00 GiB");
+        assert_eq!(format_bytes(3 * 1024 * 1024 * 1024 * 1024), "3.00 TiB");
+    }
+
+    #[test]
+    fn busiest_folders_orders_by_count_then_name_and_caps_at_three() {
+        let mut folders = BTreeMap::new();
+        folders.insert("delta".to_owned(), 2_u64);
+        folders.insert("alpha".to_owned(), 5);
+        folders.insert("bravo".to_owned(), 5);
+        folders.insert("echo".to_owned(), 1);
+        assert_eq!(
+            super::busiest_folders(&folders),
+            "alpha=5, bravo=5, delta=2"
+        );
+    }
+
+    #[test]
+    fn plain_state_tokens_are_a_stable_output_contract() {
+        // The --plain progress stream prints `state={:?}`; renaming RunState
+        // variants would silently change a documented machine-readable format.
+        assert_eq!(format!("{:?}", RunState::Preflight), "Preflight");
+        assert_eq!(format!("{:?}", RunState::Copying), "Copying");
+        assert_eq!(format!("{:?}", RunState::Verifying), "Verifying");
+        assert_eq!(format!("{:?}", RunState::Canceling), "Canceling");
+        assert_eq!(format!("{:?}", RunState::Complete), "Complete");
+        assert_eq!(format!("{:?}", RunState::Failed), "Failed");
+    }
+
+    #[test]
+    fn report_summary_lists_outcomes_audit_paths_and_next_step() {
+        let report = sample_report();
+        let mut output = Vec::new();
+        assert!(write_report_summary(&mut output, &report).is_ok());
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.starts_with("COPY COMPLETE"));
+        assert!(text.contains("Files:       0 new"));
+        assert!(text.contains(r"C:\audit\run.log.jsonl"));
+        assert!(text.contains("Next: for important data, run: bigcp verify"));
+        // No hints were recorded, so the hints section must be absent.
+        assert!(!text.contains("Helpful notes:"));
+    }
+
+    #[test]
+    fn dry_run_summary_reports_forecast_existing_and_exceptions() {
+        let mut report = sample_report();
+        report.run.dry_run = true;
+        report.counters.would_copy_new = 4;
+        report.counters.skipped_same = 2;
+        let mut output = Vec::new();
+        assert!(write_report_summary(&mut output, &report).is_ok());
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.contains("Forecast:    4 new"));
+        assert!(text.contains("Existing:    2 unchanged"));
+        assert!(text.contains("Exceptions:  0 failed"));
+    }
+
+    #[test]
+    fn next_step_matches_each_terminal_outcome() {
+        let counters = Counters::default();
+        assert!(next_step(3, false, "ok", &counters, None, "s", "d").contains("re-run the same"));
+        assert!(next_step(4, false, "ok", &counters, None, "s", "d").contains("reconnect"));
+        assert!(next_step(5, false, "ok", &counters, None, "s", "d").contains("preflight"));
+        assert!(next_step(6, false, "ok", &counters, None, "s", "d").contains("file a bigcp bug"));
+        assert!(
+            next_step(0, false, "failed", &counters, None, "s", "d").contains("file a bigcp bug")
+        );
+        let failed_verify = VerificationSummary {
+            failed: 1,
+            ..VerificationSummary::default()
+        };
+        assert!(
+            next_step(2, false, "ok", &counters, Some(&failed_verify), "s", "d")
+                .contains("verification mismatches")
+        );
+    }
+
+    #[test]
+    fn every_report_tab_renders_including_the_empty_hints_view() {
+        let report = sample_report();
+        for (tab, expected) in REPORT_TABS.iter().enumerate() {
+            let backend = TestBackend::new(100, 30);
+            let terminal = Terminal::new(backend);
+            assert!(terminal.is_ok());
+            let Some(mut terminal) = terminal.ok() else {
+                return;
+            };
+            assert!(
+                terminal
+                    .draw(|frame| draw_report(frame, &report, tab, true))
+                    .is_ok()
+            );
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>();
+            assert!(
+                rendered.contains(expected),
+                "tab {tab} did not render {expected}"
+            );
+            if tab == 4 {
+                // An empty view states so explicitly rather than rendering an
+                // unexplained blank pane.
+                assert!(rendered.contains("No hints were recorded"));
+            }
+        }
     }
 
     #[test]

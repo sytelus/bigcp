@@ -388,6 +388,90 @@ repetition round of the four contenders:
   interval) and orderings must be rotated. The round-robin prototype was
   reverted, not committed.
 
+## 2026-08-02 WSL Plan 9 evidence and optimization (H7 dispositioned)
+
+**Environment:** same machine as the 2026-07-29 entries (Windows 11 Pro
+26200, 64 GB RAM); Windows side on C: (KIOXIA EG6 NVMe, NTFS); WSL side the
+real `\\wsl.localhost\u2` endpoint — WSL 2 distribution `u2` (kernel
+6.18.33.2), ext4 on VHDX backed by NVMe. Release build, `Measure-Command`
+wall clock, all Linux-side writes confined to a disposable `/tmp/bigcp-bench`
+subtree per the `docs/TESTING.md` remote-endpoint protocol. Workloads:
+small = 2,000 × 4 KiB files in 20 directories; large = 1 × 512 MiB file.
+**Warm/cold discipline:** the first touch of a distribution pays VM/9P
+cold-start (identical small runs measured 1.8 s → 0.97 s Win→WSL and
+2.77 s → 0.97 s WSL→Win), so every published number is the median of 3 warm
+runs. That is below the certified ≥5-repetition protocol — these numbers
+bound, not certify. robocopy was swept over `/MT` (default 8 and 16) on the
+small-file cells.
+
+### Baseline (pre-optimization, warm)
+
+| Cell | bigcp | robocopy | Standing |
+|---|---|---|---|
+| Win→WSL small | 2,062 files/s (0.97 s) | `/MT:16` 2,426 files/s (0.82 s); `/MT` (8) 1,955 files/s | −15% vs `/MT:16` |
+| Win→WSL 512 MiB | 224 MB/s (2.29 s) | 560 MB/s (0.91 s) | 2.5× behind |
+| WSL→Win small | ~720 files/s cold; 2,056 warm | 2,611 files/s (warm) | 3.6× behind cold |
+| WSL→Win 512 MiB | 286 MB/s | 563 MB/s | 2× behind |
+
+### The three experiments that drove the design
+
+1. **Worker scaling (Win→WSL small, `--tune threads=N`, warm):** 1 → 502
+   files/s · 4 → 2,673 · 8 → 3,216 · 32 → 3,917 · 64 → 4,192. The knee is at
+   32; 64 workers add only ~7% for double the outstanding provider handles,
+   so the WSL Auto row moved 16 → 32 workers.
+2. **Chunk sweep (Win→WSL 512 MiB, warm):** 1 MiB 226 · 4 MiB 267 · 16 MiB
+   248 · 32 MiB 265 · 64 MiB 261 MB/s. Request size is not the lever: one 9P
+   handle (fid) caps at ~230–290 MB/s regardless of request size.
+3. **Two concurrent 512 MiB files: 408 MB/s aggregate** — the cap is
+   per-handle, and parallelism across fids scales. robocopy reaches 560 MB/s
+   on ONE file, so intra-file parallel I/O demonstrably works through p9rdr.
+   This is the measurement behind ADR 0052's segmented parallel transfers.
+
+### Phase-timing evidence (`--analyze`, 16 workers, warm)
+
+| Cell | Phase means per file |
+|---|---|
+| Win→WSL small | create_dst **2,787 µs** · set_meta 488 µs · write 347 µs · open_src 54 µs; coordinator ≈ 0. Four destination round trips per new small file (create, write, stamp, close). |
+| WSL→Win small | open_src **1,491 µs** · read 812 µs · create_dst 329 µs · set_meta 56 µs. ~95% of the ~2.4 ms/file cost (~2.3 ms) is source-side 9P round trips, which directory-affine scheduling was serializing per directory. |
+
+### What shipped (ADR 0052)
+
+1. WSL Auto workers 16 → 32 (the measured knee; generic UNC unchanged).
+2. Small-file striping now applies when **either** side is WSL — a 9P source
+   pays ~2.3 of its 2.4 ms/file in source round trips, so directory affinity
+   was forfeiting most of the pool on WSL→Win copies.
+3. Segmented parallel large-file transfer: an eligible file (single WSL side,
+   non-sparse, unnamed-stream-only, ≥64 MiB, not checkpoint-eligible, no
+   resume candidate) moves its single opaque temp as
+   `K = clamp(size/64 MiB, 2, 8)` parallel identity-verified segments; the
+   whole-file xxh3-128 digest is preserved by a local-side pass.
+4. Round-trip cuts: the pre-commit destination probe is skipped for NEW
+   streamed files (the non-replacing rename already detects collisions
+   atomically), the preflight root stat is reused, and checkpoint temp
+   identity is captured once per temp instead of per append.
+
+### Post-optimization (medians of 3 warm runs, same workloads)
+
+| Cell | bigcp before | bigcp after | robocopy best | Standing |
+|---|---|---|---|---|
+| Win→WSL small | 2,062 files/s | **3,704 files/s** | 2,426 (`/MT:16`) | **53% ahead** |
+| Win→WSL 512 MiB | 224 MB/s | **517.7 MB/s** (best 563) | 560 | within 8%; best run ties |
+| WSL→Win small | ~720 cold / 2,056 warm | **2,387 files/s** | 2,611 (warm) | ~9% behind (was 3.6× cold) |
+| WSL→Win 512 MiB | 286 MB/s | **514 MB/s** | 563 | within 9% |
+
+Correctness through the real 9P stack: standalone `bigcp verify` passed on
+the segmented large copies in both directions and on the small tree
+(2,021/2,021 objects); destination hashes were byte-identical to the sources;
+a local→local regression check ran 7,419 files/s (no regression). The full
+workspace suite (218 tests) stayed green, with fmt/clippy and the safety
+scripts clean.
+
+Fragmentation note: `bigcp-testkit extents` reads NTFS retrieval pointers,
+which the Plan 9 provider does not expose, so the Win→WSL cells carry no
+extent figures; the WSL→Win path reuses the same preallocated temp
+publication whose single-extent evidence is recorded in the 2026-07-29
+entries, and no new extent capture was taken this session.
+
 ## Outstanding
 
 **H6 — redirector overlap (registered 2026-07-31, unmeasured):** ADR 0045's
@@ -401,17 +485,17 @@ fixture and verification policy across the pre-ADR baseline, current defaults,
 manual thread/chunk sweeps, and robocopy's best applicable `/MT`/`/J` settings,
 with signing/encryption/compression and endpoint topology recorded.
 
-**H7 — WSL Plan 9 specialization (registered 2026-07-31, unmeasured):** ADR
-0046 separates WSL from generic UNC, raises its bounded Auto row from 4 MiB/8
-workers to 8 MiB/16, stripes small WSL-destination creates, supplies sequential
-cache hints, skips the provably redundant metadata query for a newly created
-final name, and stamps projected WSL metadata once after data instead of before
-and after it. Pure tests prove selection, routing isolation, stable audit
-serialization, and final metadata correctness; they do not prove a speedup.
-The first approved WSL run must compare the former/current defaults plus bounded
-chunk/thread sweeps in each approved direction and must record WSL version/type,
-distribution, filesystem, warm/cold state, verification policy, and exact
-native-Linux/robocopy comparison commands.
+**H7 — WSL Plan 9 specialization (registered 2026-07-31; measured and
+dispositioned 2026-08-02):** ADR 0046's mechanisms were benchmarked on a real
+`\\wsl.localhost` endpoint (the 2026-08-02 entry above). The measurement
+confirmed the hypothesis's direction and refined its values: per-9P-handle
+throughput caps near ~230–290 MB/s while concurrency across handles scales,
+so ADR 0052 moved the profile to 8 MiB/32 workers, extended striping to WSL
+sources, and added segmented parallel transfers for eligible large one-sided
+WSL files. Post-change medians: small files ahead of robocopy's best swept
+`/MT` setting in the Win→WSL direction, large files within ~9% both ways.
+The numbers are medians of 3 warm runs, below the certified ≥5-repetition
+protocol — indicative, not certified.
 
 **H8 — local NTFS relative final-name creates (registered 2026-07-31,
 unmeasured):** ADR 0048 caches one verified destination-parent handle per
@@ -428,19 +512,22 @@ results by directory shape because the one-parent-open amortization depends on
 files per directory.
 
 The elevated filesystem matrix, repeated-run certified benchmark protocol,
-ADR 0036 same-spindle HDD comparison, and ADR 0037 generic-UNC/WSL profile
-comparisons remain unexecuted. The same-spindle
+ADR 0036 same-spindle HDD comparison, and ADR 0037's generic-UNC profile
+comparison remain unexecuted (its WSL half was measured in the 2026-08-02
+entry). The same-spindle
 implementation is covered by deterministic topology/transport tests and a
 small verified same-volume integration case, but those tests prove correctness
 and phase ordering—not a speedup. Running the `[HW]` cell requires separate
 owner approval under `docs/TESTING.md`, including its exact bounded workload,
 target scratch root, write volume, duration, and drive impact. The remote
-generic-UNC and WSL 8 MiB/16-worker Auto rows are independently bounded static
-defaults, not measured speedup claims; any network/WSL benchmark additionally
-requires an approved scratch share/distribution path. ADR 0045's two-buffer and
-parallel-stream mechanics, ADR 0046's WSL-specific scheduling/round-trip
-reductions, and ADR 0048's local relative-create path are likewise
-benchmark-pending rather than measured speedup claims. Endurance,
+generic-UNC 8 MiB/16-worker Auto row remains an independently bounded static
+default, not a measured speedup claim; the WSL 8 MiB/32-worker row is
+measured (2026-08-02, warm medians of 3 — indicative, not certified); any
+SMB/network benchmark additionally requires an approved scratch share path.
+ADR 0045's two-buffer and parallel-stream mechanics and ADR 0048's local
+relative-create path are likewise benchmark-pending rather than measured
+speedup claims; ADR 0046/0052's WSL scheduling, round-trip, and segmented
+mechanisms are covered by the 2026-08-02 entry. Endurance,
 million-entry, and competitor sweeps stay prohibited (VISION).
 
 Future entries must record OS build, CPU/RAM, source/destination volume and

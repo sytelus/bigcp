@@ -2,6 +2,10 @@
 
 **Status:** Accepted
 
+**Superseded in part by ADR 0041:** exact-handle publication replaced this
+ADR's close-then-path-rename mechanics and path-based cleanup. The unique
+atomic-sibling artifact format and compaction policy remain in force.
+
 ## Context
 
 The JSON report already used a unique sibling and atomic replacement, while

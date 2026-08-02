@@ -15,7 +15,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     CreateSymbolicLinkW, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
     FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, MAXIMUM_REPARSE_DATA_BUFFER_SIZE,
-    SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE, SYMBOLIC_LINK_FLAG_DIRECTORY,
+    SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE, SYMBOLIC_LINK_FLAG_DIRECTORY, WRITE_DAC,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::{FSCTL_GET_REPARSE_POINT, FSCTL_SET_REPARSE_POINT};
@@ -305,12 +305,15 @@ impl ReparseTemp {
         options
             .read(true)
             .write(true)
+            // WRITE_DAC: commit applies a preserved protected DACL through
+            // this handle, and SetSecurityInfo checks granted handle access.
             .access_mode(
                 GENERIC_READ
                     | GENERIC_WRITE
                     | DELETE
                     | FILE_READ_ATTRIBUTES
-                    | FILE_WRITE_ATTRIBUTES,
+                    | FILE_WRITE_ATTRIBUTES
+                    | WRITE_DAC,
             )
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
@@ -363,12 +366,14 @@ impl ReparseTemp {
     fn open_created(path: PathBuf) -> io::Result<Self> {
         let mut options = OpenOptions::new();
         options
+            // WRITE_DAC: see create_file — commit can apply a protected DACL.
             .access_mode(
                 GENERIC_READ
                     | GENERIC_WRITE
                     | DELETE
                     | FILE_READ_ATTRIBUTES
-                    | FILE_WRITE_ATTRIBUTES,
+                    | FILE_WRITE_ATTRIBUTES
+                    | WRITE_DAC,
             )
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);

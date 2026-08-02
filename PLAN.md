@@ -41,7 +41,7 @@
 |---|---|---|
 | Language | **Rust** (stable toolchain, MSRV pinned) | §5.1 |
 | Win32 access | `windows-sys` bindings wrapped in one dedicated crate holding 100 % of the `unsafe` code | §5.2, §14 |
-| I/O strategy | **One product engine, two completion paths and four isolated transports**: local standard retains request-at-a-time buffered streaming; generic redirectors overlap one read with one write through two bounded buffers; WSL reuses that ordered pipeline behind its own Plan 9 profile and scheduling seam; same-spindle HDD batches reads and writes in bounded phases. Eligible remote streams may run independently. Values are chosen **statically from endpoint/device/topology profiles** (no adaptive tuning, no alternate OS-copy engines — VISION) | §5.8–§5.9, §8.2–§8.3 |
+| I/O strategy | **One product engine, two completion paths and four isolated transports**: local standard retains request-at-a-time buffered streaming; generic redirectors overlap one read with one write through two bounded buffers; WSL reuses that ordered pipeline behind its own Plan 9 profile and scheduling seam, and additionally moves large non-checkpointed files as bounded parallel segments of one temp because per-9P-handle throughput is capped (ADR 0052); same-spindle HDD batches reads and writes in bounded phases. Eligible remote streams may run independently. Values are chosen **statically from endpoint/device/topology profiles** (no adaptive tuning, no alternate OS-copy engines — VISION) | §5.8–§5.9, §8.2–§8.3 |
 | Endpoint strategy | **Local, generic UNC/mapped, and WSL UNC are separate immutable endpoint policies** beside filesystem and device class. Redirectors use handle-bound volume queries and static bounded profiles, never local-disk IOCTLs or same-spindle guesses; WSL additionally owns exact-name and projected-metadata semantics | §4.4–§4.5, §5.5, §8.2 |
 | Enumeration | Iterative coordinator-owned directory walk with large-fetch enumeration; destination compared via **per-directory join** (one dir listing instead of N per-file stats) | §5.6 |
 | Skip heuristic | robocopy-compatible size + mtime: exact 100 ns comparison on NTFS/ReFS, destination-granularity comparison on FAT/exFAT; plus cheap representable-metadata repair without data rewrite | §4.1 |
@@ -455,7 +455,7 @@ Runs once at startup (per distinct volume), before any copy I/O; results go into
    - `IOCTL_DISK_GET_CACHE_INFORMATION` → device write-cache state, query-only — deleted as cosmetic in ADR 0027 and **revived by measurement in ADR 0032** (~3.4× small-file impact drives the pre-copy notice and the report hint). Vendor/model strings and hotplug-policy inference stay deleted: they informed cosmetic Devices-tab lines only.
    - `MaximumTransferLength` clamps the chosen chunk; no BOT/UASP concurrency inference is claimed.
 4. Shared-disk detection: local source and destination disk-number sets intersect; rotational overlap selects the isolated same-spindle transport (§8.3). Remote roots have no disk-number set, so no overlap or server-spindle topology is guessed.
-5. **Fallbacks and epistemic honesty:** USB bridges routinely fail or lie on these IOCTLs. Local query failure selects the conservative Unknown profile (4 workers, 4 MiB chunks) and low confidence. Generic UNC and WSL each own an independent 8 MiB/16-worker Auto row; neither is described as physical-device knowledge, and equal current values do not merge their policy seams. WSL's row covers more loopback Plan 9 round trips than its former 4 MiB/8-worker row (ADR 0046). A positive no-seek-penalty answer on an unrecognized VMD/RAID bus selects the moderate SATA-SSD row rather than discarding trustworthy media evidence. `--profile`/`--tune` override static choices (§10.1). Same-volume ReFS block-refcounting is used only for an OS-copy-engine hint (F28).
+5. **Fallbacks and epistemic honesty:** USB bridges routinely fail or lie on these IOCTLs. Local query failure selects the conservative Unknown profile (4 workers, 4 MiB chunks) and low confidence. Generic UNC owns an 8 MiB/16-worker Auto row and WSL an independent 8 MiB/32-worker row; neither is described as physical-device knowledge, and past equality of the two rows never merged their policy seams. WSL's row was measured 2026-08-02 (BENCHMARKS.md): 16→32 workers lifted small-file creates 2,062→3,917 files/s over loopback Plan 9, with 64 workers adding only ~7% more (ADRs 0046/0052). A positive no-seek-penalty answer on an unrecognized VMD/RAID bus selects the moderate SATA-SSD row rather than discarding trustworthy media evidence. `--profile`/`--tune` override static choices (§10.1). Same-volume ReFS block-refcounting is used only for an OS-copy-engine hint (F28).
 
 **There is no free-space forecast.** An earlier revision specified a conservative shortfall-range estimator here; it was deleted as complexity without a matching payoff — cluster rounding, replacement double-occupancy, and sparse savings make any figure approximate, and an approximate warning changes nothing about the outcome. The disk-full circuit breaker (§5.13) is the one authoritative stop: the run halts resumably with clear guidance the moment space actually runs out, which is also exactly what a warned user would have had to do anyway (free space, rerun).
 
@@ -479,7 +479,7 @@ Receives classified `CopyItem`s and dispatches them to engine strategies.
 Policies:
 
 - **Size classes:** local standard and same-spindle workers first accept files whose enumerated unnamed size is below the 16 MiB default threshold. Redirector workers additionally accept non-sparse streams that do not require coordinator-owned checkpoints. Stream discovery promotes hidden checkpoint-eligible ADS work before any write. Reparse/meta items stay on the coordinator.
-- **Locality:** plain-small parent directories normally hash to one worker, so NTFS/generic-UNC same-directory creates serialize while distinct directories proceed in parallel. A WSL destination stripes even plain-small creates across the round-robin shard because its scarce operation is the Plan 9 provider round trip, not an NTFS directory index. Redirector-streamed files use the same independent shard. Every queue remains bounded.
+- **Locality:** plain-small parent directories normally hash to one worker, so NTFS/generic-UNC same-directory creates serialize while distinct directories proceed in parallel. Any WSL endpoint — destination *or* source — stripes plain-small jobs across the round-robin shard instead, because the scarce operation on either side is the Plan 9 provider round trip, not an NTFS directory index (measured 2026-08-02: a 9P source pays ~2.3 ms of its 2.4 ms per-file cost in source round trips, so directory-affine serialization forfeited most of the pool; ADR 0052). Redirector-streamed files use the same independent shard. Every queue remains bounded.
 - **Interleaving:** under the standard transport the coordinator copies one large file/stream at a time while already-dispatched small jobs may remain in flight. Redirectors may run independent non-checkpointed streams on the worker pool while sparse/checkpointed work stays coordinator-owned. Under same-spindle HDD, the coordinator first drains the single phased worker so large/transactional I/O cannot interleave with its source/destination phases. There is no runtime throttle or user-controlled parallel-stream/queue-depth scheduler.
 - **Ordering:** parent existence is guaranteed structurally by the directory frame; no scheduler priority rule exists.
 - **Circuit breaker:** five consecutive device-gone/disk-full outcomes with no intervening success stop further dispatch and produce resumable exit 4 (§5.13).
@@ -716,7 +716,7 @@ Deliberately simple: remaining known work = bytes enumerated so far minus bytes 
 
 ```
 select_profile(side):                       # once per volume at startup; never changes mid-run
-  if endpoint == WSL and class == Auto: p = {chunk: 8 MiB, workers: 16, confidence: low}
+  if endpoint == WSL and class == Auto: p = {chunk: 8 MiB, workers: 32, confidence: low}
   else if endpoint == UNC and class == Auto: p = {chunk: 8 MiB, workers: 16, confidence: low}
   else:
     class = classify(seek_penalty, bus, mtl, confidence) # NVMe | SATA-SSD | USB-SSD | HDD | Unknown
@@ -825,7 +825,7 @@ NTFS VDL note: a write completing beyond the valid-data-length forces zero-fill 
 | HDD (any bus) | 16 MiB | 4 for a source HDD; 32 for a destination HDD (measured close-overlap win) |
 | Unknown/low-confidence | 4 MiB | 4 |
 | Generic UNC Auto | 8 MiB | 16 |
-| WSL UNC Auto | 8 MiB | 16 |
+| WSL UNC Auto | 8 MiB | 32 |
 
 There are no stream-count, queue-depth, or enumeration-thread columns because the implementation has no such user-controlled schedulers (ADR 0033). **Composition is deterministic:** `chunk = min(src.chunk, dst.chunk, both nonzero local MTLs, optional memory cap)`; worker count follows the destination row unless the source is HDD **or remote**, in which case the source row caps it. Explicit `--profile` can replace a remote Auto class row but cannot manufacture physical topology. Local intersecting rotational extents select one phased worker and a 256 MiB burst (§8.3). Generic UNC selects `redirector`; any WSL side selects the distinct `wsl` transport. Both reuse the fixed two-buffer pipeline and eligible non-checkpointed streams can use the composed worker count (ADRs 0045/0046). With `mem`, standard reserves one coordinator chunk and threshold-sized workers, either remote pipeline reserves two coordinator chunks and `max(threshold, 2×chunk)` per worker, and same-spindle uses its single serialized burst. Every endpoint, value, topology fact, transport kind, and burst size is logged/reported (ADRs 0040/0045/0046).
 
@@ -863,7 +863,7 @@ Windows (≥1809) defaults external drives to "Quick removal" (OS write caching 
 
 **Measurement methodology (recorded in BENCHMARKS.md for every published number):** competitors run at their best-known configurations — robocopy swept across `/MT:{8,16,32,128}` × `/J` on/off — never one fixed invocation. Each result records OS build, Defender real-time state, cache protocol (above), dataset generator spec + seed, drive models/firmware/fill level, thermal rest intervals, repetitions (≥5), and median ± spread. Gates compare medians with a noise band; a single run is never a gate.
 
-**Performance hypotheses register.** Numbers this plan quotes for mechanisms not yet measured on target-class hardware are hypotheses tracked in BENCHMARKS.md. **H2 — falsified and dispositioned (2026-07-29):** uniform temp+rename cost roughly two AV-filter evaluations per small file and prevented the default-throughput goal; ADR 0030 therefore moved plain small files to direct final-name writes while retaining atomic temps for ADS/EA, sparse, and large/checkpointed files (ADR 0034). **H3** always-on xxh3 <2 % of one core per GB/s (§5.11); **H4** post-read source revalidation <2 % on the small-file workload; **H5** `FlushFileBuffers` is honored across the tested drive matrix (§7.5 reports the request, not a universal hardware promise). **H6** redirector read/write overlap and parallel eligible streams improve bounded SMB throughput without regressing correctness; **H7** the WSL-specific 8 MiB/16-worker window, striped destination creates, sequential hints, and reduced metadata calls improve bounded Plan 9 throughput without changing local/generic-UNC behavior. Both remain unmeasured pending approved scratch endpoints (ADRs 0045/0046). H1, the deferred-close finalizer pool, was measured and retired.
+**Performance hypotheses register.** Numbers this plan quotes for mechanisms not yet measured on target-class hardware are hypotheses tracked in BENCHMARKS.md. **H2 — falsified and dispositioned (2026-07-29):** uniform temp+rename cost roughly two AV-filter evaluations per small file and prevented the default-throughput goal; ADR 0030 therefore moved plain small files to direct final-name writes while retaining atomic temps for ADS/EA, sparse, and large/checkpointed files (ADR 0034). **H3** always-on xxh3 <2 % of one core per GB/s (§5.11); **H4** post-read source revalidation <2 % on the small-file workload; **H5** `FlushFileBuffers` is honored across the tested drive matrix (§7.5 reports the request, not a universal hardware promise). **H6** redirector read/write overlap and parallel eligible streams improve bounded SMB throughput without regressing correctness — still unmeasured pending an approved SMB scratch endpoint (ADR 0045). **H7 — measured and dispositioned (2026-08-02, BENCHMARKS.md):** the WSL Plan 9 window was benchmarked on a real `\\wsl.localhost` endpoint; per-9P-handle throughput caps near ~230–290 MB/s while concurrency across handles scales, so the profile moved to 8 MiB/32 workers, striping extended to WSL sources, and files ≥64 MiB on a single-WSL-side transport now transfer as 2–8 parallel identity-verified segments of one temp (ADR 0052). Measured results: small files 2,062→3,704 files/s (ahead of robocopy /MT:16's 2,426), 512 MiB 224→518 MB/s (within 8% of robocopy) with standalone verification green both directions. H1, the deferred-close finalizer pool, was measured and retired.
 
 ## 9. Edge-case catalog
 
@@ -949,7 +949,9 @@ Flags (copy):
   --tune <k=v,...>         the single advanced override hatch (replaces per-knob flags): chunk,
                            threads, mem, large-threshold, checkpoint-threshold,
                            same-spindle-burst —
-                           keys documented in MAINTENANCE.md; every applied value is logged
+                           keys and bounds documented in README.md's flag reference (the
+                           normative tune-key table; MAINTENANCE.md points there); every
+                           applied value is logged
                            (no stream-count/queue-depth keys: the sequential pipeline has none to tune, §5.9)
   --fresh                  ignore journal/partials
   --accept-degraded-filesystem
@@ -1226,14 +1228,14 @@ The bar: *a future maintainer can build, test, modify, and release without askin
 | `docs/TESTING.md` | how to run every suite, add scenarios, run chaos/VHDX/real-hardware checklists | with test changes |
 | `docs/MAINTENANCE.md` | code map (crate/module → §), the invariant list I1–I13 with their enforcing tests, release checklist, toolchain/deps policy, debugging cookbook (how to read a log/journal, decode a crash) | every release |
 | `LIMITATIONS.md` | every deliberate limitation with rationale and workaround — the user-facing mirror of §2.4/§4's scope decisions | every scope change |
-| `docs/ERRORS.md` | generated from `errors.rs` table: code → category → hint → resolution | generated in CI, never hand-edited |
+| `docs/ERRORS.md` | mirror of the `error.rs` category table: condition → category → hint. [Deviation recorded 2026-08-01 per §13.2: no generator exists yet — the file is hand-maintained and self-flags this; any `error.rs` table change must update it in the same commit. The generated form remains release work.] | with any `error.rs` category/hint change |
 | `docs/adr/NNNN-*.md` | Architecture Decision Records; the filename-ordered index covers platform, semantics, persistence, simplifications, measured performance changes, and profile surface. ADR 0033 removes configuration fields that had no execution effect; ADR 0034 makes auxiliary-data publication transactional; ADR 0035 isolates FAT/exFAT projection and fallbacks. | one per contract/architecture change, forever |
 | `docs/schemas/*.json` | log + report JSON Schemas, versioned | additive-only in v1 |
 | `BENCHMARKS.md`, `CHANGELOG.md`, `CONTRIBUTING.md` | numbers per release · keep-a-changelog · PR checklist + dev setup | per release / per PR |
 
 ### 14.2 Code documentation rules
 
-- Every module: header comment — purpose, invariants touched, concurrency notes, pointer to its DESIGN.md section.
+- Every module: header comment — purpose, invariants touched, concurrency notes, and a pointer to the governing decision record (ADR or PLAN section; DESIGN.md has no numbered sections to cite).
 - Every `pub` item in `win` and `core`: rustdoc (`#![deny(missing_docs)]`).
 - Every `unsafe` block: `// SAFETY:` discharging each obligation; `unsafe` outside `win` is a compile error.
 - Comments explain *constraints* ("timestamps after rename — NTFS tunneling, see §4.3"), never narrate code.
@@ -1244,7 +1246,7 @@ The bar: *a future maintainer can build, test, modify, and release without askin
 
 ### 14.4 Decision process
 
-Any change to: the §4 contract, on-disk formats (journal/log/report), safety invariants, or default tuning values ⇒ ADR with context/decision/consequences. ADRs are append-only history; MAINTENANCE.md indexes them.
+Any change to: the §4 contract, on-disk formats (journal/log/report), safety invariants, or default tuning values ⇒ ADR with context/decision/consequences. ADRs are append-only history; `docs/adr/README.md` is their index, and MAINTENANCE.md maps the load-bearing decisions to code and release checks.
 
 ### 14.5 Glossary (maintained in MAINTENANCE.md)
 

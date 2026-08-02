@@ -13,7 +13,14 @@ const MAX_SAME_SPINDLE_BURST_BYTES: usize = 1024 * 1024 * 1024;
 const MIN_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_CHUNK_BYTES: usize = 64 * 1024 * 1024;
 const WSL_CHUNK_BYTES: usize = 8 * 1024 * 1024;
-const WSL_WORKERS: usize = 16;
+/// WSL Plan 9 file workers. Measured 2026-08-02 over `\\wsl.localhost`
+/// (BENCHMARKS.md): Win→WSL small-file creates scaled 2,062 → 3,917 files/s
+/// going 16 → 32 workers, while 64 workers added only ~7% more
+/// (4,192 files/s) for double the outstanding provider handles — 32 is the
+/// knee. Deliberately separate from [`UNC_WORKERS`] (ADR 0046): the loopback
+/// Plan 9 boundary has no physical network to protect, so the two profiles
+/// evolve independently.
+const WSL_WORKERS: usize = 32;
 const UNC_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const UNC_WORKERS: usize = 16;
 
@@ -71,10 +78,13 @@ pub fn select_copy_profile(
         source.workers = workers;
         destination.workers = workers;
     }
-    let large_threshold = usize::try_from(tune.large_threshold.unwrap_or(16 * 1024 * 1024))
-        .map_err(|_| {
-            BigcpError::Invalid("large-file threshold does not fit this address space".to_owned())
-        })?;
+    let large_threshold = usize::try_from(
+        tune.large_threshold
+            .unwrap_or(crate::options::DEFAULT_LARGE_THRESHOLD),
+    )
+    .map_err(|_| {
+        BigcpError::Invalid("large-file threshold does not fit this address space".to_owned())
+    })?;
     let same_physical_disk = !source_info.disk_numbers.is_empty()
         && source_info
             .disk_numbers
@@ -266,9 +276,12 @@ fn side_profile(
         // Remote roots do not expose local device topology. These immutable
         // profiles favor fewer, larger protocol operations while retaining
         // enough small-file concurrency to cover redirector latency. WSL's
-        // loopback Plan 9 boundary needs at least the generic redirector
-        // window: fewer workers serialize provider round trips without
-        // protecting any physical network or disk topology we can observe.
+        // loopback Plan 9 boundary takes twice the generic redirector
+        // window: per-file cost there is provider round-trip latency, and
+        // small-file throughput kept scaling to 32 outstanding workers
+        // (2,062 → 3,917 files/s at 16 → 32, +7% more at 64; measured
+        // 2026-08-02) without any physical network or disk topology to
+        // protect.
         (true, EndpointKind::Wsl) => (WSL_CHUNK_BYTES, WSL_WORKERS),
         (true, EndpointKind::Unc) => (UNC_CHUNK_BYTES, UNC_WORKERS),
         (_, _) => match class {
@@ -565,8 +578,10 @@ mod tests {
         );
         assert!(profile.is_ok_and(|value| {
             value.source.endpoint == EndpointKind::Wsl
-                && value.source.workers == 16
-                && value.workers == value.destination.workers.min(16)
+                // 32 workers pinned by the 2026-08-02 measurement: 16 → 32
+                // scaled 2,062 → 3,917 files/s; 64 added only ~7% more.
+                && value.source.workers == 32
+                && value.workers == value.destination.workers.min(32)
                 && value.chunk_bytes == 8 * 1024 * 1024
                 && value.transport.is_redirector()
                 && value.transport.is_wsl()

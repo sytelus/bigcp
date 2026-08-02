@@ -29,7 +29,8 @@ pub struct RunInfo {
     pub dry_run: bool,
     /// logical or durable.
     pub durability: String,
-    /// ok, degraded, or failed.
+    /// ok or degraded. (A "failed" value is reserved: an unpreservable audit
+    /// stream aborts the run before any report is written.)
     pub audit: String,
     /// Source display path.
     pub source: String,

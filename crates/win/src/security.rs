@@ -133,8 +133,109 @@ fn win32_status(status: WIN32_ERROR) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::read_protected_dacl_checked;
+    use std::fs::OpenOptions;
+    use std::io;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
+    };
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL,
+        WRITE_DAC,
+    };
+
+    use super::{read_protected_dacl_checked, win32_status};
+    use crate::file::DestinationTemp;
     use crate::metadata::metadata_at;
+
+    /// Marks a test-owned file's DACL protected while keeping its ACEs.
+    fn protect_dacl(file: &std::fs::File) -> io::Result<()> {
+        let mut dacl = std::ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: requested outputs are valid pointers; unrequested outputs
+        // are null; the descriptor is freed exactly once below.
+        let read_status = unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle().cast(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &raw mut dacl,
+                std::ptr::null_mut(),
+                &raw mut descriptor,
+            )
+        };
+        win32_status(read_status)?;
+        // SAFETY: dacl points inside descriptor, which stays live for the call.
+        let write_status = unsafe {
+            SetSecurityInfo(
+                file.as_raw_handle().cast(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                dacl,
+                std::ptr::null(),
+            )
+        };
+        // SAFETY: descriptor is the LocalAlloc pointer from GetSecurityInfo.
+        unsafe {
+            let _ = LocalFree(descriptor.cast());
+        }
+        win32_status(write_status)
+    }
+
+    #[test]
+    fn captured_protected_dacl_applies_to_a_destination_temp_handle() {
+        // Regression: DestinationTemp handles must carry WRITE_DAC.
+        // SetSecurityInfo checks the handle's *granted* access, so without it
+        // every replacement of a protected-DACL destination failed with
+        // access-denied at the preserve_dacl step.
+        let sandbox = tempfile::tempdir();
+        assert!(sandbox.is_ok());
+        let Some(sandbox) = sandbox.ok() else {
+            return;
+        };
+        let target = sandbox.path().join("protected.bin");
+        assert!(std::fs::write(&target, b"payload").is_ok());
+        let opened = OpenOptions::new()
+            .access_mode(READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&target);
+        assert!(opened.is_ok());
+        let Some(opened) = opened.ok() else {
+            return;
+        };
+        assert!(protect_dacl(&opened).is_ok());
+        drop(opened);
+
+        let identity = metadata_at(&target).map(|metadata| metadata.identity);
+        assert!(identity.is_ok());
+        let Some(identity) = identity.ok() else {
+            return;
+        };
+        let captured = read_protected_dacl_checked(&target, identity)
+            .ok()
+            .flatten();
+        assert!(captured.is_some(), "protected DACL was not captured");
+        let Some(captured) = captured else {
+            return;
+        };
+
+        let temp = DestinationTemp::create(sandbox.path(), "run1", false, false);
+        assert!(temp.is_ok());
+        let Some(temp) = temp.ok() else {
+            return;
+        };
+        assert!(temp.apply_protected_dacl(&captured).is_ok());
+    }
 
     #[test]
     fn checked_dacl_read_rejects_a_replaced_path() {
@@ -154,7 +255,7 @@ mod tests {
         };
 
         let error = read_protected_dacl_checked(&observed_path, expected.identity).err();
-        assert!(error.is_some_and(|value| value.kind() == std::io::ErrorKind::InvalidData));
+        assert!(error.is_some_and(|value| value.kind() == io::ErrorKind::InvalidData));
         assert_eq!(
             std::fs::read(&observed_path).ok(),
             Some(b"observed".to_vec())

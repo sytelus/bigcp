@@ -5,13 +5,17 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 /// One downsampled report point.
+///
+/// The `*_mbps` fields are decimal megabytes per second (bytes / 1,000,000),
+/// not mebibytes and not megabits — the same unit every `mbps` field in the
+/// report uses.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TimelinePoint {
     /// Seconds since run start.
     pub seconds: f64,
-    /// Source read throughput.
+    /// Source read throughput (decimal MB/s).
     pub read_mbps: f64,
-    /// Destination write throughput.
+    /// Destination write throughput (decimal MB/s).
     pub write_mbps: f64,
     /// Completed files per second.
     pub files_per_second: f64,
@@ -27,6 +31,7 @@ pub struct StatsTracker {
     window_written: u64,
     window_files: u64,
     timeline: Vec<TimelinePoint>,
+    timeline_truncated: bool,
     best_write_bytes_per_second: f64,
 }
 
@@ -42,6 +47,7 @@ impl StatsTracker {
             window_written: 0,
             window_files: 0,
             timeline: Vec::new(),
+            timeline_truncated: false,
             best_write_bytes_per_second: 0.0,
         }
     }
@@ -84,8 +90,18 @@ impl StatsTracker {
             files_per_second: self.window_files as f64 / seconds,
             hypothesis: hypothesis.to_owned(),
         };
-        if self.timeline.len() < 3_600 {
-            self.timeline.push(point.clone());
+        // Timeline points feed the report's fastest/slowest "phases", which
+        // must follow the same sustained-window rule as the observed peak: a
+        // sub-5-second window (only the run-end forced roll can produce one —
+        // interior rolls use >= 5 s intervals) would report a cache-inflated
+        // "fastest portion" the peak logic above deliberately rejects. The
+        // point is still returned so the final Stat log event is emitted.
+        if elapsed >= Duration::from_secs(5) {
+            if self.timeline.len() < 3_600 {
+                self.timeline.push(point.clone());
+            } else {
+                self.timeline_truncated = true;
+            }
         }
         self.window_started = Instant::now();
         self.window_read = 0;
@@ -104,6 +120,15 @@ impl StatsTracker {
     #[must_use]
     pub fn timeline(&self) -> &[TimelinePoint] {
         &self.timeline
+    }
+
+    /// Reports whether samples were dropped after the bounded timeline
+    /// filled (~30 h at the default 30 s cadence). Callers surface this as a
+    /// warning so "slowest portion" claims are not silently incomplete on
+    /// very long runs.
+    #[must_use]
+    pub const fn timeline_truncated(&self) -> bool {
+        self.timeline_truncated
     }
 
     /// Best observed write rate from real traffic.

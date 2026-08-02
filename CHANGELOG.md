@@ -36,6 +36,65 @@ versioning once its 1.0 release gates are complete.
 
 ### Changed
 
+- 2026-08-02 measured WSL Plan 9 optimization (ADR 0052): raised the WSL Auto
+  row to 32 workers at the measured scaling knee; striped small-file dispatch
+  whenever either side is WSL (a 9P source pays ~2.3 of its 2.4 ms/file in
+  source round trips, so directory affinity forfeited the pool); and added
+  segmented parallel large-file transfers — non-sparse, unnamed-only,
+  non-checkpointed, non-resume files ≥64 MiB with exactly one WSL side move
+  as 2–8 identity-verified parallel segments of the single opaque temp, with
+  the whole-file digest computed on the local side and cleanup/publication
+  unchanged. Also cut per-file round trips: NEW streamed files skip the
+  pre-commit destination probe (the non-replacing rename detects collisions
+  atomically), the preflight root stat is reused, and checkpoint temp
+  identity is captured once per temp. Measured on a real `\\wsl.localhost`
+  endpoint (BENCHMARKS.md 2026-08-02, warm medians of 3): Win→WSL small
+  files 2,062→3,704 files/s (robocopy `/MT:16` 2,426), Win→WSL 512 MiB
+  224→518 MB/s and WSL→Win 286→514 MB/s (robocopy ~560), with standalone
+  verification green both directions and no local/UNC behavior change.
+- 2026-08-01 orphaned-temp reclamation (ADR 0051): a rerun now deletes a
+  destination-only `.bigcp-….part` resume temporary only when the journal
+  proves bigcp created it — recorded temp name plus a filesystem-identity
+  match verified on the opened handle — covering deleted sources, `--fresh`
+  truncation (records are harvested before the truncate), and job-signature
+  changes. Unproven look-alikes stay reported extras, dry-run never deletes,
+  and live resume temps are excluded from extras against join-time journal
+  state. New end-to-end and journal unit tests pin all three scenarios plus
+  the never-delete identity-mismatch path.
+- 2026-08-01 review pass. Reliability: protected-DACL preservation and the
+  Quick-removal write-cache warning both actually work now
+  (DestinationTemp/ReparseTemp handles carry WRITE_DAC; cache state is read
+  via `IOCTL_STORAGE_QUERY_PROPERTY`, which a zero-access volume handle can
+  satisfy); a failed `--flush` best-effort poisons the destination stamp so a
+  rerun replaces the file instead of silently dropping the durability request
+  (ADR 0050); a checkpoint-eligible named stream below the large threshold no
+  longer hits a deterministic internal failure; the audit log opens
+  write+read so the torn-line rollback and documented reopen/failover
+  recovery can actually run; journal loading refuses future-version records
+  before the CRC filter, keeps the file intact on a transient read error, and
+  a failed checkpoint append disables journaling for the run as its warning
+  states; journal-vouched live resume temps are no longer counted as
+  destination extras; standalone verify continues past unreadable directories
+  and classifies destination-side read failures as destination-changed;
+  destination-newer respects the destination timestamp quantum; mounted-folder
+  volume roots no longer borrow the host drive's device profile; and
+  redirector child names containing `:` are rejected before they can address
+  a sibling's ADS. UX: Ctrl+C is a graceful cancel in every output mode, with
+  a second Ctrl+C force-quitting (ADR 0049); `--accept-write-cache-policy`
+  makes the Quick-removal notice non-interactive; key handling fires once per
+  press so Tab reaches every tab; a panic hook restores the terminal under
+  release panic=abort; a mid-run dashboard failure now says the copy
+  continues; `bigcp report` honors `NO_COLOR` and names an empty Hints tab;
+  the plain ETA line reads "for N MiB outstanding"; and
+  flag-before-subcommand rejections explain flag placement. Internal:
+  pointer-provenance fixes for flexible-array Win32 records, named `PHASE_*`
+  indices, shared UTF-16-hex and not-attempted-walker helpers, one shared
+  large-threshold default, sub-5-second timeline tails excluded with a
+  `timeline_truncated` warning, populated `RunSnapshot.active_paths`, exact
+  FAT limits in oversize errors, and removal of the dead
+  `run_dashboard`/`product_name` TUI API. New unit tests landed across the
+  cli, tui, win, and core crates; ADRs 0049–0050 record the two new
+  decisions, and `VISION.md` remains unchanged.
 - 2026-07-31 distinct-drive NTFS small-file optimization: directory-affine
   workers now cache one identity-verified destination-parent handle and open
   plain-small final names relative to it, avoiding repeated absolute-parent

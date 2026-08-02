@@ -43,7 +43,9 @@ required by the governing plan.
   local-device IOCTLs, separately identified generic-redirector and WSL
   profiles, two-buffer ordered read/write overlap, parallel non-checkpointed
   stream dispatch, shared worker cancellation, WSL exact-name/basic-metadata
-  projection, striped WSL destination creates, sequential handle hints, and
+  projection, striped small-file dispatch on either WSL side, segmented
+  parallel identity-verified large-file transfers on the WSL transport
+  (ADR 0052), sequential handle hints, and
   deferred final stamping; combined startup acceptance and redirector-loss
   breaker mapping without changing either local transport/profile path.
 - Fail-closed Win32/provider parsing for returned lengths, record-local child
@@ -57,6 +59,16 @@ required by the governing plan.
 - Complete official Win32 Cloud Files error-family classification and explicit
   reporting when a failed READONLY replacement also fails to restore the
   destination's original metadata.
+- Honesty note (2026-08-01 review): several behaviors previously implied
+  above were found inert and are effective, with regression tests, only from
+  this date — protected-DACL preservation on replacement (temp handles lacked
+  `WRITE_DAC`, so every apply failed access-denied), the Quick-removal
+  write-cache warning (the disk-cache IOCTL's access bits could never be
+  satisfied by the zero-access volume handle, so it never fired), checkpoint
+  coverage for a checkpoint-eligible named stream below the large threshold
+  (deterministic internal failure), and the audit torn-line rollback with its
+  reopen/failover recovery (dead under append-mode handles). Treat earlier
+  evidence claims about those specific paths accordingly.
 
 ## Release-blocking evidence still required
 
@@ -71,10 +83,13 @@ lifespan-reducing writes, no machine-stability impact — see PLAN §12.0):
   million-entry behavior via synthetic enumeration simulation, never real trees.
 - The same-spindle HDD `[HW]` cell remains required before claiming a measured
   speedup or universal optimality for the new 256 MiB default.
-- An approved disposable UNC/WSL endpoint matrix remains required before
-  claiming a measured generic-redirector or WSL speedup, robocopy parity, or
-  universal optimality. The independent 8 MiB/16-worker rows and WSL create
-  striping are correctness-tested static hypotheses, not certified defaults.
+- An approved disposable SMB/UNC endpoint remains required before claiming a
+  measured generic-redirector speedup, robocopy parity, or universal
+  optimality: the generic 8 MiB/16-worker row is still a correctness-tested
+  static hypothesis (H6, unmeasured). The WSL row was measured on a real
+  `\\wsl.localhost` endpoint (BENCHMARKS.md 2026-08-02; H7 dispositioned,
+  ADR 0052), but as warm medians of 3 runs it remains indicative — the
+  certified median-of-≥5 quiesced protocol is still pending for every cell.
 - The final production-validation pass (PLAN §12.10), executed only on
   explicit owner request: chaos/kill-convergence, the adversarial set,
   sentinel/schema checks, and the bounded NTFS benchmark protocol.
@@ -101,4 +116,4 @@ create a certification claim (ADR 0042).
 
 No release process may reinterpret an unrun gate as a pass.
 `TESTING_SUMMARY.md` records dated evidence; intentional differences from
-the governing plan are recorded inline in PLAN.md and in ADRs 0027–0048.
+the governing plan are recorded inline in PLAN.md and in ADRs 0027–0052.

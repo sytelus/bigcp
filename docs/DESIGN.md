@@ -3,16 +3,20 @@
 ## Dependency direction
 
 ```text
-bigcp (CLI) -> bigcp-tui -> bigcp-core -> bigcp-win
-                                  ^
-bigcp-testkit --------------------| (dev dependency only)
+bigcp (CLI)   -> bigcp-tui, bigcp-core, bigcp-win
+bigcp-tui     -> bigcp-core
+bigcp-core    -> bigcp-win
+bigcp-testkit -> bigcp-win (dev dependency only)
 ```
 
 `bigcp-win` is the only crate allowed to contain `unsafe`; it converts Win32
 contracts into owned, safe Rust values. `bigcp-core` contains semantics,
 scheduling, journaling, verification, audit, and reporting without direct
-Win32 calls. `bigcp-testkit` depends only on `bigcp-win`, never on core copy
-logic, so its oracle is independent.
+Win32 calls. The CLI consumes all three: display through `bigcp-tui`, options
+and reports through `bigcp-core`, and the process-wide console cancel handler
+through `bigcp-win`, injected into the display layer as a plain function
+probe so `bigcp-tui` itself stays free of Win32. `bigcp-testkit` depends only
+on `bigcp-win`, never on core copy logic, so its oracle is independent.
 
 ## Control flow
 
@@ -52,8 +56,15 @@ buffer. Immutable generic `Redirector` and `Wsl` transports use exactly two
 buffers and a scoped reader so one source read overlaps one destination write;
 hashing and writes remain ordered, and pipeline segments stop at checkpoint
 boundaries.
-WSL remains a distinct transport/profile identity and stripes destination
-creates across its worker pool while generic UNC retains directory affinity.
+WSL remains a distinct transport/profile identity and stripes plain-small
+dispatch across its worker pool whenever either side is WSL, while generic
+UNC retains directory affinity. Large non-sparse, unnamed-only,
+non-checkpointed, non-resume files with exactly one WSL side additionally
+move as 2–8 chunk-aligned parallel segments of the single opaque temp — each
+segment on its own identity-checked source open and identity-proven
+`SegmentWriter` — because one Plan 9 handle caps below the boundary's
+aggregate throughput (ADR 0052); the digest, cleanup, and publication tail
+are the ordered path's own.
 When local volume disk extents intersect and an effective profile is
 rotational, an immutable `SameSpindle` transport instead stages a bounded
 multi-request burst before each destination phase; the coordinator drains the
@@ -122,8 +133,10 @@ ports:
   record without local IOCTLs. Core consumes one immutable endpoint/filesystem
   policy. `core::transport` owns generic-redirector and WSL identities over the
   bounded two-buffer pipeline; `worker.rs` confines parallel stream scheduling
-  and WSL destination striping; `file.rs` owns sequential handle hints and
-  deferred WSL stamping. Remote profiles, case matching, projection,
+  and either-side WSL striping; `engine.rs` owns the segmented parallel
+  large-file strategy (`segment_plan`/`copy_streamed_segmented`); `file.rs`
+  owns sequential handle hints, deferred WSL stamping, and the
+  identity-proven `SegmentWriter`. Remote profiles, case matching, projection,
   preallocation, transfer mechanics, and disconnect classification can
   therefore evolve without touching local hot paths.
 - **Same-spindle transport (implemented):** `transport.rs` owns topology policy
@@ -157,9 +170,10 @@ uses provider-returned volume data and independently immutable generic-UNC/WSL
 profiles; remote sources cap the composed worker count. Static profiles choose
 per-side chunk size and workers. Both remote transports use two buffers per
 active transfer, and independent non-checkpointed files may occupy separate workers.
-WSL Auto uses 8 MiB/16 workers; a WSL destination also stripes small files to
+WSL Auto uses 8 MiB/32 workers; either WSL side also stripes small files to
 cover Plan 9 latency instead of applying the measured NTFS directory-index
-policy.
+policy, and eligible large one-sided WSL files transfer as bounded parallel
+segments to overlap the measured per-handle ceiling (ADR 0052).
 Intersecting local disk extents plus
 rotational classification select one phased worker and a bounded same-spindle
 burst; SSD overlap stays on the standard path. Manual values are range checked.
@@ -208,7 +222,7 @@ knowable; this endpoint branch does not alter local allocation behavior.
   suffixes and NUL-terminated Win32 strings cannot redirect a validated path.
 
 Known intentional differences from the governing plan are recorded inline at
-their PLAN.md sections and in the ADRs (0027–0048); there is no separate
+their PLAN.md sections and in the ADRs (0027–0052); there is no separate
 deviations file.
 
 The terminal layer is a read-only projection of coordinator snapshots and
@@ -217,3 +231,10 @@ redirected or `--plain` output uses stable progress lines, `--quiet` suppresses
 live output, and an interactive terminal uses the dashboard even when color is
 disabled. Formatting and contextual next-action logic are shared by live and
 saved-report views; neither path can influence copy scheduling or semantics.
+Cancellation follows the same read-only direction: the CLI installs
+`bigcp-win`'s process-global console handler (`console` module — the first
+Ctrl+C/Ctrl+Break latches a flag and is absorbed; a second, or any
+close/logoff/shutdown signal, falls through to default termination), and both
+display modes merely poll that flag, alongside the dashboard's own
+`q`/Esc/Ctrl+C key handling, while the engine checks cancellation between
+bounded work units.

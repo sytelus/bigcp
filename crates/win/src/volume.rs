@@ -357,13 +357,12 @@ fn query_remote_attributes(handle: &File) -> io::Result<RemoteAttributes> {
     let info = words.as_ptr().cast::<FILE_FS_ATTRIBUTE_INFORMATION>();
     // SAFETY: the buffer is eight-byte aligned and at least one page. The
     // native query succeeded before these fixed fields are read.
-    let (flags, maximum_component_length, name_bytes, name_ptr) = unsafe {
+    let (flags, maximum_component_length, name_bytes) = unsafe {
         (
             (*info).FileSystemAttributes,
             (*info).MaximumComponentNameLength,
             usize::try_from((*info).FileSystemNameLength)
                 .map_err(|_| io::Error::other("remote filesystem name is too long"))?,
-            (*info).FileSystemName.as_ptr(),
         )
     };
     if !name_bytes.is_multiple_of(size_of::<u16>())
@@ -377,7 +376,18 @@ fn query_remote_attributes(handle: &File) -> io::Result<RemoteAttributes> {
         ));
     }
     // SAFETY: the variable name bounds and UTF-16 alignment were validated.
-    let name = unsafe { std::slice::from_raw_parts(name_ptr, name_bytes / size_of::<u16>()) };
+    // The pointer derives from the backing buffer, not from a reference to
+    // the one-element FileSystemName array, so its provenance spans the
+    // entire variable-length name.
+    let name = unsafe {
+        std::slice::from_raw_parts(
+            words
+                .as_ptr()
+                .cast::<u16>()
+                .add(name_offset / size_of::<u16>()),
+            name_bytes / size_of::<u16>(),
+        )
+    };
     Ok(RemoteAttributes {
         flags,
         maximum_component_length,

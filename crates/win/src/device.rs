@@ -19,11 +19,11 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::{
-    DEVICE_SEEK_PENALTY_DESCRIPTOR, DISK_CACHE_INFORMATION, DISK_EXTENT,
-    IOCTL_DISK_GET_CACHE_INFORMATION, IOCTL_STORAGE_QUERY_PROPERTY, PropertyStandardQuery,
-    STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR, STORAGE_ADAPTER_DESCRIPTOR, STORAGE_PROPERTY_QUERY,
-    StorageAccessAlignmentProperty, StorageAdapterProperty, StorageDeviceSeekPenaltyProperty,
-    VOLUME_DISK_EXTENTS,
+    DEVICE_SEEK_PENALTY_DESCRIPTOR, DISK_EXTENT, IOCTL_STORAGE_QUERY_PROPERTY,
+    PropertyStandardQuery, STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR, STORAGE_ADAPTER_DESCRIPTOR,
+    STORAGE_PROPERTY_QUERY, STORAGE_WRITE_CACHE_PROPERTY, StorageAccessAlignmentProperty,
+    StorageAdapterProperty, StorageDeviceSeekPenaltyProperty, StorageDeviceWriteCacheProperty,
+    VOLUME_DISK_EXTENTS, WriteCacheDisabled, WriteCacheEnabled,
 };
 
 use crate::EndpointKind;
@@ -137,25 +137,24 @@ pub fn profile_device(volume: &VolumeInfo) -> DeviceInfo {
 }
 
 /// Queries the device's write-cache state (query-only, never modified).
+///
+/// This must use the storage-property query, not
+/// `IOCTL_DISK_GET_CACHE_INFORMATION`: that control code encodes
+/// `FILE_READ_ACCESS` in its access bits, and the deliberately zero-access
+/// volume handle can never satisfy it — the disk-cache IOCTL would fail with
+/// access-denied on every volume and silently disable the Quick-removal
+/// warning. `IOCTL_STORAGE_QUERY_PROPERTY` is `FILE_ANY_ACCESS` and reports
+/// the same device-level write-cache state.
 fn query_write_cache(handle: &File) -> Option<bool> {
-    let mut info = DISK_CACHE_INFORMATION::default();
-    let mut returned = 0_u32;
-    // SAFETY: the output buffer is the exact documented structure, the
-    // handle is live, and the control code is a read-only query.
-    let succeeded = unsafe {
-        DeviceIoControl(
-            handle.as_raw_handle().cast(),
-            IOCTL_DISK_GET_CACHE_INFORMATION,
-            std::ptr::null(),
-            0,
-            (&raw mut info).cast(),
-            u32::try_from(size_of::<DISK_CACHE_INFORMATION>()).ok()?,
-            &raw mut returned,
-            std::ptr::null_mut(),
-        )
-    };
-    let expected = u32::try_from(size_of::<DISK_CACHE_INFORMATION>()).ok()?;
-    (succeeded != 0 && returned == expected).then_some(info.WriteCacheEnabled)
+    let cache =
+        query_property::<STORAGE_WRITE_CACHE_PROPERTY>(handle, StorageDeviceWriteCacheProperty)?;
+    // WRITE_CACHE_ENABLE is a tri-state; "unknown" must stay None so callers
+    // never warn (or skip warning) based on a guess.
+    match cache.WriteCacheEnabled {
+        value if value == WriteCacheEnabled => Some(true),
+        value if value == WriteCacheDisabled => Some(false),
+        _ => None,
+    }
 }
 
 /// Builds the `\\.\X:` query-only device path for a drive-letter volume root.
@@ -164,6 +163,12 @@ fn query_write_cache(handle: &File) -> Option<bool> {
 /// path is canonicalized before probing, so a `\\?\` or `\\.\` prefix is
 /// skipped before the drive-letter check. Without that skip, profiling
 /// silently degraded to the low-confidence fallback on every real run.
+///
+/// The body must be *exactly* a drive root (`X:` or `X:\`). A volume mounted
+/// in a folder legally reports a root like `C:\mount\vol\`; deriving `\\.\C:`
+/// from it would profile the *host* drive's topology (disk numbers, seek
+/// penalty, cache state) for the mounted volume — corrupting same-spindle
+/// detection. Such roots degrade to the documented low-confidence fallback.
 fn device_path_for_root(root: &Path) -> io::Result<OsString> {
     let units: Vec<u16> = root.as_os_str().encode_wide().collect();
     let body = match units.as_slice() {
@@ -177,7 +182,11 @@ fn device_path_for_root(root: &Path) -> io::Result<OsString> {
         }
         rest => rest,
     };
-    if body.len() < 2 || body[1] != u16::from(b':') {
+    let drive_root_only = matches!(body.len(), 2 | 3)
+        && body[1] == u16::from(b':')
+        && (body.len() == 2 || body[2] == u16::from(b'\\'))
+        && u8::try_from(body[0]).is_ok_and(|letter| letter.is_ascii_alphabetic());
+    if !drive_root_only {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "volume mount is not a drive-letter root",
@@ -309,6 +318,17 @@ mod tests {
     fn non_letter_roots_are_rejected() {
         assert!(device_path_for_root(Path::new(r"\\?\Volume{0000}\a")).is_err());
         assert!(device_path_for_root(Path::new(r"relative")).is_err());
+    }
+
+    #[test]
+    fn mounted_folder_roots_never_borrow_the_host_drive_device() {
+        // A volume mounted in a folder reports a root under the host drive;
+        // deriving \\.\C: from it would profile the wrong physical disk and
+        // corrupt same-spindle detection. It must degrade to the
+        // low-confidence fallback instead.
+        assert!(device_path_for_root(Path::new(r"\\?\C:\mount\vol\")).is_err());
+        assert!(device_path_for_root(Path::new(r"C:\mount\vol")).is_err());
+        assert!(device_path_for_root(Path::new(r"\\?\1:\")).is_err());
     }
 
     #[test]

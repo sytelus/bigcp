@@ -1,6 +1,6 @@
 # ADR 0007: Exclude volume-root OS artifacts
 
-**Status:** Accepted
+**Status:** Amended by ADR 0047
 
 ## Context
 

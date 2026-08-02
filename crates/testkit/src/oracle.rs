@@ -297,3 +297,221 @@ fn mismatch(report: &mut CheckReport, message: String) {
         report.samples.push(message);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{CheckReport, check_trees};
+    use crate::sandbox::SandboxRoot;
+    use bigcp_win::{DestinationStream, StreamInfo};
+    use std::ffi::OsString;
+    use std::fs;
+    use std::io::Write;
+    use std::path::Path;
+    use std::time::{Duration, SystemTime};
+
+    // Windows requires this create flag to obtain a directory handle.
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+    // Creates one sandbox holding empty `source` and `destination` trees.
+    fn tree_pair(label: &str) -> Option<SandboxRoot> {
+        let Ok(sandbox) = SandboxRoot::create_system_temp(label) else {
+            return None;
+        };
+        assert!(fs::create_dir(sandbox.path().join("source")).is_ok());
+        assert!(fs::create_dir(sandbox.path().join("destination")).is_ok());
+        Some(sandbox)
+    }
+
+    // Runs the oracle over the fixture pair and returns its report.
+    fn compared(sandbox: &SandboxRoot) -> Option<CheckReport> {
+        let report = check_trees(sandbox, Path::new("source"), Path::new("destination"));
+        assert!(report.is_ok(), "check_trees failed: {report:?}");
+        report.ok()
+    }
+
+    // Every negative fixture must be flagged with a sample naming the finding;
+    // a regression that silently reports zero mismatches would otherwise make
+    // each oracle-backed end-to-end assertion pass vacuously.
+    fn assert_flagged(report: &CheckReport, needle: &str) {
+        assert!(
+            report.mismatches > 0,
+            "oracle reported a known-bad pair as clean: {report:?}"
+        );
+        assert!(
+            report.samples.iter().any(|sample| sample.contains(needle)),
+            "no sample contains {needle:?}: {:?}",
+            report.samples
+        );
+    }
+
+    // Pins every compared timestamp to one fixed value so independently
+    // created fixtures can be metadata-identical (or deliberately different)
+    // without racing the clock.
+    fn stamp(path: &Path, directory: bool, seconds: u64) -> std::io::Result<()> {
+        use std::os::windows::fs::{FileTimesExt, OpenOptionsExt};
+        let mut options = fs::OpenOptions::new();
+        options.write(true);
+        if directory {
+            options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+        }
+        let fixed = SystemTime::UNIX_EPOCH + Duration::from_secs(seconds);
+        options.open(path)?.set_times(
+            fs::FileTimes::new()
+                .set_created(fixed)
+                .set_modified(fixed)
+                .set_accessed(fixed),
+        )
+    }
+
+    #[test]
+    fn identical_trees_report_zero_mismatches() {
+        let Some(sandbox) = tree_pair("oracle-identical") else {
+            return;
+        };
+        for root in ["source", "destination"] {
+            let base = sandbox.path().join(root);
+            assert!(fs::create_dir(base.join("nested")).is_ok());
+            let file = base.join("nested").join("file.txt");
+            assert!(fs::write(&file, b"identical tiny fixture").is_ok());
+            // Every object needs pinned times because the oracle compares
+            // creation and last-write values (stamping a child never touches
+            // its parent, so order is irrelevant once creation is done).
+            assert!(stamp(&file, false, 1_700_000_000).is_ok());
+            assert!(stamp(&base.join("nested"), true, 1_700_000_000).is_ok());
+            assert!(stamp(&base, true, 1_700_000_000).is_ok());
+        }
+        let Some(report) = compared(&sandbox) else {
+            return;
+        };
+        assert_eq!(report.mismatches, 0, "samples: {:?}", report.samples);
+        assert_eq!(report.extras, 0);
+        assert_eq!(report.checked, 3, "root pair, nested, and one file");
+    }
+
+    #[test]
+    fn differing_content_at_equal_size_is_flagged() {
+        let Some(sandbox) = tree_pair("oracle-content") else {
+            return;
+        };
+        assert!(fs::write(sandbox.path().join("source").join("same.bin"), b"content-A").is_ok());
+        assert!(
+            fs::write(
+                sandbox.path().join("destination").join("same.bin"),
+                b"content-B"
+            )
+            .is_ok()
+        );
+        let Some(report) = compared(&sandbox) else {
+            return;
+        };
+        assert_flagged(&report, "same.bin: data stream set or content differs");
+    }
+
+    #[test]
+    fn differing_file_size_is_flagged() {
+        let Some(sandbox) = tree_pair("oracle-size") else {
+            return;
+        };
+        assert!(fs::write(sandbox.path().join("source").join("grew.bin"), b"short").is_ok());
+        assert!(
+            fs::write(
+                sandbox.path().join("destination").join("grew.bin"),
+                b"deliberately longer"
+            )
+            .is_ok()
+        );
+        let Some(report) = compared(&sandbox) else {
+            return;
+        };
+        assert_flagged(&report, "grew.bin: data stream set or content differs");
+    }
+
+    #[test]
+    fn missing_destination_file_is_flagged() {
+        let Some(sandbox) = tree_pair("oracle-missing") else {
+            return;
+        };
+        assert!(fs::write(sandbox.path().join("source").join("gone.txt"), b"present").is_ok());
+        let Some(report) = compared(&sandbox) else {
+            return;
+        };
+        assert_flagged(&report, "gone.txt: missing");
+    }
+
+    #[test]
+    fn extra_destination_file_is_flagged() {
+        let Some(sandbox) = tree_pair("oracle-extra") else {
+            return;
+        };
+        assert!(
+            fs::write(
+                sandbox.path().join("destination").join("surplus.txt"),
+                b"unexpected"
+            )
+            .is_ok()
+        );
+        let Some(report) = compared(&sandbox) else {
+            return;
+        };
+        assert_flagged(&report, "surplus.txt: extra");
+        assert!(report.extras > 0, "extras counter: {report:?}");
+    }
+
+    #[test]
+    fn file_versus_directory_type_conflict_is_flagged() {
+        let Some(sandbox) = tree_pair("oracle-type") else {
+            return;
+        };
+        assert!(fs::write(sandbox.path().join("source").join("node"), b"a file here").is_ok());
+        assert!(fs::create_dir(sandbox.path().join("destination").join("node")).is_ok());
+        let Some(report) = compared(&sandbox) else {
+            return;
+        };
+        assert_flagged(&report, "node: type differs");
+    }
+
+    #[test]
+    fn named_stream_difference_is_flagged() {
+        let Some(sandbox) = tree_pair("oracle-ads") else {
+            return;
+        };
+        let destination_host = sandbox.path().join("destination").join("host.txt");
+        assert!(fs::write(sandbox.path().join("source").join("host.txt"), b"same base").is_ok());
+        assert!(fs::write(&destination_host, b"same base").is_ok());
+        let stream = StreamInfo {
+            name: OsString::from(":oracle-only:$DATA"),
+            size: 9,
+        };
+        let created = DestinationStream::create(&destination_host, &stream, true);
+        assert!(created.is_ok(), "creating the fixture stream failed");
+        let Some(mut alternate) = created.ok() else {
+            return;
+        };
+        assert!(alternate.write_all(b"ads bytes").is_ok());
+        assert!(alternate.flush().is_ok());
+        drop(alternate);
+        let Some(report) = compared(&sandbox) else {
+            return;
+        };
+        // File stream sets are hashed together with the unnamed content, so
+        // a destination-only ADS must surface as a stream-set mismatch.
+        assert_flagged(&report, "host.txt: data stream set or content differs");
+    }
+
+    #[test]
+    fn timestamp_difference_is_flagged() {
+        let Some(sandbox) = tree_pair("oracle-times") else {
+            return;
+        };
+        let source_file = sandbox.path().join("source").join("stamped.txt");
+        let destination_file = sandbox.path().join("destination").join("stamped.txt");
+        assert!(fs::write(&source_file, b"same bytes").is_ok());
+        assert!(fs::write(&destination_file, b"same bytes").is_ok());
+        assert!(stamp(&source_file, false, 1_700_000_000).is_ok());
+        assert!(stamp(&destination_file, false, 1_700_000_600).is_ok());
+        let Some(report) = compared(&sandbox) else {
+            return;
+        };
+        assert_flagged(&report, "stamped.txt: copied metadata differs");
+    }
+}

@@ -1,6 +1,6 @@
 # ADR 0046: Specialize WSL Plan 9 throughput
 
-**Status:** Accepted
+**Status:** Amended by ADR 0052
 
 ## Context
 
