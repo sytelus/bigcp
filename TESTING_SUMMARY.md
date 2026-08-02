@@ -2,6 +2,37 @@
 
 Latest review: 2026-08-02
 
+## 2026-08-02 latency-gated remote-source striping (generic UNC)
+
+ADR 0053's latency gate — `VolumeInfo::remote_query_latency` sampled at zero
+extra I/O from the remote probe's existing queries, and the pure
+`remote_source_striping` policy with its inclusive 250 µs floor — landed
+with confined coverage. The new core unit test
+`remote_source_striping_is_latency_gated_for_generic_redirectors` pins the
+whole decision table: WSL sources stripe with or without a sample, generic
+redirector sources keep affinity without a sample or below the floor and
+stripe at or above it, and local sources never stripe. The existing
+`wsl_endpoints_stripe_small_files_without_changing_other_affinity` now
+exercises `worker_dispatch` through the renamed run-level
+`stripe_source_reads` flag and keeps its non-striping affinity
+counterfactual. All 219 confined workspace tests passed with zero failures;
+formatting, warning-denied Clippy, and the frozen-input and test-storage
+safety scripts passed.
+
+Live validation ran manually, outside CI, through the loopback admin share
+`\\localhost\C$` with every write confined to the session's disposable
+scratch sandbox — CI has no SMB share, so this loopback protocol is an
+operator-run manual check, not an automated gate. The run-start log showed
+the gate choosing correctly (`source round trip ~2us (loopback-class),
+keeping directory affinity`) and UNC→local small files stayed at
+~4,000–4,157 files/s (no regression). A WSL re-validation run confirmed
+striped dispatch and 32 workers in the log, with Win→WSL 3,264 files/s and
+WSL→Win 2,320 files/s single runs consistent with the 2026-08-02 medians.
+The evidence is recorded in `BENCHMARKS.md` ("2026-08-02 generic UNC
+(loopback-indicative)") and is loopback-indicative only: network-class SMB
+remains unmeasured and the H6 gate stays open. No network share, stress,
+endurance, or large-scale test ran.
+
 ## 2026-08-02 WSL segmented parallel transfers and measured profile
 
 ADR 0052's changes — the 32-worker WSL Auto row, either-side WSL small-file

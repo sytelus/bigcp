@@ -139,8 +139,28 @@ pub fn run_copy(
                 preflight.profile.workers,
             )
         } else {
+            // The locality clause makes the latency-gated dispatch decision
+            // (remote_source_striping) visible in the log for later analysis.
+            let locality = match (
+                preflight.source_volume.endpoint.is_remote(),
+                preflight.source_volume.remote_query_latency,
+            ) {
+                (true, Some(latency))
+                    if remote_source_striping(preflight.source_volume.endpoint, Some(latency)) =>
+                {
+                    format!(
+                        "; source round trip ~{}us, striping small files across workers",
+                        latency.as_micros()
+                    )
+                }
+                (true, Some(latency)) => format!(
+                    "; source round trip ~{}us (loopback-class), keeping directory affinity",
+                    latency.as_micros()
+                ),
+                _ => String::new(),
+            };
             format!(
-                "remote topology: source={} destination={}; using bounded two-buffer read/write overlap and {} static redirector worker(s)",
+                "remote topology: source={} destination={}; using bounded two-buffer read/write overlap and {} static redirector worker(s){locality}",
                 preflight.source_volume.endpoint.name(),
                 preflight.destination_volume.endpoint.name(),
                 preflight.profile.workers,
@@ -324,6 +344,10 @@ pub fn run_copy(
         worker_cancel,
         last_snapshot: Instant::now(),
         recent_paths: VecDeque::new(),
+        stripe_source_reads: remote_source_striping(
+            preflight.source_volume.endpoint,
+            preflight.source_volume.remote_query_latency,
+        ),
     };
     if destination_policy.is_degraded() {
         runner.increment_warning("degraded_filesystem");
@@ -614,6 +638,10 @@ struct Runner<'a> {
     /// Most recently settled file paths (newest last), published in snapshots
     /// so the dashboard can show where the run currently is in the tree.
     recent_paths: VecDeque<PathBuf>,
+    /// Run-level plain-small locality decision from `remote_source_striping`:
+    /// stripe to parallelize remote-source round trips, or keep local
+    /// destination directory affinity.
+    stripe_source_reads: bool,
 }
 
 /// How many recently settled paths a snapshot carries for display.
@@ -677,7 +705,7 @@ fn should_use_relative_ntfs_creates(
 fn worker_dispatch(
     transport: TransportProfile,
     destination_is_wsl: bool,
-    source_is_wsl: bool,
+    stripe_source_reads: bool,
     journal_available: bool,
     unnamed_size: u64,
     large_threshold: u64,
@@ -703,19 +731,56 @@ fn worker_dispatch(
     Some(WorkerDispatch {
         promote_threshold,
         // NTFS and generic redirectors retain the measured same-directory
-        // create serialization. Either WSL side instead stripes small files.
-        // A Plan 9 *destination* under serial affinity merely exposes one
-        // provider round trip at a time and protects no local NTFS directory
-        // index. With a Plan 9 *source* the per-file cost is dominated by
-        // source-side round trips (measured 2026-08-02: open_src 1.5 ms +
-        // read 0.8 ms of the ~2.4 ms total, vs 0.33 ms for the local NTFS
-        // create), so serializing a directory onto one worker to protect the
-        // local create index costs far more than the index convoy it avoids
-        // — affine dispatch collapsed WSL→Win small files to ~720–2,000
-        // files/s while robocopy's interleaved creates reach 2,600 files/s
-        // on the same tree.
-        directory_affine: unnamed_size < large_threshold && !destination_is_wsl && !source_is_wsl,
+        // create serialization. A WSL destination instead stripes small
+        // files: serial affinity there merely exposes one provider round
+        // trip at a time and protects no local NTFS directory index.
+        // `stripe_source_reads` (decided once per run by
+        // `remote_source_striping`) does the same when the *source* is
+        // remote and its per-file round trips dominate: measured 2026-08-02,
+        // a Plan 9 source pays open_src 1.5 ms + read 0.8 ms of the ~2.4 ms
+        // total vs 0.33 ms for the local NTFS create, so serializing a
+        // directory onto one worker to protect the local create index
+        // collapsed WSL→Win small files to ~720–2,000 files/s while
+        // robocopy's interleaved creates reach 2,600 files/s on the same
+        // tree.
+        directory_affine: unnamed_size < large_threshold
+            && !destination_is_wsl
+            && !stripe_source_reads,
     })
+}
+
+/// Minimum measured remote round-trip floor at which a generic-redirector
+/// *source* switches plain-small dispatch from directory affinity to
+/// striping.
+///
+/// Loopback SMB answers volume queries in tens of microseconds and its
+/// per-file source cost is smaller than the local NTFS create convoy that
+/// striping would introduce — measured 2026-08-02 (BENCHMARKS.md): affine
+/// UNC→local ran 3,645–4,316 files/s while robocopy's interleaved creates
+/// managed 3,243 files/s on the same loopback tree. At real network
+/// latencies the balance inverts exactly as it did for Plan 9, whose round
+/// trips sit well above this floor.
+const REMOTE_SOURCE_STRIPE_LATENCY_FLOOR: Duration = Duration::from_micros(250);
+
+/// Decides once per run whether plain-small dispatch should stripe to
+/// parallelize remote-source round trips instead of preserving local
+/// destination directory affinity.
+///
+/// WSL sources always stripe — loopback Plan 9 round trips dominated
+/// per-file cost in every measured configuration (ADR 0052). Generic
+/// redirector sources stripe only when the preflight volume queries
+/// measured a network-class round trip; the sample costs no extra I/O
+/// because the probe issues those queries anyway (a static preflight
+/// decision from VISION's "minor measurement" allowance, never re-tuned
+/// mid-run). Local sources never stripe.
+fn remote_source_striping(endpoint: EndpointKind, query_latency: Option<Duration>) -> bool {
+    match endpoint {
+        EndpointKind::Wsl => true,
+        EndpointKind::Unc => {
+            query_latency.is_some_and(|latency| latency >= REMOTE_SOURCE_STRIPE_LATENCY_FLOOR)
+        }
+        EndpointKind::Local => false,
+    }
 }
 
 /// Journal verdict for one destination-only `.bigcp-…part` child name.
@@ -1929,7 +1994,7 @@ impl Runner<'_> {
             if let Some(dispatch) = worker_dispatch(
                 self.settings.tuning.transport,
                 self.destination_policy.endpoint() == EndpointKind::Wsl,
-                self.settings.source.is_wsl,
+                self.stripe_source_reads,
                 self.journal.is_some(),
                 unnamed,
                 self.options.large_threshold(),
@@ -4077,6 +4142,47 @@ mod tests {
             false,
         );
         assert!(local_both.is_some_and(|dispatch| dispatch.directory_affine));
+    }
+
+    /// Pins the run-level locality decision: WSL sources always stripe,
+    /// generic-redirector sources stripe only at network-class measured
+    /// latency, local sources never do. The floor itself is part of the
+    /// contract — loopback SMB measured faster under affinity, real
+    /// networks invert (BENCHMARKS.md 2026-08-02).
+    #[test]
+    fn remote_source_striping_is_latency_gated_for_generic_redirectors() {
+        use std::time::Duration;
+
+        use bigcp_win::EndpointKind;
+
+        use super::{REMOTE_SOURCE_STRIPE_LATENCY_FLOOR, remote_source_striping};
+
+        // WSL: unconditional, with or without a sample.
+        assert!(remote_source_striping(EndpointKind::Wsl, None));
+        assert!(remote_source_striping(
+            EndpointKind::Wsl,
+            Some(Duration::from_micros(10))
+        ));
+        // Generic UNC: no sample or loopback-class latency keeps affinity.
+        assert!(!remote_source_striping(EndpointKind::Unc, None));
+        assert!(!remote_source_striping(
+            EndpointKind::Unc,
+            Some(Duration::from_micros(60))
+        ));
+        // The floor is inclusive; network-class latency stripes.
+        assert!(remote_source_striping(
+            EndpointKind::Unc,
+            Some(REMOTE_SOURCE_STRIPE_LATENCY_FLOOR)
+        ));
+        assert!(remote_source_striping(
+            EndpointKind::Unc,
+            Some(Duration::from_millis(5))
+        ));
+        // Local sources never stripe, whatever a stray sample claims.
+        assert!(!remote_source_striping(
+            EndpointKind::Local,
+            Some(Duration::from_millis(5))
+        ));
     }
 
     #[test]

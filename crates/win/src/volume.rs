@@ -144,6 +144,15 @@ pub struct VolumeInfo {
     pub total_bytes: u64,
     /// Filesystem capabilities.
     pub capabilities: VolumeCapabilities,
+    /// Fastest observed handle-bound volume query on a remote root; `None`
+    /// for local volumes.
+    ///
+    /// The probe issues three native queries anyway, so timing them costs no
+    /// extra I/O. The minimum is a floor estimate of the provider round-trip
+    /// latency, which scheduling uses to distinguish loopback-class from
+    /// network-class redirectors (a static preflight decision — VISION's
+    /// "minor measurement", not adaptive re-tuning).
+    pub remote_query_latency: Option<std::time::Duration>,
 }
 
 /// Probes one existing local or UNC path.
@@ -247,6 +256,7 @@ pub fn probe_volume(path: &Path) -> io::Result<VolumeInfo> {
         free_bytes_available: free_for_caller,
         total_bytes,
         capabilities: capabilities_from_flags(flags),
+        remote_query_latency: None,
     })
 }
 
@@ -261,9 +271,17 @@ fn probe_remote_volume(root: PathBuf, endpoint: EndpointKind) -> io::Result<Volu
     } else {
         endpoint
     };
+    // Time each query the probe must issue anyway; the minimum of the three
+    // is the round-trip floor published as `remote_query_latency`.
+    let started = std::time::Instant::now();
     let attributes = query_remote_attributes(&handle)?;
+    let mut latency = started.elapsed();
+    let started = std::time::Instant::now();
     let serial = query_remote_serial(&handle)?;
+    latency = latency.min(started.elapsed());
+    let started = std::time::Instant::now();
     let size = query_remote_struct::<FILE_FS_SIZE_INFORMATION>(&handle, FileFsSizeInformation)?;
+    latency = latency.min(started.elapsed());
     let bytes_per_sector = size.BytesPerSector;
     let cluster_size = u64::from(size.SectorsPerAllocationUnit)
         .checked_mul(u64::from(bytes_per_sector))
@@ -327,6 +345,7 @@ fn probe_remote_volume(root: PathBuf, endpoint: EndpointKind) -> io::Result<Volu
         free_bytes_available,
         total_bytes,
         capabilities,
+        remote_query_latency: Some(latency),
     })
 }
 

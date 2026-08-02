@@ -36,6 +36,22 @@ versioning once its 1.0 release gates are complete.
 
 ### Changed
 
+- 2026-08-02 latency-gated remote-source striping (ADR 0053): the remote
+  volume probe now times the three handle-bound queries it already issues
+  and publishes the minimum as a round-trip floor (zero extra I/O). A
+  generic-UNC *source* stripes plain-small dispatch across workers only when
+  that floor is network-class (≥250 µs); loopback-class shares keep the
+  measured directory affinity, WSL sources continue to stripe
+  unconditionally, and local sources never stripe. The decision is made once
+  at preflight and recorded in the run-start remote-topology log line with
+  the measured latency. Loopback `\\localhost\C$` validation (BENCHMARKS.md
+  2026-08-02, indicative only — network-class SMB unmeasured, H6 open): the
+  gate correctly kept affinity at a ~2 µs floor with no small-file
+  regression (~4,000–4,157 files/s UNC→local), baseline bigcp already led
+  robocopy in three of four loopback cells, and WSL striping revalidated
+  after the change. Single-file segmented transfers are deliberately not
+  extended to SMB (credit-pipelined writes, lease-break risk, unmeasurable
+  on loopback).
 - 2026-08-02 measured WSL Plan 9 optimization (ADR 0052): raised the WSL Auto
   row to 32 workers at the measured scaling knee; striped small-file dispatch
   whenever either side is WSL (a 9P source pays ~2.3 of its 2.4 ms/file in

@@ -58,7 +58,11 @@ hashing and writes remain ordered, and pipeline segments stop at checkpoint
 boundaries.
 WSL remains a distinct transport/profile identity and stripes plain-small
 dispatch across its worker pool whenever either side is WSL, while generic
-UNC retains directory affinity. Large non-sparse, unnamed-only,
+UNC retains directory affinity. A generic-redirector source switches to the
+same striping only when the preflight volume queries — timed at zero extra
+I/O — measured a network-class round trip (≥250 µs floor); loopback-class
+shares keep affinity, and the once-per-run decision is logged (ADR 0053).
+Large non-sparse, unnamed-only,
 non-checkpointed, non-resume files with exactly one WSL side additionally
 move as 2–8 chunk-aligned parallel segments of the single opaque temp — each
 segment on its own identity-checked source open and identity-proven

@@ -472,15 +472,88 @@ extent figures; the WSL→Win path reuses the same preallocated temp
 publication whose single-extent evidence is recorded in the 2026-07-29
 entries, and no new extent capture was taken this session.
 
+## 2026-08-02 generic UNC (loopback-indicative)
+
+**Environment:** same machine and day as the WSL entry above; the generic-UNC
+endpoint is the loopback admin share `\\localhost\C$` — the complete SMB
+client/server stack with no physical network underneath it. Loopback answers
+in microseconds where a real network answers in hundreds, so **every number
+in this entry is loopback-indicative only; network-class SMB remains
+unmeasured and H6 stays open.** Workloads and warm discipline as in the WSL
+entry: small = 2,000 × 4 KiB files in 20 directories, large = 1 × 512 MiB,
+warm runs, release build — ranges below span runs and sit below the certified
+≥5-repetition protocol.
+
+### Baseline (pre-change): bigcp already led 3 of 4 loopback cells
+
+| Cell | bigcp | robocopy | Standing |
+|---|---|---|---|
+| local→UNC small | 3,504–3,750 files/s | `/MT:16` 980 files/s | 3.6–3.8× ahead |
+| local→UNC 512 MiB | ~610 MB/s median | 495 MB/s | ~23% ahead |
+| UNC→local small | 3,645–4,316 files/s | 3,243 files/s | 12–33% ahead |
+| UNC→local 512 MiB (cache-hot) | ≈2,500 MB/s | 3,302 MB/s | behind — loopback artifact |
+
+The one trailing cell is a loopback artifact, not a redirector result: the
+"remote" 512 MiB source is served from the local page cache at memory speed,
+so the cell measures per-syscall overhead rather than anything a network
+would show.
+
+### What shipped (ADR 0053): a latency gate for remote-source striping
+
+ADR 0052 established that when a remote *source*'s per-file round trips
+dominate, directory affinity serializes the expensive side; whether that
+arithmetic applies to a generic UNC source depends entirely on its latency
+class. The remote volume probe already issues three handle-bound native
+queries at preflight, so timing them costs zero extra I/O: `VolumeInfo` now
+publishes the minimum of the three as `remote_query_latency` (`None` for
+local volumes), and the pure policy `remote_source_striping` stripes
+plain-small dispatch for a generic-UNC source only when that floor is
+network-class (`REMOTE_SOURCE_STRIPE_LATENCY_FLOOR` = 250 µs, inclusive).
+WSL sources stripe unconditionally as before; local sources never do. The
+run-start "remote topology" log line records the measured latency and the
+chosen locality.
+
+The floor sits between measurements on both sides: loopback query floors
+measured ~2–80 µs, where affinity is measurably better (the affine UNC→local
+baseline above beats robocopy's interleaved creates), while LAN RTTs start
+around ~200 µs–1 ms+, where the Plan 9 arithmetic — source round trips
+dominate the per-file cost — applies unchanged.
+
+### Gate validation (loopback, plus WSL revalidation)
+
+- The loopback round-trip floor measured ~2 µs and the run log showed the
+  affinity branch: `source round trip ~2us (loopback-class), keeping
+  directory affinity`.
+- No regression: UNC→local small files stayed at ~4,000–4,157 files/s after
+  the change (baseline 3,645–4,316).
+- WSL revalidated after the change: the log confirmed striped dispatch and
+  32 workers; single runs measured Win→WSL 3,264 files/s and WSL→Win 2,320
+  files/s, consistent with the 2026-08-02 medians above.
+
+### Deliberately not shipped: SMB single-file segmentation
+
+Segmented parallel transfers (ADR 0052) stay WSL-only. SMB already pipelines
+writes through its credit window, extra handles on one file can break leases
+and regress real networks, and loopback cannot measure any of that — so
+extending segmentation to UNC on loopback evidence would be exactly the
+unfounded claim the H6 gate exists to prevent. H6 remains open pending an
+approved network-class scratch share.
+
 ## Outstanding
 
-**H6 — redirector overlap (registered 2026-07-31, unmeasured):** ADR 0045's
+**H6 — redirector overlap (registered 2026-07-31; network-class unmeasured,
+loopback evidence indicative):** ADR 0045's
 fixed two-buffer pipeline should reduce idle time by overlapping one source
 read with one destination write, while parallel non-checkpointed streamed files
 should cover independent-file SMB latency better than the former
 coordinator-only path. Correctness tests prove actual stage overlap, ordering,
 bounded memory, cancellation, and checkpoint routing; they do not prove a
-speedup. The first approved remote experiment must compare the same bounded
+speedup. Loopback SMB evidence (the "2026-08-02 generic UNC
+(loopback-indicative)" entry above) is indicative only, though bigcp already
+led robocopy in three of four loopback cells there, and single-file
+segmentation is deliberately NOT extended to SMB (lease-break risk,
+credit-pipelined writes, untestable without a real network; ADR 0053). The
+first approved remote experiment must compare the same bounded
 fixture and verification policy across the pre-ADR baseline, current defaults,
 manual thread/chunk sweeps, and robocopy's best applicable `/MT`/`/J` settings,
 with signing/encryption/compression and endpoint topology recorded.
@@ -514,14 +587,16 @@ files per directory.
 The elevated filesystem matrix, repeated-run certified benchmark protocol,
 ADR 0036 same-spindle HDD comparison, and ADR 0037's generic-UNC profile
 comparison remain unexecuted (its WSL half was measured in the 2026-08-02
-entry). The same-spindle
+entry; the generic half has only the loopback-indicative 2026-08-02
+baseline). The same-spindle
 implementation is covered by deterministic topology/transport tests and a
 small verified same-volume integration case, but those tests prove correctness
 and phase ordering—not a speedup. Running the `[HW]` cell requires separate
 owner approval under `docs/TESTING.md`, including its exact bounded workload,
 target scratch root, write volume, duration, and drive impact. The remote
 generic-UNC 8 MiB/16-worker Auto row remains an independently bounded static
-default, not a measured speedup claim; the WSL 8 MiB/32-worker row is
+default, not a measured speedup claim (its loopback-indicative 2026-08-02
+baseline does not change that); the WSL 8 MiB/32-worker row is
 measured (2026-08-02, warm medians of 3 — indicative, not certified); any
 SMB/network benchmark additionally requires an approved scratch share path.
 ADR 0045's two-buffer and parallel-stream mechanics and ADR 0048's local

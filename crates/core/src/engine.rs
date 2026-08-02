@@ -3216,6 +3216,7 @@ mod tests {
                 free_bytes_available: 0,
                 total_bytes: 0,
                 capabilities: capabilities(false),
+                remote_query_latency: None,
             };
             DestinationCaps::from_policy(&FilesystemPolicy::from_volumes(
                 &volume(EndpointKind::Local, FileSystem::Ntfs),

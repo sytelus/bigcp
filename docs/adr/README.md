@@ -44,6 +44,12 @@ identity match) while everything unproven stays reported and is never
 deleted. ADR 0052 amends ADR 0046 with measured WSL values: 32 workers,
 striping on either WSL side, segmented parallel identity-verified transfers
 for eligible large one-sided WSL files, and three per-file round-trip cuts,
-while keeping 0046's chunk window, sequential hints, and deferred stamp.
+while keeping 0046's chunk window, sequential hints, and deferred stamp. ADR
+0053 extends ADR 0052's source-striping arithmetic to generic redirectors
+behind a measured latency gate: the remote probe's existing volume queries
+are timed at zero extra I/O, a source at or above the 250 µs round-trip
+floor stripes plain-small dispatch while loopback-class shares keep
+directory affinity, the once-per-run decision is logged, and SMB single-file
+segmentation is deliberately withheld pending H6.
 
 The index is filename ordered. `docs/MAINTENANCE.md` maps decisions to code and release checks.

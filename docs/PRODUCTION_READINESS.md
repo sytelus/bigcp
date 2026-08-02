@@ -86,7 +86,10 @@ lifespan-reducing writes, no machine-stability impact — see PLAN §12.0):
 - An approved disposable SMB/UNC endpoint remains required before claiming a
   measured generic-redirector speedup, robocopy parity, or universal
   optimality: the generic 8 MiB/16-worker row is still a correctness-tested
-  static hypothesis (H6, unmeasured). The WSL row was measured on a real
+  static hypothesis (H6; network-class unmeasured — the 2026-08-02 loopback
+  `\\localhost\C$` evidence in BENCHMARKS.md is indicative only and does not
+  close this gate, though it validated ADR 0053's latency-gated
+  source-striping decision at the loopback end). The WSL row was measured on a real
   `\\wsl.localhost` endpoint (BENCHMARKS.md 2026-08-02; H7 dispositioned,
   ADR 0052), but as warm medians of 3 runs it remains indicative — the
   certified median-of-≥5 quiesced protocol is still pending for every cell.

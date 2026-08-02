@@ -1,6 +1,9 @@
 # ADR 0052: Measured WSL profile and segmented parallel transfers
 
-**Status:** Accepted
+**Status:** Amended by ADR 0053 (network-class generic-UNC *sources* now also
+stripe plain-small dispatch behind a measured-latency gate; this ADR's
+"local and generic-UNC combinations keep directory affinity" statement holds
+only for local sources and loopback-class redirector latencies)
 
 ## Context
 

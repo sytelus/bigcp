@@ -222,7 +222,12 @@ Generic UNC shares preserve the fields their server advertises. Remote roots
 do not receive local-disk IOCTLs, same-spindle scheduling, or dense
 preallocation hints. The automatic profile uses bounded buffered requests,
 overlaps one source read with one destination write through two buffers, and
-can run independent non-checkpointed streams on separate workers. Server-side
+can run independent non-checkpointed streams on separate workers. Small-file
+dispatch from a remote source is latency-aware: a network-class share
+(measured round trip ≥250 µs) stripes small files across workers to
+parallelize per-file round trips, while a loopback-class share keeps the
+measured directory affinity. That choice is made once at preflight from
+volume queries bigcp already issues and is recorded in the log. Server-side
 cache durability remains outside bigcp's control, even with `--flush`.
 
 `\\wsl.localhost\DISTRO\...` and legacy `\\wsl$\DISTRO\...` are supported and
