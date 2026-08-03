@@ -36,6 +36,45 @@ versioning once its 1.0 release gates are complete.
 
 ### Changed
 
+- 2026-08-02 same-SSD large-stream close-out (ADR 0057) (v0.4.0 — this
+  release spans the post-v0.3.0 second review pass and the two same-drive
+  entries through this one): the always-on
+  large-stream xxh3 digest moves off the write critical path — onto a
+  dedicated pipeline stage for local standard unnamed streams (which also
+  gain a third, `mem`-accounted jitter buffer) and onto the reader thread
+  for redirector/WSL streams — after instrumented decomposition showed
+  hash+write serialization holding the ADR 0055 pipeline at the read/write
+  alternation ceiling on cache-hot same-SSD streams (read ~640 ms, xxh3
+  ~390 ms, write ~920 ms per 2 GiB). Every streamed file still logs its
+  digest; checkpoint boundaries and every digest-evidence field are
+  byte-identical. The worker pool now materializes lazily on the first
+  dispatched job, so single-large-file, dry, and empty runs skip thread
+  spawn/join and the preallocated result ring (~14 ms of a ~90 ms fixed
+  floor; empty-run floor measured 93 → ~75 ms). Result on the same-SSD
+  2 GiB cell (BENCHMARKS.md, interleaved same-window rounds): bigcp moved
+  from ~15–40% behind `cmd copy` to winning or tying the warm rounds,
+  with robocopy `/J` far behind throughout — closing the last same-drive
+  cell where another tool led.
+- 2026-08-02 same-drive scheduling and topology visibility (ADR 0056):
+  directories with ≥512 entries now rotate plain-small dispatch across 4
+  bounded affine lanes (ordinary directories keep one-worker affinity) —
+  measured same-SSD C:→C:, the flat 2,000-file single-directory cell moved
+  from 3,729–3,793 files/s (13% behind robocopy `/MT:32`) to 4,749–5,035
+  (ahead of robocopy's best swept thread count), with the nested cell
+  unregressed at ~2× robocopy. Relative NTFS creates no longer exclude
+  same-physical-disk pairs (destination-side mechanism; order-controlled
+  A/B measured neutral; same-spindle HDD pairs stay excluded via their
+  transport). The phased same-spindle gather now caps batches at 4096 files
+  instead of the 1024-job queue depth and waits out coordinator pauses
+  below a 64-file/burst-8 floor (up to 50 ms), so tiny-file HDD sweeps are
+  sized by the 256 MiB burst budget — registered as hypothesis H10, no HDD
+  attached. Reparse creation/repair now drains the phased worker first,
+  matching the inline-file rule. New user-facing visibility, never a copy
+  path change: a `same_share_double_traversal` hint plus a startup-notice
+  clause when both endpoints resolve to one file server (equal share roots
+  are proof; equal server+serial+filesystem is "medium" confidence), and
+  the same-volume ReFS block-clone hint is now also announced at preflight
+  instead of only in the post-run report.
 - 2026-08-02 distinct-drive NTFS large-stream overlap (ADR 0055) (v0.3.0 —
   this release spans the entries from the 2026-08-01 review pass through this
   one): local
@@ -75,7 +114,9 @@ versioning once its 1.0 release gates are complete.
   hypothesis H9 pending the elevated VHDX matrix cells or a physical stick.
 - 2026-08-02 latency-gated remote-source striping (ADR 0053): the remote
   volume probe now times the three handle-bound queries it already issues
-  and publishes the minimum as a round-trip floor (zero extra I/O). A
+  and publishes the slowest as the round-trip estimate (zero extra I/O; the
+  maximum, because the SMB redirector answers some queries from its
+  tree-connect cache). A
   generic-UNC *source* stripes plain-small dispatch across workers only when
   that floor is network-class (≥250 µs); loopback-class shares keep the
   measured directory affinity, WSL sources continue to stripe

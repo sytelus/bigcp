@@ -144,14 +144,15 @@ pub struct VolumeInfo {
     pub total_bytes: u64,
     /// Filesystem capabilities.
     pub capabilities: VolumeCapabilities,
-    /// Fastest observed handle-bound volume query on a remote root; `None`
+    /// Slowest observed handle-bound volume query on a remote root; `None`
     /// for local volumes.
     ///
     /// The probe issues three native queries anyway, so timing them costs no
-    /// extra I/O. The minimum is a floor estimate of the provider round-trip
-    /// latency, which scheduling uses to distinguish loopback-class from
-    /// network-class redirectors (a static preflight decision — VISION's
-    /// "minor measurement", not adaptive re-tuning).
+    /// extra I/O. The maximum is the round-trip estimate because the SMB
+    /// redirector answers some of the queries from its tree-connect cache
+    /// (see `probe_remote_volume`); scheduling uses it to distinguish
+    /// loopback-class from network-class redirectors (a static preflight
+    /// decision — VISION's "minor measurement", not adaptive re-tuning).
     pub remote_query_latency: Option<std::time::Duration>,
 }
 

@@ -1,6 +1,10 @@
 # ADR 0036: Topology-gated same-spindle phased transport
 
-**Status:** Accepted; hardware performance evidence pending
+**Status:** Accepted; hardware performance evidence pending; amended by ADR
+0056 (the phased gather now caps batches at 4096 files instead of the queue
+depth and waits out coordinator pauses below a 64-file/burst-8 floor, so
+tiny-file sweeps are sized by the burst budget rather than shattered by a
+2 ms timeout; the three-phase contract is unchanged)
 
 ## Context
 

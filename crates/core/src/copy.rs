@@ -127,6 +127,16 @@ pub fn run_copy(
             preflight.profile.transport.burst_bytes / (1024 * 1024)
         ));
     }
+    if refs_clone_candidate(&preflight) {
+        // The report repeats this as the `refs_clone` hint; saying it before
+        // a potentially long run lets the user choose the OS engine now
+        // instead of learning about it afterwards (VISION allows informing,
+        // never a second engine).
+        observer.on_message(
+            "same-volume ReFS copy: the OS copy engine may block-clone this much faster; \
+             bigcp always performs a full byte copy",
+        );
+    }
     if preflight.source_volume.endpoint.is_remote()
         || preflight.destination_volume.endpoint.is_remote()
     {
@@ -145,8 +155,20 @@ pub fn run_copy(
                 preflight.source_volume.endpoint,
                 preflight.source_volume.remote_query_latency,
             );
+            // Same-share detection joins the existing notice rather than
+            // adding another one (VISION combines startup notices).
+            let same_share = if same_share_confidence(
+                &preflight.source_volume,
+                &preflight.destination_volume,
+            )
+            .is_some()
+            {
+                "; same-server topology: every byte crosses this client twice — running the copy on the server avoids both traversals"
+            } else {
+                ""
+            };
             format!(
-                "remote topology: source={} destination={}; using bounded two-buffer read/write overlap and {} static redirector worker(s){locality}",
+                "remote topology: source={} destination={}; using bounded two-buffer read/write overlap and {} static redirector worker(s){locality}{same_share}",
                 preflight.source_volume.endpoint.name(),
                 preflight.destination_volume.endpoint.name(),
                 preflight.profile.workers,
@@ -270,7 +292,6 @@ pub fn run_copy(
         preflight.source_volume.endpoint,
         preflight.destination_volume.filesystem,
         preflight.destination_volume.endpoint,
-        preflight.profile.same_physical_disk,
         preflight.profile.transport,
     );
     let file_workers = FileWorkers::new(
@@ -335,6 +356,8 @@ pub fn run_copy(
             preflight.source_volume.endpoint,
             preflight.source_volume.remote_query_latency,
         ),
+        affine_lanes: 1,
+        affine_sequence: 0,
     };
     if destination_policy.is_degraded() {
         runner.increment_warning("degraded_filesystem");
@@ -629,6 +652,46 @@ struct Runner<'a> {
     /// stripe to parallelize remote-source round trips, or keep local
     /// destination directory affinity.
     stripe_source_reads: bool,
+    /// Affine lanes for the directory currently being entered (1 = pure
+    /// affinity; see `single_directory_lanes`).
+    affine_lanes: usize,
+    /// Rotation counter across the current directory's affine submissions.
+    affine_sequence: usize,
+}
+
+/// Worker lanes for one directory's plain-small affine dispatch.
+///
+/// Directory affinity exists because NTFS serializes same-directory creates
+/// on the directory index, so interleaving MANY workers on one directory was
+/// measured counterproductive (2026-07-29: ~2 ms/create at 64 interleaved
+/// workers vs ~0.5 ms serialized). But a single-lane policy leaves every
+/// other worker idle when one huge directory dominates the run — VISION
+/// sizes a single directory at up to ~1M entries — and the convoy tax is
+/// mild at LOW lane counts: measured 2026-08-02 on a same-SSD 2,000-file
+/// flat directory (BENCHMARKS.md), one lane ran 3,729 files/s while
+/// robocopy's interleaving peaked at 4,548 files/s with 4 threads and fell
+/// again by 16. Oversized directories therefore rotate across a small fixed
+/// lane count; ordinary directories keep pure affinity, and the ADR 0048
+/// relative-create parent cache simply materializes once per lane.
+const SINGLE_DIRECTORY_LANES: usize = 4;
+
+// Compile-time guard: the lane count must stay far below the measured
+// 64-worker convoy regime that directory affinity exists to prevent.
+const _: () = assert!(SINGLE_DIRECTORY_LANES <= 8);
+
+/// Entry count at which a directory graduates to multi-lane dispatch.
+/// Typical tree directories (tens to a few hundred entries) stay affine;
+/// the threshold marks directories big enough that lane parallelism
+/// outweighs one directory index's serialization.
+const DIRECTORY_SUBSHARD_MIN: usize = 512;
+
+/// Lane count for a directory with `entries` joined source entries.
+const fn single_directory_lanes(entries: usize) -> usize {
+    if entries >= DIRECTORY_SUBSHARD_MIN {
+        SINGLE_DIRECTORY_LANES
+    } else {
+        1
+    }
 }
 
 /// How many recently settled paths a snapshot carries for display.
@@ -664,14 +727,17 @@ fn should_use_relative_ntfs_creates(
     source_endpoint: EndpointKind,
     destination_filesystem: FileSystem,
     destination_endpoint: EndpointKind,
-    same_physical_disk: bool,
     transport: TransportProfile,
 ) -> bool {
+    // The parent-handle relative create (ADR 0048) is purely a
+    // destination-side open-path optimization, so sharing a physical disk
+    // with the source does not affect its safety: same-disk SSD pairs keep
+    // the standard transport and now qualify. Same-spindle HDD pairs are
+    // still excluded because their transport is not Standard.
     source_filesystem == FileSystem::Ntfs
         && destination_filesystem == FileSystem::Ntfs
         && matches!(source_endpoint, EndpointKind::Local)
         && matches!(destination_endpoint, EndpointKind::Local)
-        && !same_physical_disk
         && matches!(transport.kind, TransportKind::Standard)
 }
 
@@ -1226,6 +1292,11 @@ impl Runner<'_> {
         // PartDone) before the extras accounting at the bottom runs.
         let resume_temp_dispositions =
             self.classify_resume_temps(&source_entries, &destination_map, &relative);
+        // Per-directory affine lane state (see submit_file_job): an
+        // oversized directory spreads its plain-small jobs across a small
+        // fixed number of worker lanes instead of one.
+        self.affine_lanes = single_directory_lanes(source_entries.len());
+        self.affine_sequence = 0;
         let mut seen_source = HashSet::new();
         let mut child_directories = Vec::new();
         let relative_destination_parent = if self.relative_ntfs_creates {
@@ -2213,7 +2284,19 @@ impl Runner<'_> {
         let shard = if job.directory_affine {
             let mut hasher = DefaultHasher::new();
             parent.hash(&mut hasher);
-            usize::try_from(hasher.finish()).unwrap_or(usize::MAX)
+            let base = usize::try_from(hasher.finish()).unwrap_or(usize::MAX);
+            // Oversized directories rotate across a bounded lane set so one
+            // huge directory cannot idle the rest of the pool (see
+            // single_directory_lanes); ordinary directories keep lane 0,
+            // i.e. classic one-worker affinity.
+            let lane = if self.affine_lanes > 1 {
+                let lane = self.affine_sequence % self.affine_lanes;
+                self.affine_sequence = self.affine_sequence.wrapping_add(1);
+                lane
+            } else {
+                0
+            };
+            base.wrapping_add(lane)
         } else {
             let shard = self.next_independent_shard;
             self.next_independent_shard = self.next_independent_shard.wrapping_add(1);
@@ -2547,6 +2630,13 @@ impl Runner<'_> {
                         None,
                     )?;
                 } else {
+                    // Same rule as copy_classified's inline files: reparse
+                    // metadata repair mutates the destination, so the phased
+                    // same-spindle worker must settle first or link I/O
+                    // would interleave with its source/destination phases.
+                    if self.settings.tuning.transport.is_same_spindle() {
+                        self.drain_file_workers()?;
+                    }
                     let result = destination.as_ref().map_or_else(
                         || {
                             Err(OperationError::semantic(
@@ -2629,6 +2719,12 @@ impl Runner<'_> {
                         None,
                     )?;
                     return Ok(());
+                }
+                // Reparse creation/replacement mutates the destination
+                // inline; drain the phased same-spindle worker first
+                // (symmetry with copy_classified's inline-file drain).
+                if self.settings.tuning.transport.is_same_spindle() {
+                    self.drain_file_workers()?;
                 }
                 if let Err(error) = revalidate_source(&source, &relative) {
                     self.counters.links_failed = self.counters.links_failed.saturating_add(1);
@@ -3689,6 +3785,59 @@ fn format_time(value: OffsetDateTime) -> String {
         .unwrap_or_else(|_| value.unix_timestamp().to_string())
 }
 
+/// Whether the OS copy engine could block-clone this pair: both sides ReFS,
+/// one volume, refcounting supported. bigcp never clones (VISION prohibits a
+/// second engine; ADR 0043) — the fact is surfaced to the user at preflight
+/// and in the report hints so a much faster OS-native option is not silently
+/// withheld from them.
+fn refs_clone_candidate(preflight: &Preflight) -> bool {
+    preflight.source_volume.filesystem == FileSystem::Refs
+        && preflight.destination_volume.filesystem == FileSystem::Refs
+        && preflight.source_volume.serial == preflight.destination_volume.serial
+        && preflight.destination_volume.capabilities.block_refcounting
+}
+
+/// Case-folded `(server, share)` from a canonical UNC volume root
+/// (`GetVolumePathNameW` output such as `\\server\share\` or
+/// `\\?\UNC\server\share\`). SMB server and share names match
+/// case-insensitively, so the ordinal fold applies.
+fn unc_server_share(root: &Path) -> Option<(Vec<u16>, Vec<u16>)> {
+    let std::path::Component::Prefix(prefix) = root.components().next()? else {
+        return None;
+    };
+    let (std::path::Prefix::UNC(server, share) | std::path::Prefix::VerbatimUNC(server, share)) =
+        prefix.kind()
+    else {
+        return None;
+    };
+    let server = comparison_key(server, false).ok()?;
+    let share = comparison_key(share, false).ok()?;
+    Some((server, share))
+}
+
+/// Detects a generic-UNC pair whose bytes cross this client twice — read
+/// from the server, written back to the same server volume — and returns the
+/// evidence confidence. Equal share roots are proof ("high"). Two different
+/// shares fronting one server volume are inferred from an equal server name
+/// plus equal volume serial and filesystem ("medium"): the serial alone is a
+/// bare `u32` and is never trusted without the matching server component.
+/// WSL pairs are excluded — the `wsl_interop` hint already owns that story.
+fn same_share_confidence(source: &VolumeInfo, destination: &VolumeInfo) -> Option<&'static str> {
+    if source.endpoint != EndpointKind::Unc || destination.endpoint != EndpointKind::Unc {
+        return None;
+    }
+    let (source_server, source_share) = unc_server_share(&source.root)?;
+    let (destination_server, destination_share) = unc_server_share(&destination.root)?;
+    if source_server != destination_server {
+        return None;
+    }
+    if source_share == destination_share {
+        return Some("high");
+    }
+    (source.serial == destination.serial && source.filesystem == destination.filesystem)
+        .then_some("medium")
+}
+
 fn derive_hints(runner: &Runner<'_>, preflight: &Preflight) -> Vec<Hint> {
     let mut hints = Vec::new();
     if preflight.source_volume.endpoint.is_remote()
@@ -3753,17 +3902,25 @@ fn derive_hints(runner: &Runner<'_>, preflight: &Preflight) -> Vec<Hint> {
             confidence: "high".to_owned(),
         });
     }
-    if preflight.source_volume.filesystem == FileSystem::Refs
-        && preflight.destination_volume.filesystem == FileSystem::Refs
-        && preflight.source_volume.serial == preflight.destination_volume.serial
-        && preflight.destination_volume.capabilities.block_refcounting
-    {
+    if refs_clone_candidate(preflight) {
         hints.push(Hint {
             id: "refs_clone".to_owned(),
             text:
                 "This is a same-volume ReFS copy; the OS copy engine may block-clone it much faster"
                     .to_owned(),
             confidence: "high".to_owned(),
+        });
+    }
+    if let Some(confidence) =
+        same_share_confidence(&preflight.source_volume, &preflight.destination_volume)
+    {
+        hints.push(Hint {
+            id: "same_share_double_traversal".to_owned(),
+            text: "Source and destination resolve to the same file server; every byte crosses \
+                   this client twice (read from the server, written back to it). Running the \
+                   copy on the server itself avoids both network traversals"
+                .to_owned(),
+            confidence: confidence.to_owned(),
         });
     }
     hints
@@ -3990,31 +4147,106 @@ mod tests {
     use crate::transport::TransportProfile;
     use bigcp_win::{EndpointKind, FileSystem};
 
+    /// Pins the same-share detection contract (VISION allows informing the
+    /// user; the copy path never changes): proof requires two generic-UNC
+    /// endpoints on one server — equal share roots are "high", one server
+    /// volume behind two shares is "medium", and a bare serial match across
+    /// different servers is never trusted.
     #[test]
-    fn relative_ntfs_creates_are_isolated_to_distinct_local_ntfs_drives() {
+    fn same_share_detection_requires_server_proof() {
+        use super::same_share_confidence;
+        use bigcp_win::{VolumeCapabilities, VolumeInfo};
+        use std::path::PathBuf;
+
+        fn volume(root: &str, endpoint: EndpointKind, serial: u32) -> VolumeInfo {
+            VolumeInfo {
+                root: PathBuf::from(root),
+                endpoint,
+                filesystem: FileSystem::Ntfs,
+                serial,
+                maximum_component_length: 255,
+                bytes_per_sector: 512,
+                cluster_size: 4096,
+                free_bytes_available: 0,
+                total_bytes: 0,
+                capabilities: VolumeCapabilities {
+                    named_streams: true,
+                    extended_attributes: true,
+                    sparse_files: true,
+                    encryption: false,
+                    reparse_points: true,
+                    block_refcounting: false,
+                    persistent_acls: true,
+                    posix_unlink_rename: true,
+                },
+                remote_query_latency: None,
+            }
+        }
+
+        let share = volume(r"\\server\data\", EndpointKind::Unc, 7);
+        // Identical share roots (case-insensitively) are proof.
+        assert_eq!(
+            same_share_confidence(&share, &volume(r"\\SERVER\Data\", EndpointKind::Unc, 9)),
+            Some("high")
+        );
+        // The verbatim form of the same root matches the plain form.
+        assert_eq!(
+            same_share_confidence(
+                &share,
+                &volume(r"\\?\UNC\server\data\", EndpointKind::Unc, 7)
+            ),
+            Some("high")
+        );
+        // Two shares on one server fronting one volume: serial + filesystem
+        // agreement upgrades the same-server observation to "medium".
+        assert_eq!(
+            same_share_confidence(&share, &volume(r"\\server\backup\", EndpointKind::Unc, 7)),
+            Some("medium")
+        );
+        // Same server, different shares, different serials: no claim.
+        assert_eq!(
+            same_share_confidence(&share, &volume(r"\\server\backup\", EndpointKind::Unc, 8)),
+            None
+        );
+        // A serial collision across different servers proves nothing.
+        assert_eq!(
+            same_share_confidence(&share, &volume(r"\\other\data\", EndpointKind::Unc, 7)),
+            None
+        );
+        // Local and WSL endpoints never participate.
+        assert_eq!(
+            same_share_confidence(&share, &volume(r"C:\", EndpointKind::Local, 7)),
+            None
+        );
+        assert_eq!(
+            same_share_confidence(
+                &volume(r"\\wsl.localhost\Ubuntu\", EndpointKind::Wsl, 7),
+                &volume(r"\\wsl.localhost\Ubuntu\", EndpointKind::Wsl, 7)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn relative_ntfs_creates_require_local_ntfs_and_the_standard_transport() {
         let standard = TransportProfile::standard(8 * 1024 * 1024);
+        // Distinct drives and same-disk SSD pairs both qualify: the parent
+        // handle is destination-side only, and a shared physical disk keeps
+        // the Standard transport unless a rotational side selects the
+        // same-spindle profile (which changes the transport kind below).
         assert!(should_use_relative_ntfs_creates(
             FileSystem::Ntfs,
             EndpointKind::Local,
             FileSystem::Ntfs,
             EndpointKind::Local,
-            false,
             standard,
         ));
-        for (
-            source_fs,
-            source_endpoint,
-            destination_fs,
-            destination_endpoint,
-            same_disk,
-            transport,
-        ) in [
+        for (source_fs, source_endpoint, destination_fs, destination_endpoint, transport) in [
             (
                 FileSystem::Refs,
                 EndpointKind::Local,
                 FileSystem::Ntfs,
                 EndpointKind::Local,
-                false,
                 standard,
             ),
             (
@@ -4022,7 +4254,6 @@ mod tests {
                 EndpointKind::Local,
                 FileSystem::ExFat,
                 EndpointKind::Local,
-                false,
                 standard,
             ),
             (
@@ -4030,7 +4261,6 @@ mod tests {
                 EndpointKind::Unc,
                 FileSystem::Ntfs,
                 EndpointKind::Local,
-                false,
                 standard,
             ),
             (
@@ -4038,7 +4268,6 @@ mod tests {
                 EndpointKind::Local,
                 FileSystem::Ntfs,
                 EndpointKind::Wsl,
-                false,
                 TransportProfile::wsl(8 * 1024 * 1024),
             ),
             (
@@ -4046,15 +4275,13 @@ mod tests {
                 EndpointKind::Local,
                 FileSystem::Ntfs,
                 EndpointKind::Local,
-                true,
-                standard,
+                TransportProfile::same_spindle(256 * 1024 * 1024),
             ),
             (
                 FileSystem::Ntfs,
                 EndpointKind::Local,
                 FileSystem::Ntfs,
                 EndpointKind::Local,
-                false,
                 TransportProfile::redirector(8 * 1024 * 1024),
             ),
         ] {
@@ -4063,7 +4290,6 @@ mod tests {
                 source_endpoint,
                 destination_fs,
                 destination_endpoint,
-                same_disk,
                 transport,
             ));
         }
@@ -4196,6 +4422,25 @@ mod tests {
             false,
         );
         assert!(local_both.is_some_and(|dispatch| dispatch.directory_affine));
+    }
+
+    /// Pins the oversized-directory lane policy: ordinary directories keep
+    /// one-worker affinity, directories at or past the threshold rotate
+    /// across the small measured lane count (BENCHMARKS.md 2026-08-02:
+    /// single-lane 3,729 files/s vs a 4-thread interleave knee of 4,548 on a
+    /// same-SSD 2,000-file flat directory).
+    #[test]
+    fn oversized_directories_rotate_across_a_bounded_lane_set() {
+        use super::{DIRECTORY_SUBSHARD_MIN, SINGLE_DIRECTORY_LANES, single_directory_lanes};
+
+        assert_eq!(single_directory_lanes(0), 1);
+        assert_eq!(single_directory_lanes(DIRECTORY_SUBSHARD_MIN - 1), 1);
+        assert_eq!(
+            single_directory_lanes(DIRECTORY_SUBSHARD_MIN),
+            SINGLE_DIRECTORY_LANES
+        );
+        assert_eq!(single_directory_lanes(1_000_000), SINGLE_DIRECTORY_LANES);
+        // (The ≤8 lane-count ceiling is a compile-time guard at the const.)
     }
 
     /// Pins the run-level locality decision: WSL sources always stripe,

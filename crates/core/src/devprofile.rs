@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::BigcpError;
 use crate::options::{DeviceClass, TuneOptions};
-use crate::transport::{PIPELINE_BUFFERS, TransportProfile};
+use crate::transport::{LOCAL_PIPELINE_BUFFERS, PIPELINE_BUFFERS, TransportProfile};
 
 const DEFAULT_SAME_SPINDLE_BURST_BYTES: usize = 256 * 1024 * 1024;
 const MIN_SAME_SPINDLE_BURST_BYTES: usize = 1024 * 1024;
@@ -108,21 +108,28 @@ pub fn select_copy_profile(
     let mut chunk_bytes = tune
         .chunk_bytes
         .unwrap_or_else(|| source.chunk_bytes.min(destination.chunk_bytes));
+    // Every transport's coordinator-owned large stream moves through the
+    // bounded overlap pipeline (ADR 0055 extended it from redirectors to the
+    // standard transport), so the coordinator always reserves its buffer
+    // count: two chunks on network transports, three on the local standard
+    // transport whose closely matched stages take one jitter buffer
+    // (`LOCAL_PIPELINE_BUFFERS`, ADR 0057).
+    let coordinator_buffers = if redirector {
+        PIPELINE_BUFFERS
+    } else {
+        LOCAL_PIPELINE_BUFFERS
+    };
     if let Some(memory_bytes) = tune.memory_bytes {
         let chunk_budget = if same_spindle {
             memory_bytes
         } else {
-            // Every transport's coordinator-owned large stream moves through
-            // the bounded two-buffer overlap pipeline (ADR 0055 extended it
-            // from redirectors to the standard transport), so the coordinator
-            // always reserves PIPELINE_BUFFERS chunks.
             memory_bytes
                 .checked_sub(large_threshold)
-                .map(|available| available / PIPELINE_BUFFERS)
+                .map(|available| available / coordinator_buffers)
                 .filter(|available| *available >= MIN_CHUNK_BYTES)
                 .ok_or_else(|| {
                     BigcpError::Invalid(format!(
-                        "memory budget {memory_bytes} must hold one worker buffer ({large_threshold}) and {PIPELINE_BUFFERS} minimum coordinator chunks ({MIN_CHUNK_BYTES} bytes each)"
+                        "memory budget {memory_bytes} must hold one worker buffer ({large_threshold}) and {coordinator_buffers} minimum coordinator chunks ({MIN_CHUNK_BYTES} bytes each)"
                     ))
                 })?
         };
@@ -146,13 +153,14 @@ pub fn select_copy_profile(
         destination.workers
     };
     if !same_spindle && let Some(memory_bytes) = tune.memory_bytes {
-        // The coordinator runs one pipelined large transfer (two chunks in
-        // flight — ADR 0055) while small workers each hold one
-        // threshold-bounded file; redirector workers may additionally stream
-        // pipelined files themselves. Reserve the coordinator's chunks before
-        // deriving the worker cap so `mem=` is an actual aggregate
-        // copy-buffer bound, not merely a per-allocation bound.
-        let coordinator_bytes = chunk_bytes.saturating_mul(PIPELINE_BUFFERS);
+        // The coordinator runs one pipelined large transfer
+        // (`coordinator_buffers` chunks in flight — ADR 0055/0057) while
+        // small workers each hold one threshold-bounded file; redirector
+        // workers may additionally stream pipelined files themselves.
+        // Reserve the coordinator's chunks before deriving the worker cap so
+        // `mem=` is an actual aggregate copy-buffer bound, not merely a
+        // per-allocation bound.
+        let coordinator_bytes = chunk_bytes.saturating_mul(coordinator_buffers);
         let per_worker_bytes = if redirector {
             large_threshold.max(chunk_bytes.saturating_mul(PIPELINE_BUFFERS))
         } else {
@@ -161,7 +169,7 @@ pub fn select_copy_profile(
         let worker_bytes = memory_bytes.saturating_sub(coordinator_bytes);
         if worker_bytes < per_worker_bytes {
             return Err(BigcpError::Invalid(format!(
-                "memory budget {memory_bytes} must hold {PIPELINE_BUFFERS} coordinator chunks ({chunk_bytes} bytes each) and one worker buffer ({per_worker_bytes})"
+                "memory budget {memory_bytes} must hold {coordinator_buffers} coordinator chunks ({chunk_bytes} bytes each) and one worker buffer ({per_worker_bytes})"
             )));
         }
         let budgeted_workers = (worker_bytes / per_worker_bytes).clamp(1, 256);
@@ -472,15 +480,16 @@ mod tests {
 
     #[test]
     fn standard_memory_budget_reserves_the_pipelined_coordinator_chunks() {
-        // ADR 0055: the standard transport's coordinator-owned large streams
-        // move through the two-buffer overlap pipeline, so a `mem` budget
-        // reserves PIPELINE_BUFFERS coordinator chunks: an 8 MiB budget with
-        // a 4 MiB worker buffer leaves (8-4)/2 = 2 MiB per chunk.
+        // ADR 0055/0057: the local standard transport's coordinator-owned
+        // large streams move through the overlap pipeline with
+        // LOCAL_PIPELINE_BUFFERS (3) chunks in flight, so a `mem` budget
+        // reserves three coordinator chunks: a 16 MiB budget with a 4 MiB
+        // worker buffer leaves (16-4)/3 = 4 MiB per chunk.
         let mut unlimited = nvme();
         unlimited.maximum_transfer_length = None;
         let bounded = TuneOptions {
             chunk_bytes: Some(8 * 1024 * 1024),
-            memory_bytes: Some(8 * 1024 * 1024),
+            memory_bytes: Some(16 * 1024 * 1024),
             large_threshold: Some(4 * 1024 * 1024),
             ..TuneOptions::default()
         };
@@ -493,7 +502,7 @@ mod tests {
         );
         assert!(
             profile
-                .is_ok_and(|value| { value.chunk_bytes == 2 * 1024 * 1024 && value.workers == 1 })
+                .is_ok_and(|value| { value.chunk_bytes == 4 * 1024 * 1024 && value.workers == 1 })
         );
 
         let too_small = TuneOptions {

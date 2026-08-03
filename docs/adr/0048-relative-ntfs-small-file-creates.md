@@ -1,6 +1,10 @@
 # ADR 0048: Use relative parent handles for distinct-drive NTFS small files
 
-**Status:** Accepted
+**Status:** Accepted; amended by ADR 0056 (the same-physical-disk exclusion
+below was scoping conservatism with no safety rationale — the mechanism is
+destination-side only. Same-disk local NTFS pairs on the `standard`
+transport now qualify; same-spindle HDD pairs remain excluded through their
+transport kind)
 
 ## Context
 

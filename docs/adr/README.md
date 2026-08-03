@@ -73,5 +73,28 @@ segmentation is deliberately withheld pending H6.
   MaximumTransferLength no longer clamps the composed chunk, and the NVMe
   row moves to 16 MiB — amending ADR 0028's overlap rationale while keeping
   its buffered-I/O decision.
+- **0056 — Same-drive scheduling and topology visibility.** Directories with
+  ≥512 entries rotate plain-small dispatch across 4 bounded affine lanes
+  (measured: the flat single-directory cell moves from 13% behind robocopy
+  to ahead of its best thread count; ordinary directories keep one-worker
+  affinity), ADR 0048's same-physical-disk exclusion is dropped (destination-
+  side mechanism; A/B-measured neutral, path un-forked), the same-spindle
+  gather gains amplitude (4096-file cap) and floor-gated patience (50 ms
+  below 64 files/burst-8 — hypothesis H10, no HDD available), reparse
+  mutation drains the phased worker, and same-server UNC pairs plus
+  same-volume ReFS clones become visible at preflight (hints/notices only —
+  VISION's inform-the-user clause, never an OS copy engine).
+- **0057 — Staged in-flight hash, local pipeline depth, lazy worker pool.**
+  The always-on large-stream xxh3 moves off the write critical path — onto
+  a dedicated stage thread for local standard streams (which also gain a
+  third jitter buffer, `mem`-accounted), inline on the reader for network
+  transports — keeping PLAN §5.11's hashed-in-flight rule while removing
+  its measured cost (hash+write serialization held the ADR 0055 pipeline
+  at the alternation ceiling on same-SSD streams); and the worker pool
+  materializes lazily on the first job, so large-only/dry/empty runs skip
+  thread spawn/join and the preallocated result ring (~14 ms of a ~90 ms
+  fixed floor). Closed the last losing same-drive cell: bigcp now meets or
+  beats `cmd copy` and robocopy `/J` on the same-SSD 2 GiB stream in
+  same-window interleaved rounds.
 
 The index is filename ordered. `docs/MAINTENANCE.md` maps decisions to code and release checks.

@@ -99,9 +99,23 @@ impl TransportProfile {
 /// Fixed number of request buffers owned by one redirector transfer.
 ///
 /// Two buffers are sufficient to overlap one synchronous read with one
-/// synchronous write. A deeper userspace queue would increase memory without
+/// synchronous write when one side clearly dominates (a network or Plan 9
+/// round trip). A deeper userspace queue would increase memory without
 /// increasing either handle's I/O depth.
 pub const PIPELINE_BUFFERS: usize = 2;
+
+/// Request buffers for the *local standard* unnamed-stream pipeline.
+///
+/// A local cache-hot copy has closely matched stage costs (measured
+/// 2026-08-02 on a same-SSD 2 GiB stream: reader ~6.8 ms per 16 MiB request
+/// against writer ~7.2 ms), so momentary reader stalls — cache-miss reads,
+/// writeback contention — immediately starve the writer with only one
+/// spare buffer (~60 ms of writer idle per 2 GiB measured). One extra
+/// buffer absorbs that jitter for one chunk of additional memory, which the
+/// `mem` budget accounts for (`bigcp-core::devprofile`). Network transports
+/// keep [`PIPELINE_BUFFERS`]: their slow side dominates, the jitter margin
+/// buys nothing, and redirector workers each carry their own pipeline.
+pub const LOCAL_PIPELINE_BUFFERS: usize = 3;
 
 const CHANNEL_POLL: Duration = Duration::from_millis(50);
 
@@ -161,15 +175,25 @@ enum ReadPacket {
 /// Copies exactly `length` bytes while overlapping one source read with one
 /// destination write.
 ///
-/// The reader owns two fallibly allocated request buffers and never advances
-/// more than that bounded window ahead of the committed destination prefix.
-/// `consume` runs in write order on the caller thread, which lets the semantic
-/// engine retain its ordinary contiguous hashing and checkpoint boundaries.
+/// The reader owns `depth` fallibly allocated request buffers and never
+/// advances more than that bounded window ahead of the committed destination
+/// prefix.
+/// `consume` runs once per request in read order — which is write order,
+/// since ordered channels feed the writer — so the semantic engine retains
+/// its ordinary contiguous hashing and checkpoint boundaries. At
+/// [`LOCAL_PIPELINE_BUFFERS`] depth, `consume` gets its own stage thread
+/// between reader and writer, keeping the digest off both hot legs: the
+/// local stages are closely matched (measured 2026-08-02 on a same-SSD
+/// cache-hot 2 GiB stream: read ~640 ms, xxh3 ~390 ms, write ~920 ms), so
+/// serializing the digest into either leg costs the row. At two-buffer
+/// depth (network transports) it runs inline on the reader thread, whose
+/// round trips dwarf it — a third thread would buy nothing there.
 ///
 /// INVARIANT for checkpoint callers: `consume` (hashing) runs *before* the
-/// corresponding write is confirmed, so the in-flight digest may be ahead of
-/// the durable destination prefix mid-segment. A checkpoint recorded from the
-/// live hasher inside a segment would attest bytes that may never have been
+/// corresponding write is confirmed — up to `depth` requests
+/// ahead of it — so the in-flight digest may be ahead of the durable
+/// destination prefix mid-segment. A checkpoint recorded from the live
+/// hasher inside a segment would attest bytes that may never have been
 /// written — checkpoints must only be appended after this function returns
 /// `Ok` for the whole segment ending at the boundary.
 pub(crate) fn transfer_pipelined<R, W, F>(
@@ -177,17 +201,19 @@ pub(crate) fn transfer_pipelined<R, W, F>(
     destination: &mut W,
     length: u64,
     request_bytes: usize,
+    depth: usize,
     canceled: &dyn CancelProbe,
     mut consume: F,
 ) -> Result<PipelinedTransfer, PipelinedFailure>
 where
     R: Read + Send,
     W: Write,
-    F: FnMut(&[u8]),
+    F: FnMut(&[u8]) + Send,
 {
     let request_bytes = request_bytes.max(1);
-    let mut buffers = Vec::with_capacity(PIPELINE_BUFFERS);
-    for _ in 0..PIPELINE_BUFFERS {
+    let depth = depth.clamp(PIPELINE_BUFFERS, LOCAL_PIPELINE_BUFFERS);
+    let mut buffers = Vec::with_capacity(depth);
+    for _ in 0..depth {
         let mut buffer = Vec::new();
         if let Err(error) = buffer.try_reserve_exact(request_bytes) {
             return Err(PipelinedFailure {
@@ -202,8 +228,9 @@ where
     let stopped = AtomicBool::new(false);
     let bytes_read = AtomicU64::new(0);
     let mut bytes_written = 0_u64;
-    let (free_sender, free_receiver) = crossbeam_channel::bounded(PIPELINE_BUFFERS);
-    let (filled_sender, filled_receiver) = crossbeam_channel::bounded(PIPELINE_BUFFERS);
+    let (free_sender, free_receiver) = crossbeam_channel::bounded(depth);
+    let (filled_sender, filled_receiver) = crossbeam_channel::bounded(depth);
+    let (hashed_sender, hashed_receiver) = crossbeam_channel::bounded(depth);
     for buffer in buffers {
         // The receiver is live and the channel has exactly enough capacity.
         if free_sender.send(buffer).is_err() {
@@ -216,9 +243,17 @@ where
         }
     }
 
+    let staged_hash = depth >= LOCAL_PIPELINE_BUFFERS;
     let outcome = std::thread::scope(|scope| {
         let reader_stopped = &stopped;
         let reader_bytes_read = &bytes_read;
+        // Exactly one stage owns `consume` (see the function doc): the
+        // dedicated hash stage at local depth, the reader inline otherwise.
+        let (mut reader_consume, hasher_consume) = if staged_hash {
+            (None, Some(consume))
+        } else {
+            (Some(consume), None)
+        };
         let reader = scope.spawn(move || {
             let mut remaining = length;
             while remaining > 0 && !reader_stopped.load(Ordering::Acquire) {
@@ -242,6 +277,11 @@ where
                         Ok(count) => {
                             reader_bytes_read.fetch_add(count as u64, Ordering::Relaxed);
                             remaining = remaining.saturating_sub(count as u64);
+                            // Two-buffer transports hash inline here, in
+                            // read order (see the function doc).
+                            if let Some(consume) = reader_consume.as_mut() {
+                                consume(&buffer[..count]);
+                            }
                             break ReadPacket::Data(buffer, count);
                         }
                         Err(error) if error.kind() == io::ErrorKind::Interrupted => {
@@ -274,6 +314,54 @@ where
             }
         });
 
+        // The hash stage pumps read packets to the writer in order, running
+        // `consume` on each data packet along the way. It owns the original
+        // `hashed_sender`, so its exit (normal or panic) disconnects the
+        // writer's channel and cannot hang the pipeline.
+        let hasher = if let Some(mut consume) = hasher_consume {
+            let filled_receiver = filled_receiver.clone();
+            Some(scope.spawn(move || {
+                loop {
+                    let packet = match filled_receiver.recv_timeout(CHANNEL_POLL) {
+                        Ok(packet) => packet,
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout)
+                            if !reader_stopped.load(Ordering::Acquire) =>
+                        {
+                            continue;
+                        }
+                        Err(_) => return,
+                    };
+                    if let ReadPacket::Data(buffer, count) = &packet {
+                        consume(&buffer[..*count]);
+                    }
+                    let terminal = !matches!(packet, ReadPacket::Data(_, _));
+                    let mut pending = packet;
+                    loop {
+                        match hashed_sender.send_timeout(pending, CHANNEL_POLL) {
+                            Ok(()) => break,
+                            Err(crossbeam_channel::SendTimeoutError::Timeout(packet))
+                                if !reader_stopped.load(Ordering::Acquire) =>
+                            {
+                                pending = packet;
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                    if terminal {
+                        return;
+                    }
+                }
+            }))
+        } else {
+            drop(hashed_sender);
+            None
+        };
+        let writer_receiver = if staged_hash {
+            &hashed_receiver
+        } else {
+            &filled_receiver
+        };
+
         let mut result = Ok(());
         while bytes_written < length {
             if canceled.is_canceled() {
@@ -281,7 +369,7 @@ where
                 break;
             }
             let packet = loop {
-                match filled_receiver.recv_timeout(CHANNEL_POLL) {
+                match writer_receiver.recv_timeout(CHANNEL_POLL) {
                     Ok(packet) => break Some(packet),
                     Err(crossbeam_channel::RecvTimeoutError::Timeout)
                         if !canceled.is_canceled() => {}
@@ -300,7 +388,6 @@ where
             };
             match packet {
                 ReadPacket::Data(buffer, count) => {
-                    consume(&buffer[..count]);
                     let mut offset = 0;
                     while offset < count {
                         if canceled.is_canceled() {
@@ -347,6 +434,12 @@ where
         }
         stopped.store(true, Ordering::Release);
         if reader.join().is_err() && result.is_ok() {
+            result = Err(PipelinedFailureKind::ReaderPanicked);
+        }
+        if let Some(hasher) = hasher
+            && hasher.join().is_err()
+            && result.is_ok()
+        {
             result = Err(PipelinedFailureKind::ReaderPanicked);
         }
         result
@@ -626,6 +719,7 @@ mod tests {
             &mut destination,
             expected.len() as u64,
             8,
+            2,
             &|| false,
             |bytes| consumed.extend_from_slice(bytes),
         );
@@ -652,7 +746,7 @@ mod tests {
             reads,
             checked: false,
         };
-        let result = transfer_pipelined(&mut source, &mut destination, 8, 4, &|| false, |_| {});
+        let result = transfer_pipelined(&mut source, &mut destination, 8, 4, 2, &|| false, |_| {});
         assert!(result.is_ok());
         assert_eq!(destination.bytes, (0_u8..8).collect::<Vec<_>>());
     }
@@ -661,12 +755,37 @@ mod tests {
     fn redirector_pipeline_reports_short_source_and_actual_io() {
         let mut source = Cursor::new(vec![1_u8; 5]);
         let mut destination = Vec::new();
-        let result = transfer_pipelined(&mut source, &mut destination, 9, 4, &|| false, |_| {});
+        let result = transfer_pipelined(&mut source, &mut destination, 9, 4, 2, &|| false, |_| {});
         assert!(result.is_err_and(|failure| {
             matches!(failure.kind, PipelinedFailureKind::UnexpectedEof)
                 && failure.transfer.bytes_read == 5
                 && failure.transfer.bytes_written == 5
         }));
+    }
+
+    /// Pins the local-depth staged hash (ADR 0057): at
+    /// `LOCAL_PIPELINE_BUFFERS` depth, `consume` runs on its own stage
+    /// between reader and writer, and must still see every byte exactly
+    /// once, in order, with the written stream identical — including with
+    /// requests that do not divide the length evenly.
+    #[test]
+    fn local_depth_pipeline_hashes_on_its_own_stage_in_order() {
+        let expected: Vec<u8> = (0_u16..1000).map(|value| (value % 251) as u8).collect();
+        let mut source = Cursor::new(expected.clone());
+        let mut destination = Vec::new();
+        let mut consumed = Vec::new();
+        let result = transfer_pipelined(
+            &mut source,
+            &mut destination,
+            expected.len() as u64,
+            7,
+            super::LOCAL_PIPELINE_BUFFERS,
+            &|| false,
+            |bytes| consumed.extend_from_slice(bytes),
+        );
+        assert!(result.is_ok_and(|transfer| transfer.bytes_written == expected.len() as u64));
+        assert_eq!(destination, expected);
+        assert_eq!(consumed, expected);
     }
 
     #[test]
@@ -701,6 +820,7 @@ mod tests {
             &mut destination,
             expected.len() as u64,
             8,
+            2,
             &|| false,
             |_| {},
         );
@@ -754,6 +874,7 @@ mod tests {
                 &mut pipeline_destination,
                 expected.len() as u64,
                 4,
+                2,
                 &|| false,
                 |_| {},
             )
@@ -819,7 +940,7 @@ mod tests {
         let mut source = FailingReader;
         let mut destination = Vec::new();
         let read_result =
-            transfer_pipelined(&mut source, &mut destination, 8, 4, &|| false, |_| {});
+            transfer_pipelined(&mut source, &mut destination, 8, 4, 2, &|| false, |_| {});
         assert!(read_result.is_err_and(|failure| {
             matches!(failure.kind, PipelinedFailureKind::Read(_))
                 && failure.transfer == super::PipelinedTransfer::default()
@@ -828,7 +949,7 @@ mod tests {
         let mut source = Cursor::new(vec![1_u8; 8]);
         let mut destination = FailingWriter { first: true };
         let write_result =
-            transfer_pipelined(&mut source, &mut destination, 8, 4, &|| false, |_| {});
+            transfer_pipelined(&mut source, &mut destination, 8, 4, 2, &|| false, |_| {});
         assert!(write_result.is_err_and(|failure| {
             matches!(failure.kind, PipelinedFailureKind::Write(_))
                 && failure.transfer.bytes_read >= 4
@@ -865,6 +986,7 @@ mod tests {
             &mut destination,
             32,
             8,
+            2,
             cancel.as_ref(),
             |_| {},
         );
@@ -887,7 +1009,7 @@ mod tests {
 
         let mut source = PanickingReader;
         let mut destination = Vec::new();
-        let result = transfer_pipelined(&mut source, &mut destination, 8, 4, &|| false, |_| {});
+        let result = transfer_pipelined(&mut source, &mut destination, 8, 4, 2, &|| false, |_| {});
         assert!(result.is_err_and(|failure| {
             matches!(failure.kind, PipelinedFailureKind::ReaderPanicked)
                 && failure.transfer.bytes_read == 0

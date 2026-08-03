@@ -27,8 +27,8 @@ use crate::journal::{Checkpoint, CheckpointFileIdentity, Journal, JournalEvent};
 use crate::model::{Counters, EntrySnapshot};
 use crate::phase::PhaseTracker;
 use crate::transport::{
-    BurstBuffer, CancelProbe, PipelinedFailureKind, TransferFailureKind, TransportProfile,
-    transfer_pipelined,
+    BurstBuffer, CancelProbe, LOCAL_PIPELINE_BUFFERS, PIPELINE_BUFFERS, PipelinedFailureKind,
+    TransferFailureKind, TransportProfile, transfer_pipelined,
 };
 
 /// Successful engine result consumed by the common outcome path.
@@ -471,6 +471,10 @@ fn open_file<'a>(
         ));
     }
     let checkpoint_eligible = routing.checkpoint_eligible;
+    // Every large stream is hashed in flight (PLAN §5.11: the digest powers
+    // checkpoint integrity and gives every streamed file a logged digest).
+    // The pipeline keeps that genuinely cheap by running the digest on its
+    // own stage, off both the read and write legs (ADR 0057).
     let should_hash =
         request.verify() || largest_stream >= request.large_threshold() || checkpoint_eligible;
     let source_has_eas =
@@ -1786,13 +1790,18 @@ enum StreamBuffers {
     /// Request-at-a-time chunk buffer for standard-transport sparse ranges
     /// and named streams.
     Standard(Vec<u8>),
-    /// Bounded read/write-overlap pipeline; the two request buffers live
-    /// inside [`transfer_pipelined`], so only the per-request size is
-    /// retained. Carries every redirector and WSL stream, and — since the
-    /// 2026-08-02 measurement — standard-transport unnamed large streams.
+    /// Bounded read/write-overlap pipeline; the request buffers live inside
+    /// [`transfer_pipelined`], so only the per-request size and buffer count
+    /// are retained. Carries every redirector and WSL stream, and — since
+    /// the 2026-08-02 measurement — standard-transport unnamed large
+    /// streams.
     Pipelined {
         /// Bytes per pipeline request.
         request_bytes: usize,
+        /// Request buffers in flight: [`PIPELINE_BUFFERS`] on network
+        /// transports, [`LOCAL_PIPELINE_BUFFERS`] for the local standard
+        /// transport's closely matched stages.
+        depth: usize,
     },
     /// Phased staging buffer reused by every same-spindle burst of the stream.
     SameSpindle(BurstBuffer),
@@ -1813,7 +1822,10 @@ impl StreamBuffers {
                 request, remaining,
             )?))
         } else if request.transport().is_redirector() {
-            Ok(Self::Pipelined { request_bytes })
+            Ok(Self::Pipelined {
+                request_bytes,
+                depth: PIPELINE_BUFFERS,
+            })
         } else if request_bytes == 0 {
             Err(zero_chunk_error(request))
         } else {
@@ -1846,7 +1858,18 @@ impl StreamBuffers {
         } else if request_bytes == 0 {
             Err(zero_chunk_error(request))
         } else {
-            Ok(Self::Pipelined { request_bytes })
+            // Local standard streams take one extra buffer to absorb reader
+            // jitter against a closely matched writer; network transports
+            // keep the two-buffer window (see the constants' docs).
+            let depth = if request.transport().is_redirector() {
+                PIPELINE_BUFFERS
+            } else {
+                LOCAL_PIPELINE_BUFFERS
+            };
+            Ok(Self::Pipelined {
+                request_bytes,
+                depth,
+            })
         }
     }
 }
@@ -1934,13 +1957,17 @@ fn transfer_segment<R: Read + Send, W: Write>(
             )
             .map(|count| count as u64)
         }
-        StreamBuffers::Pipelined { request_bytes } => transfer_redirector_segment(
+        StreamBuffers::Pipelined {
+            request_bytes,
+            depth,
+        } => transfer_redirector_segment(
             request,
             counters,
             source,
             destination,
             bound,
             *request_bytes,
+            *depth,
             ops.read_op,
             ops.write_op,
             ops.truncated,
@@ -2055,6 +2082,7 @@ fn transfer_redirector_segment<R: Read + Send, W: Write>(
     destination: &mut W,
     requested: u64,
     request_bytes: usize,
+    depth: usize,
     read_operation: &str,
     write_operation: &str,
     unexpected_end: &str,
@@ -2065,6 +2093,7 @@ fn transfer_redirector_segment<R: Read + Send, W: Write>(
         destination,
         requested,
         request_bytes,
+        depth,
         request.cancel,
         |bytes| {
             if let Some(hasher) = hasher {

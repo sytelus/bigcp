@@ -634,6 +634,153 @@ The certified protocol remains pending for this cell as for every other:
 median-of-≥5 quiesced, rotated runs with recorded Defender and commit state,
 per the closing protocol note below.
 
+## 2026-08-02 same-drive NTFS SSD (C:→C:) — copy vs robocopy vs bigcp, and bounded directory lanes
+
+Same-volume copies on the system NVMe (C: KIOXIA EG6 1 TB, NTFS, nvme row,
+not elevated, Defender active). Workloads: 2 GiB single stream, 10,000 ×
+4 KiB in 100 directories ("nested"), 2,000 × 4 KiB in one directory
+("flat"). Methodology: interleaved tool pairs, per-run destination deletion,
+`Optimize-Volume -ReTrim` settles. Same-volume cells add caveats the
+distinct-drive protocol does not have — freshly generated sources are
+page-cache-hot (the read side runs from RAM), one SLC cache absorbs both
+sides' traffic, the device ceiling is roughly half its mixed R/W bandwidth,
+and machine-window drift was directly observed (a later window depressed
+*all three tools* ~30%; every comparison below is within one window, and
+cross-window absolute numbers must not be compared).
+
+### Required three-tool comparison (baseline defaults, warm, one window)
+
+| Cell | `copy` | robocopy | bigcp (defaults) | Standing |
+|---|---|---|---|---|
+| 2 GiB large stream | ~2,824 MB/s (median) | `/J` ~1,311 MB/s (median) | ~1,679 MB/s (median) | cache-dominated: `copy`'s buffered read of a page-cache-hot source measures RAM, not the device; bigcp ahead of robocopy |
+| nested 10,000 × 4 KiB | n/a (no tree support) | `/MT:32` 4,294–4,403 f/s | **9,071–9,377 f/s** | bigcp ~2.1× ahead |
+| flat 2,000 × 4 KiB, one directory | 2,209–2,215 f/s | `/MT:32` 4,271–4,364 f/s | 3,729–3,793 f/s | the one cell robocopy won (~13%) |
+
+### The thread sweep that explained the flat cell
+
+One NTFS directory index serializes creates, but a *small* interleave still
+wins over strict serialization — robocopy on the flat cell: `/MT:2` 3,454,
+`/MT:4` **4,548**, `/MT:8` 4,116, `/MT:16` 3,787, `/MT:32` 4,271–4,364
+files/s. The knee at ~4 threads motivated bounded lane rotation instead of
+either extreme (pure affinity or full striping — the 2026-07-29 evidence
+that 64 interleaved workers collapse to ~2 ms/create still stands).
+
+### What shipped (ADR 0056)
+
+Directories with ≥512 joined entries rotate plain-small dispatch across 4
+affine lanes; ordinary directories keep one-worker affinity (PLAN §5.8 part
+1 refined, parts 2–4 untouched). Separately, ADR 0048's relative creates
+lost their same-physical-disk exclusion (destination-side mechanism; the
+same-spindle transport still excludes HDD pairs).
+
+### Post-change (interleaved robocopy control, one warm window)
+
+| Cell | bigcp (4 lanes) | robocopy `/MT:32` (interleaved) | Standing |
+|---|---|---|---|
+| flat 2,000 × 4 KiB | **4,749–5,035 f/s** | 3,760–4,223 f/s | ahead — was the only losing cell; +27% vs single-lane, ahead of robocopy's swept best (4,548) |
+| nested 10,000 × 4 KiB | **9,125 f/s** | 4,488 f/s | unregressed (its 100-entry directories sit below the 512 threshold) |
+
+`bigcp verify` green on the copied trees (2,001 and 10,101 objects).
+
+### Same-disk relative creates: order-controlled A/B (neutral, kept)
+
+Alternating first/second position within one window, flat cell: A1 build
+2,894–3,103 f/s vs exclusion build 2,964–3,185 f/s — differences 0.7–2.4%,
+within noise (an earlier non-order-controlled quartet had suggested −13%;
+position drift explained it). Nested equally a wash. The change is retained
+as path un-forking with ADR 0048's speedup claim still pending (H8): in the
+cache-hot small-file regime the parent-open saving is small against the
+create itself. All figures indicative — warm, small sets, below the
+certified ≥5-run protocol.
+
+## 2026-08-02 same-drive NTFS SSD, large-stream close-out (ADR 0057)
+
+The one same-drive cell another tool still won was the same-SSD 2 GiB
+stream: within every window `cmd copy` led bigcp by ~15–40% (e.g.
+2,049–2,067 vs 1,825–1,889 MB/s fresh; wider when degraded). Micro-probes
+in the same windows set the physics: cache-hot pure read ~4,663 MB/s, pure
+cached write ~3,491 MB/s, a single-threaded 16 MiB read-then-write loop
+1,988 MB/s — exactly the read/write alternation ceiling `1/(1/R+1/W)` —
+and the kernel's `CopyFile` 3,639 MB/s (cache-to-cache, no user-mode read
+leg; VISION's one-engine rule forbids that mechanism, not its wall clock).
+bigcp measured ~1,859 MB/s in-file: *at* the alternation ceiling despite
+ADR 0055's overlap pipeline.
+
+### Instrumented decomposition (temporary stage counters, 2 GiB, cache-hot)
+
+- Writer thread: xxh3 `consume` ~388 ms + writes ~822 ms, serialized —
+  the digest sat on the write critical path, spending the overlap the
+  pipeline was built for. Reader: ~638 ms, never waiting for buffers.
+- After moving the digest off the writer: reader-bound (read ~866 ms +
+  jitter), writer idle ~69 ms per 2 GiB waiting on packets — two buffers
+  cannot absorb reader stalls when stages are this closely matched
+  (~6.8 vs ~7.2 ms per 16 MiB request).
+- Fixed run floor ~93 ms against `cmd.exe`'s ~33 ms spawn: stage timers
+  put ~14 ms in `FileWorkers::new` eagerly preallocating the bounded
+  result ring (64 × 1024 `CompletedCopy` slots) plus thread spawn/join
+  for a pool a single-large-file run never uses; `--version` runs in
+  13–21 ms, so process init was not the problem.
+
+### What shipped (ADR 0057)
+
+The always-on digest (PLAN §5.11, unchanged) moved off both hot legs: a
+dedicated hash-stage thread between reader and writer for local standard
+unnamed streams, reader-inline for redirector/WSL (their round trips
+dwarf it). Local standard streams gained a third pipeline buffer
+(`LOCAL_PIPELINE_BUFFERS`, `mem`-accounted at three coordinator chunks)
+to absorb reader jitter. The worker pool (threads + result ring) now
+materializes lazily on the first dispatched job; empty-run floor measured
+93 → ~75 ms. Digest evidence, checkpoint boundaries, and every log/report
+field are byte-identical; network transports keep two buffers pending
+network measurement (H6).
+
+### Same-window interleaved rounds (2 GiB, per-round tool rotation)
+
+Intermediate builds already flipped the cell in warm windows — reader-side
+digest + third buffer: bigcp 1,781–1,947 vs copy 1,558–1,650 MB/s (won 4
+of 5 rounds); order-swapped fresh window: copy 1,952–2,049 vs bigcp
+1,825–1,889 (copy ahead ~7% ≈ the then-unfixed floor), robocopy `/J`
+1,055–1,252 far behind.
+
+Final build (staged hash + third buffer + lazy pool), one post-recovery
+window (~35 min idle after the degraded state below; the window recovered
+to a mid-range plateau, so absolutes sit below the fresh-morning numbers
+— the interleaved comparison is the claim, not the absolutes). Order
+rotated per round; every destination deleted between rounds:
+
+| Round | bigcp | `copy` | robocopy `/J` |
+|---|---|---|---|
+| 2 GiB r1 | 1,175 MB/s | 1,073 | **1,333** |
+| 2 GiB r2 | **1,353 MB/s** | 1,120 | 1,136 |
+| 2 GiB r3 | **1,907 MB/s** | 1,745 | 1,341 |
+| 2 GiB r4 | 1,508 MB/s | **1,609** | 1,201 |
+| median | **1,431 MB/s** | 1,365 | 1,267 |
+
+bigcp wins 3 of 4 rounds against each competitor and holds the highest
+median; `/J`'s unbuffered writes stop losing only when the cache path is
+degraded for everyone. The audit log carries the file's `xxh3:` digest
+(staged hashing kept the evidence), and `bigcp verify` passed on the
+copied stream. The same window re-confirmed the other two rows with the
+final build — all three tools interleaved, `copy` driven with a wildcard
+on the flat directory:
+
+| Cell | bigcp | robocopy `/MT:32` | `copy` |
+|---|---|---|---|
+| nested 10,000 × 4 KiB | **3,876–4,524 f/s** | 1,661–1,750 | n/a |
+| flat 2,000 × 4 KiB | **2,101–2,223 f/s** | 1,769–2,026 | 456–1,002 |
+
+Standalone verification green on both shapes (10,101 and 2,001 objects).
+With ADR 0056's lane rotation and this ADR's close-out, bigcp meets or
+beats both `cmd copy` and robocopy in all three same-SSD rows within
+every same-window interleaved comparison.
+
+Methodology finding recorded for future same-volume sessions: after
+~150 GiB of accumulated same-day writes the QLC system drive entered a
+degraded state that retrim alone did not clear — all three tools fell
+together to ~300–1,000 MB/s — so same-volume rounds are valid only
+interleaved within one window, after an idle recovery period, and
+cross-window absolutes must not be compared.
+
 ## Outstanding
 
 **H6 — redirector overlap (registered 2026-07-31; network-class unmeasured,
@@ -701,6 +848,21 @@ rejects both classification IOCTLs falls to the conservative 4-worker row;
 ADR 0031's data suggests 16–32 workers would roughly halve metadata-bound
 flood time — decide with data, not by loosening the conservative fallback
 blindly).
+
+**H10 — same-spindle gather amplitude (registered 2026-08-02, unmeasured —
+no HDD attached):** ADR 0056 raises the phased batch cap from the 1024-job
+queue depth to 4096 files and adds floor-gated gather patience (up to 50 ms
+while a batch is below 64 files *and* an eighth of the burst budget). For
+4 KiB files the old count cap set the sweep frequency at ~4 MiB of payload
+against a 256 MiB burst — 64× more source↔destination head sweeps than the
+budget implies — and the old 2 ms timeout let routine coordinator pauses
+shatter batches. Expected effect: fewer, fuller head sweeps on tiny-file
+HDD trees; bounded costs are ≤4096 open source handles per batch and one
+≤50 ms wait on a run's final undersized batch. Correctness is pinned by
+`same_spindle_gather_patience_is_floor_gated`, the phase-order transport
+tests, and the same-volume e2e case; the wall-clock claim needs the PLAN
+§12.5 `[HW]` cell (owner-approved bounded HDD workload) comparing pre/post
+builds and robocopy on the 2,000×4 KiB tree with sweep counts recorded.
 
 The elevated filesystem matrix, repeated-run certified benchmark protocol,
 ADR 0036 same-spindle HDD comparison, and ADR 0037's generic-UNC profile

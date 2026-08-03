@@ -2,6 +2,67 @@
 
 Latest review: 2026-08-02
 
+## 2026-08-02 same-SSD large-stream close-out (ADR 0057)
+
+The staged-hash pipeline and lazy worker pool landed with confined
+coverage. New core unit test
+`local_depth_pipeline_hashes_on_its_own_stage_in_order` pins the staged
+consume contract at local depth (every byte exactly once, in order,
+written stream identical, on requests that do not divide the length);
+the existing pipeline suite — overlap proof, short-read/write ordering,
+interruption retries, stage-specific errors, cancellation, panic
+containment, exact actual-I/O counters — passes unchanged at two-buffer
+depth. The updated
+`standard_memory_budget_reserves_the_pipelined_coordinator_chunks` pins
+the three-chunk standard `mem` reservation, and the updated
+`worker_pool_bounds_are_enforced_at_construction` pins the lazy pool (no
+threads or queues before the first job; idempotent spawn). All 230
+confined workspace tests passed with zero failures; formatting,
+warning-denied Clippy, and the frozen-input and test-storage safety
+scripts passed (PLAN re-pinned for the §5.11/§6.5/§8.2/I9/§14.2 pipeline
+text, final step of the change).
+
+Benchmarking ran manually on the whitelisted C: drive in session-scratch
+directories. This round's methodology finding: after ~150 GiB of
+accumulated same-day writes the QLC destination entered a degraded state
+that retrim alone did not clear — all three tools fell together (down to
+~300–1,000 MB/s) — so the published close-out rounds come from
+same-window interleaved pairs after an idle recovery period, and
+cross-window absolutes remain non-comparable (recorded in BENCHMARKS.md).
+No stress, endurance, or large-scale test ran.
+
+## 2026-08-02 same-drive scheduling and topology visibility (ADR 0056)
+
+The same-drive round landed with confined coverage. New core unit tests:
+`oversized_directories_rotate_across_a_bounded_lane_set` (the ≥512-entry /
+4-lane policy table; a compile-time guard pins the ≤8 lane ceiling),
+`same_spindle_gather_patience_is_floor_gated` (the 50 ms/2 ms two-timeout
+gather policy and both floors; a compile-time guard pins the 4096-file
+batch cap at or above the queue depth), and
+`same_share_detection_requires_server_proof` (the same-server UNC
+confidence table: case-folded share-root equality, verbatim/plain prefix
+equivalence, the serial+filesystem "medium" upgrade, and the
+never-trust-a-bare-serial rule). The widened relative-create gate is pinned
+by the updated
+`relative_ntfs_creates_require_local_ntfs_and_the_standard_transport`
+(same-disk pairs on the standard transport qualify; same-spindle and
+redirector transports still refuse). All 229 confined workspace tests
+passed with zero failures; formatting, warning-denied Clippy, and the
+frozen-input and test-storage safety scripts passed (PLAN re-pinned for the
+§5.7/§5.8 lane-rotation and ADR 0048 scope text, final step of the round).
+
+Same-SSD benchmarking ran manually, outside CI, on the whitelisted C: drive
+in session-scratch directories with per-run destination deletion and retrim
+settles; the required `copy` vs robocopy vs bigcp comparison, the robocopy
+thread sweep, the interleaved before/after lane measurement, and the
+order-controlled relative-create A/B are in `BENCHMARKS.md` ("2026-08-02
+same-drive NTFS SSD"). Machine-window drift (~30% across all tools) was
+observed and is recorded there — same-volume comparisons are valid only
+within one window. No HDD and no LAN share were attached: the same-spindle
+gather change is registered as hypothesis H10 with its `[HW]`-cell
+protocol, and same-server detection is covered by unit tests only. No
+stress, endurance, or large-scale test ran.
+
 ## 2026-08-02 distinct-drive NTFS large-stream overlap and device-bus classification
 
 ADR 0055's changes — the two-buffer overlap pipeline for standard-transport

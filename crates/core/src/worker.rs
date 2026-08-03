@@ -158,11 +158,22 @@ pub(crate) struct CompletedCopy {
 /// there is no local NTFS directory index to protect. Queues are deep (jobs are
 /// small metadata records) so the coordinator can run ahead across sibling
 /// directories instead of stalling on the one currently being enumerated.
+/// The pool materializes lazily on the first submitted job: a run whose
+/// files are all coordinator-inline (one large stream, a dry run, an empty
+/// tree) never pays for spawning up to 64 threads, joining them at drop,
+/// or preallocating the bounded result ring (worker_count × queue-depth
+/// slots — the dominant cost, measured 2026-08-02 as a ~14 ms slice of the
+/// fixed run floor on the same-SSD large-stream cell; BENCHMARKS.md).
+/// Until the pool spawns, `receive_timeout` reproduces the empty-channel
+/// contract by sleeping out its timeout — no completion can exist.
 pub(crate) struct FileWorkers {
+    worker_count: usize,
+    same_spindle_burst_bytes: Option<usize>,
     senders: Vec<Sender<FileCopyJob>>,
     receiver: Option<Receiver<CompletedCopy>>,
     handles: Vec<JoinHandle<()>>,
     capacity: usize,
+    stopped: bool,
 }
 
 /// Per-worker job-queue depth. Deep enough to hold a large directory's
@@ -186,7 +197,8 @@ const fn worker_count_floor(worker_count: usize) -> usize {
 }
 
 impl FileWorkers {
-    /// Starts the static profile's bounded file workers.
+    /// Prepares the static profile's bounded file-worker pool. Threads
+    /// spawn on the first submitted job (see the struct doc).
     pub fn new(
         worker_count: usize,
         same_spindle_burst_bytes: Option<usize>,
@@ -202,10 +214,33 @@ impl FileWorkers {
             ));
         }
         let capacity = worker_count.saturating_mul(PER_WORKER_QUEUE);
-        let (result_sender, result_receiver) = crossbeam_channel::bounded(capacity);
-        let mut handles = Vec::with_capacity(worker_count);
-        let mut senders = Vec::with_capacity(worker_count);
-        for index in 0..worker_count {
+        Ok(Self {
+            worker_count,
+            same_spindle_burst_bytes,
+            senders: Vec::new(),
+            receiver: None,
+            handles: Vec::new(),
+            capacity,
+            stopped: false,
+        })
+    }
+
+    /// Materializes the result ring and worker threads on first use.
+    /// Idempotent; a pool that already spawned (or was stopped by drop) is
+    /// left unchanged.
+    fn ensure_spawned(&mut self) -> Result<(), BigcpError> {
+        if !self.handles.is_empty() {
+            return Ok(());
+        }
+        if self.stopped {
+            return Err(BigcpError::Invariant(
+                "file workers already stopped".to_owned(),
+            ));
+        }
+        let (result_sender, result_receiver) = crossbeam_channel::bounded(self.capacity);
+        self.receiver = Some(result_receiver);
+        let same_spindle_burst_bytes = self.same_spindle_burst_bytes;
+        for index in 0..self.worker_count {
             let (job_sender, job_receiver) =
                 crossbeam_channel::bounded::<FileCopyJob>(PER_WORKER_QUEUE);
             let results = result_sender.clone();
@@ -219,16 +254,11 @@ impl FileWorkers {
                     }
                 })
                 .map_err(|error| BigcpError::io("start file worker", error))?;
-            handles.push(handle);
-            senders.push(job_sender);
+            self.handles.push(handle);
+            self.senders.push(job_sender);
         }
         drop(result_sender);
-        Ok(Self {
-            senders,
-            receiver: Some(result_receiver),
-            handles,
-            capacity,
-        })
+        Ok(())
     }
 
     /// Maximum number of submitted-but-unaccounted jobs.
@@ -241,10 +271,11 @@ impl FileWorkers {
     /// worker's queue is full so the coordinator can drain one completion and
     /// retry — never blocking with completions unconsumed (deadlock-free).
     pub fn try_submit(
-        &self,
+        &mut self,
         job: FileCopyJob,
         shard: usize,
     ) -> Result<Option<FileCopyJob>, BigcpError> {
+        self.ensure_spawned()?;
         let index = route_shard(shard, self.senders.len());
         let Some(sender) = self.senders.get(index) else {
             return Err(BigcpError::Invariant(
@@ -263,12 +294,20 @@ impl FileWorkers {
     /// Waits for one submitted job while allowing the coordinator to poll its
     /// front-end cancellation source. `None` is a timeout, not a disconnect.
     pub fn receive_timeout(&self, timeout: Duration) -> Result<Option<CompletedCopy>, BigcpError> {
-        match self
-            .receiver
-            .as_ref()
-            .ok_or_else(|| BigcpError::Invariant("file workers already stopped".to_owned()))?
-            .recv_timeout(timeout)
-        {
+        if self.stopped {
+            return Err(BigcpError::Invariant(
+                "file workers already stopped".to_owned(),
+            ));
+        }
+        let Some(receiver) = self.receiver.as_ref() else {
+            // Unspawned pool: no job was ever submitted, so no completion
+            // can arrive. Sleeping out the timeout reproduces the eager
+            // channel's empty-recv behavior for any caller polling without
+            // an outstanding-jobs gate.
+            std::thread::sleep(timeout);
+            return Ok(None);
+        };
+        match receiver.recv_timeout(timeout) {
             Ok(completed) => Ok(Some(completed)),
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => Ok(None),
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(BigcpError::Invariant(
@@ -280,6 +319,7 @@ impl FileWorkers {
 
 impl Drop for FileWorkers {
     fn drop(&mut self) {
+        self.stopped = true;
         self.senders.clear();
         drop(self.receiver.take());
         for handle in self.handles.drain(..) {
@@ -354,6 +394,51 @@ struct WrittenBatchEntry {
     seconds: f64,
 }
 
+/// Upper bound on files gathered into one phased same-spindle batch. The
+/// byte budget (`burst_bytes`) already bounds payload memory; this cap
+/// bounds the open source handles and job records one batch may hold at
+/// once (a few MiB of metadata plus one handle each — firmly bounded).
+/// The former `PER_WORKER_QUEUE` cap set the sweep frequency by *file
+/// count* for tiny files — 1024 × 4 KiB ≈ 4 MiB per head sweep against a
+/// 256 MiB burst budget, 64× more source↔destination seeks than the budget
+/// implies. The coordinator keeps refilling the bounded queue while the
+/// gather drains it, so batches larger than the queue depth fill normally.
+const SAME_SPINDLE_BATCH_FILES: usize = 4096;
+
+// Compile-time guard: a batch cap below the queue depth would silently
+// reintroduce the count-limited sweep this constant exists to remove.
+const _: () = assert!(SAME_SPINDLE_BATCH_FILES >= PER_WORKER_QUEUE);
+
+/// Below this floor the gatherer waits out coordinator pauses (directory
+/// enumeration, classification, journal work — routinely longer than the
+/// quick timeout on the very HDD this transport serves) rather than launch
+/// an undersized read/write sweep whose head switches a fuller batch would
+/// have amortized. At or past the floor only quick pauses are tolerated so
+/// a ready batch is not held hostage to an idle channel.
+const SAME_SPINDLE_GATHER_FLOOR_FILES: usize = 64;
+
+/// Patient wait while the batch is below the gather floor. Bounded: worst
+/// case adds one such wait to the final undersized batch of a run.
+const SAME_SPINDLE_GATHER_PATIENT: Duration = Duration::from_millis(50);
+
+/// Quick wait once the batch is already worth a sweep.
+const SAME_SPINDLE_GATHER_QUICK: Duration = Duration::from_millis(2);
+
+/// Gather patience for the current batch state: patient below the floor
+/// (both by file count and by payload — a few large-ish small files are
+/// already worth a sweep), quick otherwise.
+const fn same_spindle_gather_timeout(
+    batch_files: usize,
+    batch_bytes: usize,
+    burst_bytes: usize,
+) -> Duration {
+    if batch_files < SAME_SPINDLE_GATHER_FLOOR_FILES && batch_bytes < burst_bytes / 8 {
+        SAME_SPINDLE_GATHER_PATIENT
+    } else {
+        SAME_SPINDLE_GATHER_QUICK
+    }
+}
+
 /// Same-spindle small-file scheduling has three coarse phases: fill the
 /// bounded batch from source handles, write every prepared destination, then
 /// revalidate the still-open source handles. This removes one source↔target
@@ -368,8 +453,9 @@ fn same_spindle_worker_loop(
     while let Some(first) = carried.take().or_else(|| jobs.recv().ok()) {
         let mut estimated = usize::try_from(first.logical_bytes).unwrap_or(usize::MAX);
         let mut batch = vec![first];
-        while batch.len() < PER_WORKER_QUEUE && estimated < burst_bytes {
-            let next = match jobs.recv_timeout(Duration::from_millis(2)) {
+        while batch.len() < SAME_SPINDLE_BATCH_FILES && estimated < burst_bytes {
+            let timeout = same_spindle_gather_timeout(batch.len(), estimated, burst_bytes);
+            let next = match jobs.recv_timeout(timeout) {
                 Ok(job) => job,
                 Err(
                     crossbeam_channel::RecvTimeoutError::Timeout
@@ -541,6 +627,33 @@ mod tests {
         assert_eq!(super::route_shard(41, 0), 0);
     }
 
+    /// Pins the phased-batch gather policy (ADR 0036 amendment): patience
+    /// applies only below both floors — few files *and* a small payload —
+    /// so coordinator pauses cannot shatter a tiny-file batch into
+    /// undersized head sweeps, while a batch already worth a sweep is
+    /// released after at most the quick timeout.
+    #[test]
+    fn same_spindle_gather_patience_is_floor_gated() {
+        use super::{
+            SAME_SPINDLE_GATHER_FLOOR_FILES, SAME_SPINDLE_GATHER_PATIENT,
+            SAME_SPINDLE_GATHER_QUICK, same_spindle_gather_timeout,
+        };
+        let burst = 256 * 1024 * 1024;
+        assert_eq!(
+            same_spindle_gather_timeout(1, 4096, burst),
+            SAME_SPINDLE_GATHER_PATIENT
+        );
+        assert_eq!(
+            same_spindle_gather_timeout(SAME_SPINDLE_GATHER_FLOOR_FILES, 4096, burst),
+            SAME_SPINDLE_GATHER_QUICK
+        );
+        // A payload at burst/8 is already worth a sweep even with few files.
+        assert_eq!(
+            same_spindle_gather_timeout(3, burst / 8, burst),
+            SAME_SPINDLE_GATHER_QUICK
+        );
+    }
+
     #[test]
     fn worker_pool_bounds_are_enforced_at_construction() {
         assert!(FileWorkers::new(0, None).is_err());
@@ -550,10 +663,18 @@ mod tests {
         assert!(FileWorkers::new(2, Some(1024 * 1024)).is_err());
         let workers = FileWorkers::new(8, None);
         assert!(workers.is_ok());
-        let Some(workers) = workers.ok() else {
+        let Some(mut workers) = workers.ok() else {
             return;
         };
-        assert_eq!(workers.senders.len(), 8);
+        // Lazy pool: no threads or queues exist until the first job.
+        assert_eq!(workers.senders.len(), 0);
+        assert!(workers.handles.is_empty());
         assert_eq!(workers.capacity(), 8 * super::PER_WORKER_QUEUE);
+        assert!(workers.ensure_spawned().is_ok());
+        assert_eq!(workers.senders.len(), 8);
+        assert_eq!(workers.handles.len(), 8);
+        // Idempotent: a second call must not double-spawn.
+        assert!(workers.ensure_spawned().is_ok());
+        assert_eq!(workers.handles.len(), 8);
     }
 }
