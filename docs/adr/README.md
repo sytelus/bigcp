@@ -67,7 +67,8 @@ segmentation is deliberately withheld pending H6.
   ~25% behind robocopy `/J` on a distinct-NVMe pair; sparse ranges and named
   streams keep request-at-a-time, `REDIRECTOR_PIPELINE_BUFFERS` becomes
   `PIPELINE_BUFFERS`, and `mem` reserves two coordinator chunks on every
-  non-same-spindle transport. Bus classification falls back to the
+  non-same-spindle transport (later raised to three for local standard streams
+  by ADR 0057). Bus classification falls back to the
   per-device descriptor when the adapter answer is unspecific (NVMe behind
   Intel VMD no longer demotes to the SATA-SSD row), the adapter
   MaximumTransferLength no longer clamps the composed chunk, and the NVMe

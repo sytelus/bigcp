@@ -12,6 +12,10 @@ standard-transport unnamed large streams, its constant is renamed
 coordinator chunks. This ADR's "standard local accounting remains unchanged"
 statements describe the state before ADR 0055.
 
+**Extended by ADR 0057:** local standard streams now use a third jitter buffer
+and a dedicated hash stage. Generic redirector and WSL transfers retain this
+ADR's two-buffer window.
+
 ## Context
 
 ADR 0037 isolated UNC, mapped-drive, and WSL policy but deliberately retained

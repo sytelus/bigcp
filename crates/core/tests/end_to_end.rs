@@ -226,7 +226,7 @@ fn copy_rerun_and_both_verification_forms_converge() -> Result<(), Box<dyn std::
     assert_eq!(oracle.mismatches, 0, "oracle samples: {:?}", oracle.samples);
 
     let full = bigcp_core::run_standalone_verify(&VerifyOptions {
-        source: source.clone(),
+        source,
         destination: destination.clone(),
     })?;
     assert_eq!(full.failed, 0, "verify mismatches: {:?}", full.mismatches);
@@ -287,7 +287,7 @@ fn dry_run_never_creates_destination_and_direct_replacement_converges()
         "dry-run created the destination tree"
     );
 
-    let options = sandboxed_options(&sandbox, source.clone(), destination.clone(), "copy-state")?;
+    let options = sandboxed_options(&sandbox, source, destination.clone(), "copy-state")?;
     let initial = run_copy(&options, &SilentObserver)?;
     assert_eq!(initial.run.exit, 0, "copy errors: {:?}", initial.errors);
     assert_eq!(initial.counters.copied_new, 1);

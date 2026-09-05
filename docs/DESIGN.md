@@ -137,10 +137,11 @@ ports:
   existing Win32 local-volume path and uses handle-bound native filesystem
   queries only for redirectors; `device.rs` returns an opaque remote device
   record without local IOCTLs. Core consumes one immutable endpoint/filesystem
-  policy. `core::transport` owns generic-redirector and WSL identities over the
-  bounded two-buffer pipeline; `worker.rs` confines parallel stream scheduling
-  and either-side WSL striping; `engine.rs` owns the segmented parallel
-  large-file strategy (`segment_plan`/`copy_streamed_segmented`); `file.rs`
+  policy. `core::transport` owns the shared ordered pipeline: two buffers for
+  generic redirectors and WSL, three buffers plus a dedicated hash stage for
+  eligible local standard streams. `worker.rs` confines parallel stream
+  scheduling and either-side WSL striping; `engine.rs` owns the segmented
+  parallel large-file strategy (`segment_plan`/`copy_streamed_segmented`); `file.rs`
   owns sequential handle hints, deferred WSL stamping, and the
   identity-proven `SegmentWriter`. Remote profiles, case matching, projection,
   preallocation, transfer mechanics, and disconnect classification can
@@ -189,7 +190,7 @@ segments to overlap the measured per-handle ceiling (ADR 0052).
 Intersecting local disk extents plus
 rotational classification select one phased worker and a bounded same-spindle
 burst; SSD overlap stays on the standard path. Manual values are range checked.
-On standard transport the memory override reserves the two concurrently live
+On standard transport the memory override reserves the three concurrently live
 pipelined coordinator chunks before capping threshold-sized workers.
 Redirector accounting
 reserves the same two coordinator chunks and the larger of one

@@ -105,7 +105,7 @@ impl RunObserver for PlainObserver {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct LiveState {
     snapshot: Option<RunSnapshot>,
     message: String,
@@ -704,7 +704,10 @@ fn draw_live(
     tab: usize,
     color_enabled: bool,
 ) {
-    let state = state.lock().unwrap_or_else(PoisonError::into_inner);
+    // Rendering can be slower than progress publication on a busy terminal.
+    // Snapshot under the lock, then release it before constructing widgets so
+    // display refresh can never stall the copy engine's observer callbacks.
+    let state = state.lock().unwrap_or_else(PoisonError::into_inner).clone();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([

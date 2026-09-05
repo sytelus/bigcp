@@ -1,9 +1,10 @@
 # ADR 0055: Local large-stream overlap and device-bus classification
 
-**Status:** Accepted (amends ADR 0028's overlap rationale — buffered I/O is
-retained and no unbuffered path returns; only the claim that the cache
-manager alone supplies read/write overlap is superseded — and removes the
-adapter-MTL chunk clamp from profile composition)
+**Status:** Amended by ADR 0057 (local standard streams now use a third buffer
+and a dedicated in-flight hash stage). Accepted (amends ADR 0028's overlap
+rationale — buffered I/O is retained and no unbuffered path returns; only the
+claim that the cache manager alone supplies read/write overlap is superseded —
+and removes the adapter-MTL chunk clamp from profile composition)
 
 ## Context
 

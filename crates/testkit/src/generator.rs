@@ -40,6 +40,7 @@ pub fn heavy_tests_enabled() -> bool {
 
 /// One generated file.
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileSpec {
     /// Relative path beneath the generated tree.
     pub path: PathBuf,
@@ -52,6 +53,7 @@ pub struct FileSpec {
 
 /// Harmless deterministic scenario.
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Scenario {
     /// Directory paths created before files.
     #[serde(default)]
@@ -240,14 +242,14 @@ fn write_pattern(writer: &mut impl Write, size: u64, seed: u64) -> Result<()> {
     let mut state = seed | 1;
     let mut buffer = vec![0_u8; 64 * 1024];
     while remaining > 0 {
-        for byte in &mut buffer {
+        let count = usize::try_from(remaining.min(buffer.len() as u64))
+            .context("pattern chunk size overflow")?;
+        for byte in &mut buffer[..count] {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
             *byte = state.to_le_bytes()[0];
         }
-        let count = usize::try_from(remaining.min(buffer.len() as u64))
-            .context("pattern chunk size overflow")?;
         writer.write_all(&buffer[..count])?;
         remaining -= count as u64;
     }
@@ -256,7 +258,10 @@ fn write_pattern(writer: &mut impl Write, size: u64, seed: u64) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FileSpec, Scenario, generate, heavy_tests_enabled, planned_entry_counts};
+    use super::{
+        FileSpec, ROUTINE_ENTRY_LIMIT, Scenario, generate, heavy_tests_enabled,
+        planned_entry_counts,
+    };
     use crate::sandbox::SandboxRoot;
     use std::path::{Path, PathBuf};
 
@@ -380,5 +385,34 @@ mod tests {
             write_budget_bytes: 0,
         };
         assert!(planned_entry_counts(&scenario).is_err());
+    }
+
+    #[test]
+    fn smoke_scenario_stays_parseable_and_within_its_declared_budget() {
+        let parsed = serde_yaml::from_str::<Scenario>(include_str!(
+            "../../../testkit/scenarios/e00-smoke.yaml"
+        ));
+        assert!(parsed.is_ok(), "smoke scenario must parse: {parsed:?}");
+        let Some(scenario) = parsed.ok() else {
+            return;
+        };
+        let declared = scenario.files.iter().map(|file| file.size).sum::<u64>();
+        assert!(declared <= scenario.write_budget_bytes);
+        assert!(
+            planned_entry_counts(&scenario).is_ok_and(|(directories, files)| {
+                directories.saturating_add(files) <= ROUTINE_ENTRY_LIMIT
+            })
+        );
+    }
+
+    #[test]
+    fn scenario_yaml_rejects_unknown_fields() {
+        for yaml in [
+            "directories: []\nfiles: []\nwrite_budget_bytes: 0\nwrite_buget_bytes: 0\n",
+            "directories: []\nfiles:\n  - path: a.bin\n    size: 0\n    patten: 1\nwrite_budget_bytes: 0\n",
+        ] {
+            let parsed = serde_yaml::from_str::<Scenario>(yaml);
+            assert!(parsed.is_err(), "unknown scenario keys must not be ignored");
+        }
     }
 }

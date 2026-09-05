@@ -1,6 +1,51 @@
 # Implementation testing and drive-safety summary
 
-Latest review: 2026-08-02
+Latest review: 2026-09-05
+
+## 2026-09-05 repository-wide quality and production-readiness review
+
+The review covered all 146 tracked code, configuration, data, script, and
+documentation files with repository-wide static checks plus focused inspection
+of the copy, transport, Win32, testkit, terminal, schema, and CI boundaries.
+It preserved `VISION.md`, `PLAN.md`, and `LIMITATIONS.md`: their current
+contracts remain consistent with the implementation.
+
+The v0.4.0 GitHub failures were two copies of the same workflow, triggered by
+the branch and release-tag pushes. Both stopped on one warning-denied Clippy
+finding (`mut consume` was unnecessary); that defect is fixed. CI now runs push
+validation only for `main` and pins `actions/checkout` to its immutable v7
+commit, so a tag and its commit do not duplicate the workflow.
+
+This pass also migrated scenario parsing from deprecated `serde_yaml` to the
+maintained `yaml_serde` fork, made unknown top-level and file-level YAML keys a
+hard error, refreshed all compatible locked dependencies, and cleared
+RUSTSEC-2026-0253 by moving transitive `lru` to 0.18.4. Two new pure tests pin
+the checked-in smoke scenario's parse/budget/entry contract and reject unknown
+scenario keys. Pattern generation no longer fills unused bytes in its final
+buffer. The Win32 crate now denies undocumented unsafe blocks, and the existing
+native boundary passes that lint.
+
+On this host, `FSCTL_GET_RETRIEVAL_POINTERS` returned
+`ERROR_NOT_SUPPORTED` even for a non-resident file on the system temporary
+volume. The CLI continues to propagate that capability failure rather than
+claiming zero extents. The two routine extent tests now capability-probe their
+non-resident sandbox fixture and skip only that exact response; every other
+error remains a test failure.
+
+All 232 confined workspace tests passed with zero failures (16 CLI, 94 core,
+24 end-to-end, 21 testkit, 15 TUI, 62 Win32). Formatting, warning-denied
+Clippy, frozen-input verification, test-storage safety, warning-denied Rustdoc,
+and the release build passed. `cargo deny check` passed with only the configured
+duplicate-version warnings for `hashbrown` and `syn`; `cargo audit` found no
+advisories in the final 146-package lock graph. All JSON files parsed, all four
+stored report fixtures validated against the report-v1 schema, the smoke YAML
+stayed within its declared write budget, relative Markdown links resolved, and
+`git diff --check` passed.
+
+Per VISION's safety constraints, this review did not run stress/endurance,
+huge-tree, elevated VHDX, destructive fault/kill, physical-device performance,
+or live UNC/WSL tests. Those permission- and hardware-gated matrix cells remain
+explicit follow-up work rather than being inferred from routine coverage.
 
 ## 2026-08-02 same-SSD large-stream close-out (ADR 0057)
 

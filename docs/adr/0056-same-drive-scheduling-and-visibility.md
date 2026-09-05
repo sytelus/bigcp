@@ -41,7 +41,8 @@ SSD"):
 - **A same-server UNC pair pays double traversal invisibly.** Both endpoints
   remote → every byte crosses this client twice (read from the server,
   written back to it). The probe already returns the canonical share root
-  and the remote volume serial; neither was consulted. VISION line 27
+  and the remote volume serial; neither was consulted. VISION's
+  one-product-engine clause
   prohibits using an OS server-side copy but explicitly allows informing
   the user. The same clause covers the ReFS block-clone hint, which fired
   only in the post-run report — after a potentially hours-long run.

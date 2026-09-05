@@ -121,13 +121,19 @@ bigcp C:\scratch\bigcp-case-001\source C:\scratch\bigcp-case-001\destination --p
 bigcp-testkit check C:\scratch\bigcp-case-001 source destination
 ```
 
-A scenario declares `write_budget_bytes`; generation sums file sizes with
-checked arithmetic and refuses any declaration above 1 GiB. Paths are relative
-and may not traverse reparse points.
+A scenario declares `write_budget_bytes`; generation rejects unknown YAML
+fields, sums file sizes with checked arithmetic, and refuses any declaration
+above 1 GiB. Paths are relative and may not traverse reparse points. A unit
+test parses the checked-in smoke scenario and verifies its declared budget and
+routine entry bound so configuration drift fails before any fixture is written.
 
 `bigcp-testkit extents <sandbox> <relative-tree>` reports physical extent
 counts for a sandboxed tree (read-only, reparse points never followed) — the
-fragmentation evidence benchmark entries record per `BENCHMARKS.md`.
+fragmentation evidence benchmark entries record per `BENCHMARKS.md`. If the
+filesystem/provider stack rejects `FSCTL_GET_RETRIEVAL_POINTERS`, the command
+reports that error instead of guessing a zero count. Routine extent tests skip
+only an explicit `ERROR_NOT_SUPPORTED` capability response; every other query
+error remains a failure.
 
 Link integration tests create only test-owned links inside the marked sandbox.
 They use Developer Mode when available and skip link creation on hosts that do

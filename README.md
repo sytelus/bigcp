@@ -156,9 +156,10 @@ ordered path everywhere except WSL's automatically planned segmented
 transfers, whose segment count is computed rather than tunable, so those
 settings would not describe real work. Redirector
 transfers use a fixed two-buffer pipeline and may run independent files below
-the checkpoint threshold on the bounded worker pool; local standard large
-streams move through that same two-buffer pipeline, while their sparse ranges
-and named streams keep the request-at-a-time loop. WSL has a distinct transport/profile
+the checkpoint threshold on the bounded worker pool; local standard unnamed
+large streams use the shared ordered pipeline with three buffers and a
+dedicated in-flight hash stage, while their sparse ranges and named streams
+keep the request-at-a-time loop. WSL has a distinct transport/profile
 identity even though it reuses the ordered pipeline: Auto uses 8 MiB requests
 and up to 32 workers, and small-file work is striped across those workers
 whenever either side is WSL instead of inheriting NTFS directory affinity.
@@ -168,9 +169,9 @@ Plan 9 handle caps well below what the boundary can carry in aggregate
 (measured in BENCHMARKS.md; ADR 0052).
 Manual bounds are enforced in the core library — workers `1..=256`, chunks
 `64 KiB..=64 MiB`, thresholds positive — while the CLI itself validates only
-syntax and positivity. On the standard path, a `mem` budget reserves the two
+syntax and positivity. On the standard path, a `mem` budget reserves the three
 pipelined coordinator chunks and must also hold at least one large-threshold
-worker buffer. The redirector path reserves the same two coordinator chunks
+worker buffer. The redirector path reserves two coordinator chunks
 plus `max(large-threshold, 2 × chunk)` for each worker. Remaining bytes cap the
 worker count. The same-spindle path serializes coordinator and worker I/O, so
 its 256 MiB burst is instead capped directly by `mem`; a

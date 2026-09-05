@@ -507,7 +507,7 @@ pub fn run_copy(
     let mut report = RunReport {
         v: REPORT_SCHEMA_VERSION,
         run: RunInfo {
-            id: run_id.clone(),
+            id: run_id,
             started,
             ended: format_time(ended_at),
             duration_seconds: duration,
@@ -1435,8 +1435,9 @@ impl Runner<'_> {
         // per-directory barrier measurably serialized small-file runs). The
         // drain happens at directory exit, before timestamps are stamped.
         // Destination-only accounting for bigcp's own `.bigcp-…part` resume
-        // temporaries. Decision table (contract-critical — VISION lines
-        // 29–35 and 59, README FAQ: reclaim only what the journal PROVES
+        // temporaries. Decision table (contract-critical — VISION's
+        // reliability and no-unexpected-file-removal requirements, README FAQ:
+        // reclaim only what the journal PROVES
         // bigcp created; report, never delete, everything else):
         //
         //   LIVE    — a resumable checkpoint names this temp and its final
@@ -1497,7 +1498,7 @@ impl Runner<'_> {
         }
 
         tasks.push_back(DirectoryTask::Exit {
-            source: source.clone(),
+            source,
             destination: destination.clone(),
             relative: relative.clone(),
             source_metadata,

@@ -31,6 +31,8 @@ const HOLE_LCN: i64 = -1;
 /// occupy no disk run and are not counted. Two data runs count as one extent
 /// when they are physically adjacent on disk (no seek lies between them),
 /// which also heals artificial splits at query-buffer boundaries.
+/// Filesystem/provider capability errors are propagated; callers must never
+/// turn an unsupported query into a false zero-extent result.
 pub fn extent_count(file: &File) -> io::Result<u64> {
     let mut extents = 0_u64;
     let mut vcn_cursor = 0_i64;
@@ -161,6 +163,7 @@ fn returned_word_count(returned: u32, capacity_words: usize) -> io::Result<usize
 mod tests {
     use super::{extent_count, returned_word_count};
     use std::fs;
+    use windows_sys::Win32::Foundation::ERROR_NOT_SUPPORTED;
 
     #[test]
     fn malformed_retrieval_pointer_lengths_are_rejected() {
@@ -177,7 +180,34 @@ mod tests {
             return;
         };
 
-        // Empty files own no disk run on any supported filesystem.
+        // Probe with non-resident data first. The host storage/filter stack may
+        // reject the query even on an otherwise supported test volume. Skip
+        // only that explicit capability response; every other error remains a
+        // test failure.
+        let data = sandbox.path().join("data.bin");
+        assert!(fs::write(&data, vec![0xA5_u8; 256 * 1024]).is_ok());
+        let file = fs::File::open(&data);
+        assert!(file.is_ok());
+        let Some(file) = file.ok() else {
+            return;
+        };
+        let count = extent_count(&file);
+        if count
+            .as_ref()
+            .is_err_and(|error| error.raw_os_error() == Some(ERROR_NOT_SUPPORTED.cast_signed()))
+        {
+            return;
+        }
+        assert!(
+            count.is_ok(),
+            "non-resident extent capability probe failed: {count:?}"
+        );
+        assert!(
+            count.ok().is_some_and(|value| (1..=64).contains(&value)),
+            "non-resident extent count exceeded its cluster bound"
+        );
+
+        // Empty files own no disk run when the query is supported.
         let empty = sandbox.path().join("empty.bin");
         assert!(fs::write(&empty, b"").is_ok());
         let file = fs::File::open(&empty);
@@ -192,17 +222,5 @@ mod tests {
         assert!(file.is_ok());
         let count = file.ok().and_then(|f| extent_count(&f).ok());
         assert!(count.is_some_and(|value| value <= 1), "{count:?}");
-
-        // 256 KiB is always non-resident; it cannot occupy more runs than it
-        // has clusters (64 at the smallest common 4 KiB cluster size).
-        let data = sandbox.path().join("data.bin");
-        assert!(fs::write(&data, vec![0xA5_u8; 256 * 1024]).is_ok());
-        let file = fs::File::open(&data);
-        assert!(file.is_ok());
-        let count = file.ok().and_then(|f| extent_count(&f).ok());
-        assert!(
-            count.is_some_and(|value| (1..=64).contains(&value)),
-            "{count:?}"
-        );
     }
 }

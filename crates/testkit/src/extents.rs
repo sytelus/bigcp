@@ -85,8 +85,10 @@ fn measure_file(path: &Path, report: &mut ExtentReport) -> Result<()> {
 mod tests {
     use super::measure_extents;
     use crate::sandbox::SandboxRoot;
+    use bigcp_win::extent_count;
     use std::fs;
     use std::path::Path;
+    use windows_sys::Win32::Foundation::ERROR_NOT_SUPPORTED;
 
     #[test]
     fn measures_only_regular_files_inside_the_sandbox() {
@@ -98,6 +100,20 @@ mod tests {
         assert!(fs::create_dir(tree.join("nested")).is_ok());
         assert!(fs::write(tree.join("small.bin"), b"resident").is_ok());
         assert!(fs::write(tree.join("nested/data.bin"), vec![0x5A_u8; 128 * 1024]).is_ok());
+
+        // Capability-probe the non-resident fixture so a host storage/filter
+        // stack that explicitly rejects read-only retrieval-pointer queries
+        // does not make the portable routine suite fail. The CLI still reports
+        // that capability error instead of publishing false extent evidence.
+        let probe =
+            fs::File::open(tree.join("nested/data.bin")).and_then(|file| extent_count(&file));
+        if probe
+            .as_ref()
+            .is_err_and(|error| error.raw_os_error() == Some(ERROR_NOT_SUPPORTED.cast_signed()))
+        {
+            return;
+        }
+        assert!(probe.is_ok(), "extent capability probe failed: {probe:?}");
 
         let report = measure_extents(&sandbox, Path::new("tree"));
         assert!(report.is_ok(), "{report:?}");

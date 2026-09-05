@@ -33,7 +33,8 @@ every push. All of them must stay green; clippy pedantic plus
 
 ## Non-negotiable rules
 
-- **Test safety (PLAN §12.0, VISION line 43, [docs/TESTING.md](docs/TESTING.md)):**
+- **Test safety (PLAN §12.0, VISION's testing-safety requirement,
+  [docs/TESTING.md](docs/TESTING.md)):**
   every test writes only inside a fresh sandbox under a whitelisted drive
   (system drive or the code checkout drive), with tiny data. Never add tests
   that create huge file counts, stress drives, delete outside their sandbox,

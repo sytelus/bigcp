@@ -1835,8 +1835,10 @@ impl StreamBuffers {
 
     /// Like [`Self::new`], but a standard-transport stream large enough to
     /// reach the temp+rename path overlaps one source read with one
-    /// destination write through the bounded two-buffer pipeline instead of
-    /// half-duplex request-at-a-time alternation.
+    /// destination write through the bounded overlap pipeline instead of
+    /// half-duplex request-at-a-time alternation. Local standard streams use
+    /// three buffers and a dedicated hash stage; redirectors use two buffers
+    /// and hash on the reader thread.
     ///
     /// Measured 2026-08-02 (BENCHMARKS.md): an 8 GiB distinct-NVMe copy ran
     /// 1,788–2,038 MB/s under alternation while robocopy's unbuffered mode

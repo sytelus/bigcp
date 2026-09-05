@@ -5,6 +5,35 @@ versioning once its 1.0 release gates are complete.
 
 ## [Unreleased]
 
+### Fixed
+
+- 2026-09-05 repository review: routine extent tests now distinguish an
+  explicitly unsupported retrieval-pointer query from genuine failures, so
+  provider limitations do not fail portable CI while the user-facing command
+  continues to report the limitation instead of publishing false evidence.
+- The interactive dashboard now releases its progress-state lock before
+  rendering, preventing slow terminal refresh from delaying copy-engine
+  observer updates.
+
+### Changed
+
+- Scenario YAML now uses the maintained `yaml_serde` fork, rejects unknown
+  fields, and generates only the used portion of the final pattern buffer.
+  Checked-in smoke-scenario parsing, budget, and entry limits are unit tested.
+- Refreshed the compatible locked dependency graph; in particular, transitive
+  `lru` is now 0.18.4, clearing RUSTSEC-2026-0253.
+- The Win32 boundary now denies undocumented unsafe blocks during every
+  Clippy run; existing native calls pass the enforced safety-comment audit.
+- CI now runs branch pushes only for `main`, avoiding a duplicate workflow when
+  a release tag and its `main` commit are pushed together, and the checkout
+  action is pinned to its immutable v7 commit.
+- Corrected documentation drift around the three-buffer local large-stream
+  pipeline, dedicated hash stage, memory accounting, release state, and
+  semantic VISION references. `VISION.md`, `PLAN.md`, and `LIMITATIONS.md`
+  remain unchanged.
+
+## [0.4.0] - 2026-08-03
+
 ### Added
 
 - Generic UNC, mapped-drive, and WSL UNC source/destination support through an

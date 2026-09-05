@@ -1,12 +1,14 @@
 //! Static copy-transport policy selected from preflight topology.
 //!
-//! The normal local path retains one request-sized buffer. Redirector paths
-//! use a bounded two-buffer pipeline so a source read and destination write
-//! can be in flight at the same time. A rotational source and destination that
-//! share a physical disk instead use a much larger bounded staging buffer so
-//! reads and writes occur in coarse phases rather than forcing a disk-head seek
-//! after every request. This module owns only transport mechanics; file
-//! semantics, hashing, checkpoints, and publication remain in `engine`.
+//! Ordinary local streams retain one request-sized buffer. Eligible unnamed
+//! local large streams use a three-buffer pipeline with a dedicated hash
+//! stage; redirector paths use two buffers and hash on the reader thread. Both
+//! let a source read and destination write overlap. A rotational source and
+//! destination that share a physical disk instead use a much larger bounded
+//! staging buffer so reads and writes occur in coarse phases rather than
+//! forcing a disk-head seek after every request. This module owns only
+//! transport mechanics; file semantics, hashing, checkpoints, and publication
+//! remain in `engine`.
 
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -203,7 +205,7 @@ pub(crate) fn transfer_pipelined<R, W, F>(
     request_bytes: usize,
     depth: usize,
     canceled: &dyn CancelProbe,
-    mut consume: F,
+    consume: F,
 ) -> Result<PipelinedTransfer, PipelinedFailure>
 where
     R: Read + Send,

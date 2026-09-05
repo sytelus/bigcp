@@ -127,8 +127,9 @@ replacements, warnings, grouped failures, extras, hints, and verification.
 - **Watermark:** contiguous temp prefix eligible for a checkpoint.
 - **QD:** queue depth — in-flight I/O count per device side; each pipeline
   stage issues one synchronous request at a time, with large streams
-  overlapping one read with one write through two bounded buffers
-  (ADR 0055). Small-file parallelism comes from the worker pool.
+  overlapping one read with one write through two bounded buffers on remote
+  transports or three buffers plus a dedicated hash stage on local standard
+  transport (ADRs 0055/0057). Small-file parallelism comes from the worker pool.
 - **MTL:** adapter-reported maximum transfer length; a recorded fact only —
   it bounds one storport request and no longer clamps the composed chunk
   (ADR 0055).
@@ -153,10 +154,10 @@ replacements, warnings, grouped failures, extras, hints, and verification.
 - **Same-spindle transport:** the static policy selected only when physical
   extents intersect and media is rotational; source reads and destination
   writes run in bounded phases to reduce mechanical head switching.
-- **Relative NTFS create:** distinct-drive local NTFS plain-small workers may
-  cache one identity-verified destination-parent capability and open children
-  by final component. Selection belongs in `copy.rs`, the bounded one-entry
-  cache in `worker.rs`, and all native handle mechanics in `file.rs`; never
+- **Relative NTFS create:** local NTFS plain-small workers on the standard
+  transport may cache one identity-verified destination-parent capability and
+  open children by final component. Selection belongs in `copy.rs`, the bounded
+  one-entry cache in `worker.rs`, and all native handle mechanics in `file.rs`; never
   spread this path into another filesystem, endpoint, or transport without a
   separate decision and evidence.
 - **Generic redirector transport:** generic UNC/mapped paths use two bounded
@@ -181,7 +182,7 @@ replacements, warnings, grouped failures, extras, hints, and verification.
   file's ordinary data.
 - **Ring:** a historical term from two deleted streaming designs (the IOCP
   overlapped ring, ADR 0027, and the unbuffered reader/writer pair, ADR
-  0028). No completion ring exists: the standard transport is a sequential
+  0028). No completion ring exists: ordinary standard streams use a sequential
   buffered chunk loop, ADR 0036 adds bounded synchronous same-spindle phases,
   ADR 0045 adds a fixed two-buffer redirector pipeline, ADR 0046 gives WSL
   its own profile and scheduling seam over that pipeline, ADR 0052 adds
@@ -189,7 +190,9 @@ replacements, warnings, grouped failures, extras, hints, and verification.
   routes standard-transport unnamed large streams through the same
   two-buffer pipeline (`PIPELINE_BUFFERS`, formerly
   `REDIRECTOR_PIPELINE_BUFFERS`) while sparse ranges and named streams keep
-  the request-at-a-time loop (PLAN §5.8–§5.9).
+  the request-at-a-time loop, and ADR 0057 gives eligible local standard
+  streams a third jitter buffer plus a dedicated in-flight hash stage
+  (PLAN §5.8–§5.11).
 
 ## Release checklist
 

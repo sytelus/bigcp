@@ -449,7 +449,7 @@ struct PreflightAcceptance {
     remote_paths: bool,
     /// CLI-only: silences the advisory Quick-removal prompt. Core does not
     /// re-gate on this because a slow write-cache policy is a performance
-    /// notice, not a fidelity or safety loss (VISION line 11).
+    /// notice, not a fidelity or safety loss (VISION's single-prompt rule).
     write_cache_policy: bool,
 }
 
